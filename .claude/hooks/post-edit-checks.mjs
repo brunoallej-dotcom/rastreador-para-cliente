@@ -6,7 +6,9 @@
 //   contracts/openapi*.yaml    → Redocly lint (se instalado)
 // A raiz do projeto vem do git da pasta do arquivo (funciona em worktrees de subagentes, ver lib.mjs);
 // Prettier e Redocly são os de node_modules dessa raiz (cada worktree roda o próprio pnpm install) e,
-// se não estiverem instalados, a formatação e o lint do contrato completo são pulados.
+// se não estiverem instalados (worktree nova, antes do `pnpm install`), a formatação e o lint do contrato
+// completo são pulados — e isso é avisado no stderr (uma vez por execução, sem mudar o código de saída),
+// para não parecer que o arquivo foi formatado e conferido.
 // Exit 2 = devolve as violações ao Claude para correção imediata. Erro interno = exit 1.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -176,13 +178,16 @@ function checkSource(rel, text) {
 
 // ------------------------------------------------------------ Contrato ----
 
+/** Lint do contrato. Devolve { problems, skipped }: sem Redocly instalado, só a checagem básica (skipped). */
 function checkContract(root, abs) {
-  const redocly = path.join(root, 'node_modules', '.bin', 'redocly');
-  if (!existsSync(redocly)) {
+  const redocly = localBin(root, 'redocly');
+  if (!redocly) {
     const head = readFileSync(abs, 'utf8');
-    if (head.includes('\t')) return ['o contrato contém TAB; YAML exige espaços.'];
-    if (!/^openapi:\s*3\.1\./m.test(head)) return ['o contrato precisa declarar "openapi: 3.1.x".'];
-    return [];
+    if (head.includes('\t')) return { problems: ['o contrato contém TAB; YAML exige espaços.'], skipped: true };
+    if (!/^openapi:\s*3\.1\./m.test(head)) {
+      return { problems: ['o contrato precisa declarar "openapi: 3.1.x".'], skipped: true };
+    }
+    return { problems: [], skipped: true };
   }
   try {
     execFileSync(redocly, ['lint', abs, '--format=stylish'], {
@@ -191,23 +196,37 @@ function checkContract(root, abs) {
       timeout: TOOL_TIMEOUT_MS,
       env: { ...process.env, REDOCLY_TELEMETRY: 'off', REDOCLY_SUPPRESS_UPDATE_NOTICE: 'true' },
     });
-    return [];
+    return { problems: [], skipped: false };
   } catch (error) {
     const out = `${error.stdout ?? ''}${error.stderr ?? ''}`.slice(-MAX_OUTPUT_CHARS);
-    return [`redocly lint falhou:\n${out}`];
+    return { problems: [`redocly lint falhou:\n${out}`], skipped: false };
   }
 }
 
 // ---------------------------------------------------------------- main ----
 
+/** Binário de node_modules/.bin da raiz (null se não estiver instalado). */
+function localBin(root, name) {
+  const bin = path.join(root, 'node_modules', '.bin', name);
+  return existsSync(bin) ? bin : null;
+}
+
+/** Prettier se aplica a esta extensão? Se sim e ele não está instalado, a formatação foi pulada. */
 function formatWithPrettier(root, abs) {
-  const prettier = path.join(root, 'node_modules', '.bin', 'prettier');
-  if (!existsSync(prettier) || !PRETTIER_EXTENSIONS.has(path.extname(abs))) return;
+  if (!PRETTIER_EXTENSIONS.has(path.extname(abs))) return { skipped: false };
+  const prettier = localBin(root, 'prettier');
+  if (!prettier) return { skipped: true };
   try {
     execFileSync(prettier, ['--write', '--log-level', 'warn', abs], { cwd: root, stdio: 'ignore', timeout: TOOL_TIMEOUT_MS });
   } catch {
     // formatação é conveniência; o CI cobra format:check
   }
+  return { skipped: false };
+}
+
+/** Aviso (não bloqueante) de que as ferramentas locais faltam e as checagens foram puladas. */
+function toolsMissingNotice(root) {
+  return `[${HOOK}] aviso: prettier/redocly ausentes em ${root}; rode pnpm install --frozen-lockfile\n`;
 }
 
 try {
@@ -219,13 +238,19 @@ try {
   const abs = path.join(root, rel);
   if (!existsSync(abs)) process.exit(0);
 
-  formatWithPrettier(root, abs);
+  let toolsMissing = formatWithPrettier(root, abs).skipped;
   const text = readFileSync(abs, 'utf8');
 
   let problems = [];
   if (/^supabase\/migrations\/.+\.sql$/.test(rel)) problems = checkMigration(text);
   else if (/^src\/.+\.tsx?$/.test(rel) && !/\.test\.tsx?$/.test(rel)) problems = checkSource(rel, text);
-  else if (/^contracts\/openapi[^/]*\.ya?ml$/.test(rel)) problems = checkContract(root, abs);
+  else if (/^contracts\/openapi[^/]*\.ya?ml$/.test(rel)) {
+    const contract = checkContract(root, abs);
+    problems = contract.problems;
+    toolsMissing ||= contract.skipped;
+  }
+
+  if (toolsMissing) process.stderr.write(toolsMissingNotice(root));
 
   if (problems.length > 0) {
     block(`[${HOOK}] ${rel} viola regras do projeto (AGENTS.md › Segurança/Banco):\n- ${problems.join('\n- ')}\nCorrija antes de seguir.`);

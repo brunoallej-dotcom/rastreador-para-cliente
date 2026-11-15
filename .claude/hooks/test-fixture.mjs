@@ -2,7 +2,7 @@
 // Monta, em diretórios temporários, um repositório git descartável com commit inicial na branch main e uma
 // worktree dele em outro caminho (ou aninhada em .claude/worktrees/, como nos subagentes do Claude Code).
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,9 +94,51 @@ export function installFakePrettier(root, markerFile) {
   return bin;
 }
 
-/** Executa um hook de verdade, com o JSON no stdin como o Claude Code faz. */
-export function runHook(script, payload, { projectDir, cwd = projectDir, rawInput } = {}) {
-  const env = cleanEnv(projectDir === undefined ? {} : { CLAUDE_PROJECT_DIR: projectDir });
+/** Grava tudo (git add -A) e faz um commit em `cwd`; devolve o hash. */
+export function commitAll(cwd, message = 'wip') {
+  git(cwd, 'add', '-A');
+  git(cwd, 'commit', '--quiet', '-m', message);
+  return git(cwd, 'rev-parse', 'HEAD').trim();
+}
+
+/** Caminho absoluto do executável `name` no PATH atual (null se não achar). */
+export function findExecutable(name) {
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(dir, name);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // próximo diretório do PATH
+    }
+  }
+  return null;
+}
+
+/**
+ * Instala em `binDir` um falso `git` que repassa tudo ao git de verdade, exceto os comandos que casam com as
+ * regras: { match, exit, stderr } falha com o código/mensagem dados; { match, sleep } trava por `sleep`
+ * segundos (para testar timeout). `match` é uma substring dos argumentos (ex.: 'ls-tree'). Devolve o PATH com
+ * `binDir` na frente, para passar a `runHook({ env })` ou atribuir a process.env.PATH.
+ */
+export function installFakeGit(binDir, rules) {
+  const realGit = findExecutable('git');
+  const quote = (text) => `'${String(text).replaceAll("'", "'\\''")}'`;
+  const cases = rules.map((rule) =>
+    rule.sleep === undefined
+      ? `  *${rule.match}*) echo ${quote(rule.stderr ?? 'fatal: simulated failure')} >&2; exit ${rule.exit ?? 128};;`
+      : `  *${rule.match}*) exec sleep ${rule.sleep};;`,
+  );
+  const script = `#!/bin/sh\ncase "$*" in\n${cases.join('\n')}\nesac\nexec ${quote(realGit)} "$@"\n`;
+  const bin = path.join(binDir, 'git');
+  write(bin, script);
+  chmodSync(bin, 0o755);
+  return `${binDir}${path.delimiter}${process.env.PATH}`;
+}
+
+/** Executa um hook de verdade, com o JSON no stdin como o Claude Code faz. `env` acrescenta variáveis. */
+export function runHook(script, payload, { projectDir, cwd = projectDir, rawInput, env: extraEnv = {} } = {}) {
+  const env = cleanEnv({ ...(projectDir === undefined ? {} : { CLAUDE_PROJECT_DIR: projectDir }), ...extraEnv });
   if (projectDir === undefined) delete env.CLAUDE_PROJECT_DIR;
   const result = spawnSync(process.execPath, [path.join(HOOKS_DIR, script)], {
     cwd,

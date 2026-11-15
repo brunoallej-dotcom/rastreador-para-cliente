@@ -27,7 +27,7 @@
     "db:reset": "supabase db reset --local",
     "db:test": "supabase test db --local",
     "db:lint": "supabase db lint --local --fail-on error",
-    "db:types": "supabase gen types typescript --local --schema public > src/shared/db/database.types.ts",
+    "db:types": "mkdir -p src/shared/db && supabase gen types typescript --local --schema public > src/shared/db/database.types.ts",
     "db:new": "supabase migration new",
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm contract:lint && pnpm db:test",
     "ceo:create": "tsx scripts/create-ceo.ts"

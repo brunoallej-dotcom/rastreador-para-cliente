@@ -7,11 +7,24 @@ import { defineConfig, globalIgnores } from 'eslint/config';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
-const MODULES = ['identity', 'tracking'];
+/**
+ * Every folder under src/modules/ needs an entry here, or it is born without layer rules.
+ * tests/lint/eslint-boundaries.test.ts compares this list with the folders on disk.
+ * `platform` has no folder yet: Wave 1 creates src/modules/platform/presentation/health.handler.ts.
+ */
+export const MODULES = ['identity', 'tracking', 'platform'];
 /** Modules a module may not import at all (not even through the index). */
 const FORBIDDEN_MODULE_DEPS = { tracking: ['identity'] };
 
-const SRC_FILES = ['src/**/*.{ts,tsx}'];
+/** Every extension a source file may have: layer and route globs must not miss `.tsx`/`.js`/`.mts`. */
+const CODE_EXT = '{ts,tsx,mts,cts,js,jsx,mjs,cjs}';
+const SRC_FILES = [`src/**/*.${CODE_EXT}`];
+/** Test files that live beside the code they test (`x.test.ts`, `x.int.test.ts`). */
+const TEST_FILES = '*.test.{ts,tsx,mts}';
+/** The only package a domain test may import besides its own domain and the kernel. */
+const TEST_RUNNER = 'vitest';
+/** Folders inside a layer (domain/a/b/c.ts is depth 2) with their own relative-import limit. */
+const MAX_LAYER_DEPTH = 6;
 const NEXT_HEADERS = {
   name: 'next/headers',
   message:
@@ -20,27 +33,105 @@ const NEXT_HEADERS = {
 
 // ------------------------------------------------------------ no-restricted-syntax ----
 
-const POSTGREST_FILTER = '[callee.property.name=/^(or|filter|textSearch)$/]';
+const POSTGREST_CALL = "CallExpression[callee.type='MemberExpression']";
+/** `.or()/.filter()/.textSearch()`, by name or by computed string (`q['or'](...)`). */
+const POSTGREST_ANY =
+  ':matches([callee.property.name=/^(or|filter|textSearch)$/], [callee.property.value=/^(or|filter|textSearch)$/])';
+/**
+ * Calls whose FIRST argument is structure, not a value: `.or(filters)`, `.textSearch(column, ...)`
+ * and `.filter(column, operator, value)`. `.filter` with one argument is `Array#filter`
+ * (PostgREST's takes three), so it is not guarded.
+ */
+const POSTGREST_STRUCTURE =
+  ':matches([callee.property.name=/^(or|textSearch)$/], [callee.property.value=/^(or|textSearch)$/], ' +
+  "[callee.property.name='filter'][arguments.length>=2], [callee.property.value='filter'][arguments.length>=2])";
+/** First arguments that cannot carry input: literals, static templates and callbacks. */
+const SAFE_FIRST_ARGUMENTS = [
+  "[arguments.0.type='Literal']",
+  "[arguments.0.type='TemplateLiteral'][arguments.0.expressions.length=0]",
+  "[arguments.0.type='ArrowFunctionExpression']",
+  "[arguments.0.type='FunctionExpression']",
+  // Zod also has `.or()`: `schema.or(z.number().int())` is a call chain rooted at `z`.
+  ...Array.from({ length: 8 }, (_, i) => `[arguments.0${'.callee.object'.repeat(i + 1)}.name='z']`),
+];
 const POSTGREST_MESSAGE =
   'Interpolated/concatenated input in a PostgREST filter allows injection (spec §3.8). ' +
   'Use .eq/.in/.ilike with a plain value or an RPC.';
+const POSTGREST_FIRST_ARGUMENT_MESSAGE =
+  'The first argument of .or()/.filter()/.textSearch() must be a plain string literal: a variable, ' +
+  'call, concatenation or interpolated template allows PostgREST injection (spec §3.8). ' +
+  'Use .eq/.in/.ilike with a plain value or an RPC.';
+
+/** A member access to `getSession` through `.auth`, `['auth']` or a bare `auth`. */
+const AUTH_OBJECT =
+  ":matches([object.property.name='auth'], [object.property.value='auth'], [object.name='auth'])";
+const GET_SESSION_KEY =
+  ":matches([computed=false][key.name='getSession'], [key.value='getSession'])";
+const AUTH_SOURCE = (/** @type {string} */ field) =>
+  `:matches([${field}.property.name='auth'], [${field}.property.value='auth'], [${field}.name='auth'], ` +
+  `[${field}.expression.property.name='auth'], [${field}.expression.property.value='auth'])`;
+const GET_SESSION_SELECTORS = [
+  // supabase.auth.getSession(), supabase.auth?.getSession, supabase['auth']['getSession']()
+  `MemberExpression${AUTH_OBJECT}:matches([computed=false][property.name='getSession'], [computed=true][property.value='getSession'])`,
+  // supabase.auth[`getSession`]()
+  `MemberExpression${AUTH_OBJECT}[computed=true][property.type='TemplateLiteral'][property.expressions.length=0][property.quasis.0.value.cooked='getSession']`,
+  // const { getSession } = supabase.auth;  ({ getSession } = supabase.auth);
+  `VariableDeclarator${AUTH_SOURCE('init')} > ObjectPattern.id > Property${GET_SESSION_KEY}`,
+  `AssignmentExpression${AUTH_SOURCE('right')} > ObjectPattern.left > Property${GET_SESSION_KEY}`,
+  // const { auth: { getSession } } = supabase;  function f({ auth: { getSession } }) {}
+  `Property:matches([key.name='auth'][computed=false], [key.value='auth']) > ObjectPattern.value > Property${GET_SESSION_KEY}`,
+];
 
 const FORBIDDEN_SYNTAX = [
   {
-    selector: `CallExpression[callee.type='MemberExpression']${POSTGREST_FILTER} > TemplateLiteral.arguments[expressions.length>0]`,
+    selector: `${POSTGREST_CALL}${POSTGREST_ANY} > TemplateLiteral.arguments[expressions.length>0]`,
     message: POSTGREST_MESSAGE,
   },
   {
-    selector: `CallExpression[callee.type='MemberExpression']${POSTGREST_FILTER} > BinaryExpression[operator='+'].arguments`,
+    selector: `${POSTGREST_CALL}${POSTGREST_ANY} > BinaryExpression[operator='+'].arguments`,
     message: POSTGREST_MESSAGE,
   },
   {
-    selector:
-      "CallExpression[callee.property.name='getSession']:matches([callee.object.property.name='auth'], [callee.object.name='auth'])",
+    selector: `${POSTGREST_CALL}${POSTGREST_STRUCTURE}:not(${SAFE_FIRST_ARGUMENTS.join(', ')})`,
+    message: POSTGREST_FIRST_ARGUMENT_MESSAGE,
+  },
+  ...GET_SESSION_SELECTORS.map((selector) => ({
+    selector,
     message:
       'auth.getSession() does not validate the JWT on the server. Use getClaims()/getUser() through the PrincipalResolver.',
+  })),
+  {
+    selector: "ImportExpression[source.value='next/headers']",
+    message:
+      'Do not use next/headers: the pipeline reads NextRequest and writes NextResponse (spec §3.3).',
   },
 ];
+
+/**
+ * no-restricted-imports only sees static `import`/`export ... from`. In layers that must stay
+ * pure, every other way to load a module (or a module's types) would escape the layer rules.
+ */
+const DYNAMIC_LOADING = [
+  {
+    selector: 'ImportExpression',
+    message: 'Dynamic import() escapes the layer rules here; use a static import.',
+  },
+  {
+    selector: "CallExpression[callee.name='require']",
+    message: 'require() escapes the layer rules here; use a static import.',
+  },
+  {
+    selector: "TSImportEqualsDeclaration[moduleReference.type='TSExternalModuleReference']",
+    message: 'import x = require() escapes the layer rules here; use a static import.',
+  },
+  {
+    selector: 'TSImportType',
+    message: "import('…') types escape the layer rules here; use a static `import type`.",
+  },
+];
+
+/** `no-restricted-syntax` value for files of layers that must stay pure (domain, application). */
+const PURE_LAYER_SYNTAX = ['error', ...FORBIDDEN_SYNTAX, ...DYNAMIC_LOADING];
 
 // ------------------------------------------------------------ no-restricted-imports ----
 
@@ -48,11 +139,28 @@ const FORBIDDEN_SYNTAX = [
 const pattern = (regex, message) => ({ regex, message });
 
 /**
- * no-restricted-imports options. `next/headers` is forbidden everywhere in src/. Later config
- * objects REPLACE earlier ones for the same rule, so each layer lists its full set.
+ * Alias and relative specifiers must be canonical, otherwise `..`/`.` segments bypass every
+ * pattern below (`@/shared/kernel/../db/admin-client` starts like an allowed import):
+ * - a `..` segment after a normal segment (`@/a/../b`, `./a/../../b`, `@/..`);
+ * - a `.` segment after the first one (`@/a/./b`, `../.`);
+ * - an empty segment (`@/a//b`).
+ * Only leading `./` and `../` runs remain, which the layer patterns count.
+ */
+const NON_CANONICAL_SPECIFIER = pattern(
+  String.raw`^(?=@/|\.{1,2}(?:/|$)).*(?:/\.(?:/|$)|//|(?:^|/)(?!\.{1,2}(?:/|$))[^/]+/(?:.*/)?\.\.(?:/|$))`,
+  'Import specifiers may not contain ".."/"." segments after the first or empty segments: they bypass the module boundary rules. Write the canonical path.',
+);
+
+/**
+ * no-restricted-imports options. `next/headers` and non-canonical specifiers are forbidden
+ * everywhere in src/. Later config objects REPLACE earlier ones for the same rule, so each layer
+ * lists its full set: going through this helper is what puts the shared patterns in every list.
  * @param {...{ regex: string, message: string }} patterns
  */
-const restrictImports = (...patterns) => ['error', { paths: [NEXT_HEADERS], patterns }];
+const restrictImports = (...patterns) => [
+  'error',
+  { paths: [NEXT_HEADERS], patterns: [NON_CANONICAL_SPECIFIER, ...patterns] },
+];
 
 const alt = (/** @type {string[]} */ names) => names.join('|');
 
@@ -63,6 +171,24 @@ const aliasLayers = (/** @type {string} */ mod, /** @type {string[]} */ layers, 
 /** Relative imports (`../infrastructure/x`, `./a/presentation/y`) that land in one of the folders. */
 const relativeLayers = (/** @type {string[]} */ layers, message) =>
   pattern(String.raw`^\.{1,2}/(?:.*/)?(?:${alt(layers)})(?:/|$)`, message);
+
+/**
+ * Relative imports that stay inside the allowed layers of the module. A file `depth` folders below
+ * its layer root (domain/x.ts is 0, domain/a/x.ts is 1) can climb `depth` times and stay in the layer;
+ * `depth + 1` climbs land on the module root, where only `allowedLayers` may come next; more
+ * climbs leave the module. The specifier is canonical (NON_CANONICAL_SPECIFIER), so counting
+ * the leading `..` segments is enough: after `depth + 1` of them nothing but an allowed layer
+ * may follow (another `..`, the module index or any other folder is rejected).
+ */
+const relativeStayWithin = (
+  /** @type {number} */ depth,
+  /** @type {string[]} */ allowedLayers,
+  /** @type {string} */ message,
+) =>
+  pattern(
+    String.raw`^(?:\./)?(?:\.\.(?:/|$)){${depth + 1}}(?!(?:${alt(allowedLayers)})(?:/|$))`,
+    message,
+  );
 
 /** Cross-module rules for files of module `mod`. */
 const crossModulePatterns = (/** @type {string} */ mod) => {
@@ -85,7 +211,7 @@ const crossModulePatterns = (/** @type {string} */ mod) => {
     ...(others.length > 0
       ? [
           pattern(
-            String.raw`^(?:\.\./)+(?:modules/)?(?:${alt(others)})(?:/|$)`,
+            String.raw`^(?:\./)?(?:\.\./)+(?:modules/)?(?:${alt(others)})(?:/|$)`,
             'Do not reach into another module with relative paths; use its index through the "@/modules/<name>" alias.',
           ),
         ]
@@ -93,34 +219,67 @@ const crossModulePatterns = (/** @type {string} */ mod) => {
   ];
 };
 
-/** Rules for src/modules/<mod>/<layer>/**. */
+/** Rules for src/modules/<mod>/**. */
 const moduleLayerConfigs = (/** @type {string} */ mod) => {
   const base = `src/modules/${mod}`;
   const cross = crossModulePatterns(mod);
+  /**
+   * One config object per folder depth inside the layer; later objects win, so a file at depth N
+   * gets the limits for N (deeper than MAX_LAYER_DEPTH it keeps the strictest-for-its-depth ones,
+   * which fails closed).
+   */
+  const byDepth = (
+    /** @type {string} */ layer,
+    /** @type {(depth: number) => unknown} */ imports,
+    /** @type {unknown} */ syntax,
+    /** @type {string} */ fileGlob = `*.${CODE_EXT}`,
+    /** @type {string} */ nameSuffix = '',
+  ) =>
+    Array.from({ length: MAX_LAYER_DEPTH + 1 }, (_, depth) => ({
+      name: `boundaries/${mod}/${layer}${nameSuffix}/depth-${depth}`,
+      files: [`${base}/${layer}/${'*/'.repeat(depth)}**/${fileGlob}`],
+      rules: {
+        'no-restricted-imports': imports(depth),
+        ...(depth === 0 && syntax !== undefined ? { 'no-restricted-syntax': syntax } : {}),
+      },
+    }));
+  /** domain/ imports; test files may also import the test runner and nothing else new. */
+  const domainImports = (/** @type {number} */ depth, /** @type {boolean} */ isTestFile) =>
+    restrictImports(
+      // Allow-only: relative paths inside domain, own domain via alias, shared/kernel.
+      pattern(
+        String.raw`^(?!\.{1,2}(?:/|$)|${isTestFile ? `${TEST_RUNNER}$|` : ''}@/shared/kernel(?:/|$)|@/modules/${mod}/domain(?:/|$)).+`,
+        isTestFile
+          ? 'domain/ tests may import only their own domain/, @/shared/kernel and vitest.'
+          : 'domain/ may import only its own domain/ and @/shared/kernel (no I/O, no frameworks, no other layer).',
+      ),
+      relativeLayers(
+        ['application', 'infrastructure', 'presentation', 'shared', 'modules', 'app'],
+        'domain/ may not reach other layers or shared/ through relative paths.',
+      ),
+      relativeStayWithin(
+        depth,
+        ['domain'],
+        'domain/ relative imports must stay inside domain/ (not the module root, its index or another layer).',
+      ),
+      ...cross,
+    );
   return [
     {
-      name: `boundaries/${mod}/domain`,
-      files: [`${base}/domain/**/*.ts`],
-      rules: {
-        'no-restricted-imports': restrictImports(
-          // Allow-only: relative paths inside domain, own domain via alias, shared/kernel.
-          pattern(
-            String.raw`^(?!\.{1,2}(?:/|$)|@/shared/kernel(?:/|$)|@/modules/${mod}/domain(?:/|$)).+`,
-            'domain/ may import only its own domain/ and @/shared/kernel (no I/O, no frameworks, no other layer).',
-          ),
-          relativeLayers(
-            ['application', 'infrastructure', 'presentation', 'shared', 'modules', 'app'],
-            'domain/ may not reach other layers or shared/ through relative paths.',
-          ),
-          ...cross,
-        ),
-      },
+      // Everything in the module, including the index and folders without a layer of their own.
+      name: `boundaries/${mod}/all`,
+      files: [`${base}/**/*.${CODE_EXT}`],
+      rules: { 'no-restricted-imports': restrictImports(...cross) },
     },
-    {
-      name: `boundaries/${mod}/application`,
-      files: [`${base}/application/**/*.ts`],
-      rules: {
-        'no-restricted-imports': restrictImports(
+    ...byDepth('domain', (depth) => domainImports(depth, false), PURE_LAYER_SYNTAX),
+    // Unit and integration tests (`x.test.ts`, `x.int.test.ts`) beside the domain code: the same
+    // limits plus the test runner. They come later, so they win for test files; the syntax rule
+    // (no dynamic loading) is inherited from the objects above.
+    ...byDepth('domain', (depth) => domainImports(depth, true), undefined, TEST_FILES, '/tests'),
+    ...byDepth(
+      'application',
+      (depth) =>
+        restrictImports(
           aliasLayers(
             mod,
             ['infrastructure', 'presentation'],
@@ -134,13 +293,18 @@ const moduleLayerConfigs = (/** @type {string} */ mod) => {
             String.raw`^(?:@supabase/|next(?:/|$)|@/shared/db(?:/|$))`,
             'application/ does no I/O: no @supabase/*, next or @/shared/db (use ports from domain/).',
           ),
+          relativeStayWithin(
+            depth,
+            ['domain', 'application'],
+            'application/ relative imports may only reach domain/ and application/ (not the module root, its index or another layer).',
+          ),
           ...cross,
         ),
-      },
-    },
+      PURE_LAYER_SYNTAX,
+    ),
     {
       name: `boundaries/${mod}/infrastructure`,
-      files: [`${base}/infrastructure/**/*.ts`],
+      files: [`${base}/infrastructure/**/*.${CODE_EXT}`],
       rules: {
         'no-restricted-imports': restrictImports(
           aliasLayers(mod, ['presentation'], 'infrastructure/ must not import presentation/.'),
@@ -151,16 +315,13 @@ const moduleLayerConfigs = (/** @type {string} */ mod) => {
     },
     {
       name: `boundaries/${mod}/presentation`,
-      files: [`${base}/presentation/**/*.ts`],
-      rules: { 'no-restricted-imports': restrictImports(...cross) },
-    },
-    {
-      name: `boundaries/${mod}/index`,
-      files: [`${base}/*.ts`],
+      files: [`${base}/presentation/**/*.${CODE_EXT}`],
       rules: { 'no-restricted-imports': restrictImports(...cross) },
     },
   ];
 };
+
+const ROUTE_FILES = [`src/app/**/route.${CODE_EXT}`];
 
 const boundaryConfigs = [
   {
@@ -171,17 +332,20 @@ const boundaryConfigs = [
   ...MODULES.flatMap(moduleLayerConfigs),
   {
     name: 'boundaries/shared',
-    files: ['src/shared/**/*.{ts,tsx}'],
+    files: [`src/shared/**/*.${CODE_EXT}`],
     rules: {
       'no-restricted-imports': restrictImports(
         pattern(String.raw`^@/modules(?:/|$)`, 'src/shared/ never imports @/modules/**.'),
-        pattern(String.raw`^(?:\.\./)+modules(?:/|$)`, 'src/shared/ never imports modules/.'),
+        pattern(
+          String.raw`^(?:\./)?(?:\.\./)+modules(?:/|$)`,
+          'src/shared/ never imports modules/.',
+        ),
       ),
     },
   },
   {
     name: 'boundaries/route',
-    files: ['src/app/**/route.{ts,tsx}'],
+    files: ROUTE_FILES,
     rules: {
       'no-restricted-imports': restrictImports(
         // Allow-only: the handler file of a module's presentation layer.
@@ -193,10 +357,10 @@ const boundaryConfigs = [
       'no-restricted-syntax': [
         'error',
         ...FORBIDDEN_SYNTAX,
-        {
-          selector: 'ImportExpression',
-          message: 'route.ts only re-exports the handler; dynamic import() is not allowed.',
-        },
+        ...DYNAMIC_LOADING.map((rule) => ({
+          ...rule,
+          message: `route.ts only re-exports the handler. ${rule.message}`,
+        })),
       ],
     },
   },

@@ -4,8 +4,18 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { gitToplevel, projectDir, relativeToProject } from './lib.mjs';
-import { createFixture, write } from './test-fixture.mjs';
+import {
+  describeGitError,
+  existingMainRefs,
+  gitFailureText,
+  gitResult,
+  gitToplevel,
+  hasGitSegment,
+  projectDir,
+  relativeToProject,
+  sameRepository,
+} from './lib.mjs';
+import { createFixture, git, installFakeGit, write } from './test-fixture.mjs';
 
 const MIGRATION = 'supabase/migrations/20260102000000_new.sql';
 
@@ -154,5 +164,222 @@ describe('relativeToProject', () => {
     const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: fx.main }, file));
     assert.equal(root, fx.realWorktree);
     assert.equal(relativeToProject(root, file), 'src/novo/a.ts');
+  });
+});
+
+/** Cria um repositório git próprio (aninhado/estranho) em `dir`. */
+function initForeignRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  git(dir, 'init', '--quiet');
+}
+
+describe('projectDir: repositório git aninhado não sequestra a raiz (M4)', () => {
+  for (const nested of [false, true]) {
+    describe(nested ? 'worktree aninhada em <repo>/.claude/worktrees' : 'worktree em outro caminho', () => {
+      let fx;
+      beforeEach(() => {
+        fx = createFixture({ nested });
+      });
+      afterEach(() => fx.cleanup());
+
+      it('git init em <repo>/src: o arquivo de src/ resolve a raiz do repositório, com caminho relativo src/…', () => {
+        initForeignRepo(path.join(fx.main, 'src'));
+        const file = path.join(fx.main, 'src', 'x.ts');
+        const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: fx.main }, file));
+        assert.equal(root, realpathSync(fx.main));
+        assert.equal(relativeToProject(root, file), 'src/x.ts');
+      });
+
+      it('git init em <worktree>/src: a raiz continua sendo a da worktree (não cai no checkout principal)', () => {
+        initForeignRepo(path.join(fx.worktree, 'src'));
+        const file = path.join(fx.worktree, 'src', 'x.ts');
+        const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: fx.main }, file));
+        assert.equal(root, fx.realWorktree);
+        assert.equal(relativeToProject(root, file), 'src/x.ts');
+      });
+
+      it('git init em <repo>/supabase/migrations: a migration continua sob supabase/migrations/', () => {
+        initForeignRepo(path.join(fx.main, 'supabase', 'migrations'));
+        const file = path.join(fx.main, fx.initialMigration);
+        const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: fx.main }, file));
+        assert.equal(relativeToProject(root, file), fx.initialMigration);
+      });
+
+      it('Stop/SessionStart (sem arquivo) com cwd num repositório aninhado: usa a raiz do repositório', () => {
+        initForeignRepo(path.join(fx.main, 'src'));
+        const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: path.join(fx.main, 'src') }));
+        assert.equal(root, realpathSync(fx.main));
+      });
+    });
+  }
+
+  describe('sem CLAUDE_PROJECT_DIR (comportamento atual preservado)', () => {
+    let fx;
+    beforeEach(() => {
+      fx = createFixture();
+    });
+    afterEach(() => fx.cleanup());
+
+    it('vale a raiz git mais próxima, inclusive a do repositório aninhado', () => {
+      const nestedRepo = path.join(fx.main, 'src');
+      initForeignRepo(nestedRepo);
+      const file = path.join(nestedRepo, 'x.ts');
+      const root = withProjectDirEnv(undefined, () => projectDir({ cwd: fx.main }, file));
+      assert.equal(root, realpathSync(nestedRepo));
+    });
+  });
+
+  describe('repositório sem relação com CLAUDE_PROJECT_DIR', () => {
+    let fx;
+    let foreign;
+    beforeEach(() => {
+      fx = createFixture();
+      foreign = mkdtempSync(path.join(os.tmpdir(), 'hooks-foreign-'));
+      git(foreign, 'init', '--quiet');
+    });
+    afterEach(() => {
+      fx.cleanup();
+      rmSync(foreign, { recursive: true, force: true });
+    });
+
+    it('arquivo de outro repositório cai em CLAUDE_PROJECT_DIR (e fica fora do projeto)', () => {
+      const file = path.join(foreign, 'src', 'x.ts');
+      const root = withProjectDirEnv(fx.main, () => projectDir({ cwd: foreign }, file));
+      assert.equal(root, fx.main);
+      assert.equal(relativeToProject(root, file), null);
+    });
+  });
+});
+
+describe('sameRepository', () => {
+  let fx;
+  let outside;
+  beforeEach(() => {
+    fx = createFixture();
+    outside = mkdtempSync(path.join(os.tmpdir(), 'hooks-same-'));
+  });
+  afterEach(() => {
+    fx.cleanup();
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('checkout principal e worktree vinculada compartilham o repositório', () => {
+    assert.equal(sameRepository(fx.main, fx.worktree), true);
+    assert.equal(sameRepository(fx.worktree, path.join(fx.worktree, 'pasta', 'inexistente')), true);
+  });
+
+  it('repositório aninhado, repositório estranho e pasta fora de repositório não contam', () => {
+    initForeignRepo(path.join(fx.main, 'src'));
+    git(outside, 'init', '--quiet');
+    assert.equal(sameRepository(path.join(fx.main, 'src'), fx.main), false);
+    assert.equal(sameRepository(outside, fx.main), false);
+    assert.equal(sameRepository(fx.main, path.join(os.tmpdir(), 'hooks-nao-existe-' + process.pid)), false);
+  });
+});
+
+describe('hasGitSegment', () => {
+  it('detecta segmento .git em qualquer posição, inclusive no fim e via ..', () => {
+    assert.equal(hasGitSegment('/r/.git'), true);
+    assert.equal(hasGitSegment('/r/.git/hooks/pre-commit'), true);
+    assert.equal(hasGitSegment('/r/src/../.git/config'), true);
+    assert.equal(hasGitSegment('/r/sub/.GIT/config'), true);
+    assert.equal(hasGitSegment('/r/x\\.git\\config'), true); // separador do Windows
+  });
+
+  it('não confunde com nomes parecidos', () => {
+    assert.equal(hasGitSegment('/r/.github/workflows/ci.yml'), false);
+    assert.equal(hasGitSegment('/r/.gitignore'), false);
+    assert.equal(hasGitSegment('/r/.gitattributes'), false);
+    assert.equal(hasGitSegment('/r/foo.git/x'), false);
+    assert.equal(hasGitSegment('/r/src/git/x.ts'), false);
+  });
+});
+
+describe('falhas do git (describeGitError, gitResult, existingMainRefs)', () => {
+  let fx;
+  let outside;
+  let previousPath;
+  beforeEach(() => {
+    fx = createFixture();
+    outside = mkdtempSync(path.join(os.tmpdir(), 'hooks-gitfail-'));
+    previousPath = process.env.PATH;
+  });
+  afterEach(() => {
+    process.env.PATH = previousPath;
+    fx.cleanup();
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('classifica erros sintéticos: timeout, git ausente, não é repositório e demais falhas', () => {
+    assert.equal(describeGitError({ code: 'ETIMEDOUT' }).kind, 'timeout');
+    assert.equal(describeGitError({ killed: true, signal: 'SIGTERM' }).kind, 'timeout');
+    assert.equal(describeGitError({ code: 'ENOENT' }).kind, 'unavailable');
+    assert.equal(
+      describeGitError({ status: 128, stderr: 'fatal: not a git repository (or any of the parent directories): .git\n' }).kind,
+      'not-repo',
+    );
+    const other = describeGitError({ status: 128, stderr: 'fatal: index file corrupt' });
+    assert.equal(other.kind, 'failed');
+    assert.equal(other.status, 128);
+    assert.equal(describeGitError(new Error('boom')).kind, 'failed');
+  });
+
+  it('fora de um repositório → not-repo', () => {
+    const result = gitResult(outside, ['status', '--porcelain']);
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'not-repo');
+  });
+
+  it('índice corrompido → failed (não é "não é um repositório")', () => {
+    write(path.join(fx.main, '.git', 'index'), 'lixo');
+    const result = gitResult(fx.main, ['status', '--porcelain']);
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'failed');
+    assert.equal(result.status, 128);
+    assert.match(gitFailureText(result), /git falhou \(código 128\)/);
+  });
+
+  it('git que trava estoura o timeout → timeout', () => {
+    const bin = mkdtempSync(path.join(os.tmpdir(), 'hooks-fakegit-'));
+    try {
+      process.env.PATH = installFakeGit(bin, [{ match: 'status', sleep: 10 }]);
+      const result = gitResult(fx.main, ['status', '--porcelain'], { timeout: 300 });
+      assert.equal(result.ok, false);
+      assert.equal(result.kind, 'timeout');
+      assert.equal(gitFailureText(result), 'git estourou o tempo limite');
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it('HOOKS_GIT_TIMEOUT_MS só encurta o timeout (nunca alonga)', () => {
+    const bin = mkdtempSync(path.join(os.tmpdir(), 'hooks-fakegit-'));
+    const previousCap = process.env.HOOKS_GIT_TIMEOUT_MS;
+    try {
+      process.env.PATH = installFakeGit(bin, [{ match: 'status', sleep: 10 }]);
+      process.env.HOOKS_GIT_TIMEOUT_MS = '300';
+      assert.equal(gitResult(fx.main, ['status'], { timeout: 60000 }).kind, 'timeout');
+    } finally {
+      if (previousCap === undefined) delete process.env.HOOKS_GIT_TIMEOUT_MS;
+      else process.env.HOOKS_GIT_TIMEOUT_MS = previousCap;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it('existingMainRefs lista as refs da main que existem, na ordem de preferência', () => {
+    assert.deepEqual(existingMainRefs(fx.worktree), { ok: true, refs: ['refs/heads/main'] });
+    const sha = git(fx.main, 'rev-parse', 'HEAD').trim();
+    git(fx.main, 'update-ref', 'refs/remotes/origin/main', sha);
+    assert.deepEqual(existingMainRefs(fx.worktree).refs, ['refs/heads/main', 'refs/remotes/origin/main']);
+    git(fx.main, 'update-ref', '-d', 'refs/heads/main');
+    assert.deepEqual(existingMainRefs(fx.worktree).refs, ['refs/remotes/origin/main']);
+    git(fx.main, 'update-ref', '-d', 'refs/remotes/origin/main');
+    assert.deepEqual(existingMainRefs(fx.worktree), { ok: true, refs: [] });
+  });
+
+  it('existingMainRefs devolve a falha do git quando ele não consegue responder', () => {
+    const result = existingMainRefs(outside);
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, 'not-repo');
   });
 });
