@@ -1,0 +1,2113 @@
+openapi: 3.1.0
+info:
+  title: Rastreador para Cliente API
+  version: 1.0.0-draft.1
+  summary: Backend do rastreador de entregas (painel do cliente e painel dos CEOs).
+  description: |
+    Contrato normativo da API v1. Spec de origem: `docs/specs/client-delivery-tracker.md`.
+    O código respeita este contrato; mudança incompatível vira `/api/v2`, e mudança aditiva é
+    bump minor desta versão, com nota de compatibilidade.
+
+    ## Autenticação
+    Sessão em cookie `__Host-rt-session` (`HttpOnly; Secure; SameSite=Lax; Path=/`), emitido por
+    `POST /auth/login`. O cookie pode ser dividido em `__Host-rt-session.0`, `.1`… Tokens nunca
+    aparecem no corpo das respostas. **Deny by default:** só operações com `security: []` são
+    públicas.
+
+    ## Extensões
+    - `x-auth-policy`: política declarada pelo handler (`withRoute`). `roles` são os papéis
+      aceitos; `allowPending` são as pendências (`CHANGE_PASSWORD`, `ENROLL_MFA`, `VERIFY_MFA`)
+      com as quais a operação continua acessível. Pendência fora da lista → 403 com o `code` da
+      pendência.
+    - `x-rate-limit`: limites aplicados antes da autenticação (escopo `ip` ou `account`) ou depois
+      (escopo `user`). Excedido → 429 com `Retry-After`.
+
+    ## CSRF
+    Métodos não seguros exigem o header `Origin` igual a uma origem permitida (senão 403
+    `ORIGIN_NOT_ALLOWED`) e `Content-Type: application/json` quando há corpo (senão 415).
+    Corpo limitado a 16 KiB (senão 413).
+
+    ## Headers em todas as respostas
+    `X-Request-Id`, `Cache-Control: no-store`, `Strict-Transport-Security`,
+    `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+    `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+    `Permissions-Policy`.
+
+    ## Erros
+    `application/problem+json` (RFC 9457) com `code` estável e `requestId`. Nunca contém stack,
+    SQL ou mensagens de serviços internos. Recurso de outro tenant responde 404, nunca 403.
+  license:
+    name: Proprietário — todos os direitos reservados
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: /api/v1
+    description: Mesma origem do frontend (dev, preview e produção)
+security:
+  - sessionCookie: []
+tags:
+  - name: Health
+    description: Verificação de disponibilidade (pública).
+  - name: Auth
+    description: Login, logout, sessão, troca de senha e MFA TOTP.
+  - name: Client Panel
+    description: Painel do cliente. Tenant derivado da sessão; nenhum id de cliente é aceito.
+  - name: Admin Clients
+    description: Painel dos CEOs — clientes (uma aba por cliente).
+  - name: Admin Client Users
+    description: Painel dos CEOs — logins dos clientes.
+  - name: Admin Processes
+    description: Painel dos CEOs — processos, fases, aprovações ("Ok") e linha do tempo.
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      description: Liveness simples. Não expõe versão, dependências nem detalhes internos.
+      tags: [Health]
+      security: []
+      x-auth-policy:
+        access: public
+      x-rate-limit:
+        - scope: ip
+          limit: 60
+          windowSeconds: 60
+      responses:
+        '200':
+          description: Serviço no ar.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: Login com e-mail e senha
+      description: |
+        Cria a sessão e grava o cookie `__Host-rt-session`. A falha é sempre
+        `401 INVALID_CREDENTIALS` com corpo idêntico (e-mail inexistente, senha errada ou conta
+        desativada). Não existe cadastro público.
+      tags: [Auth]
+      security: []
+      x-auth-policy:
+        access: public
+      x-rate-limit:
+        - scope: ip
+          limit: 20
+          windowSeconds: 900
+        - scope: account
+          limit: 10
+          windowSeconds: 900
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              client:
+                value:
+                  email: contato@cliente.com.br
+                  password: correct-horse-battery
+      responses:
+        '200':
+          description: Sessão criada. Verifique `pendingActions` antes de seguir.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Set-Cookie:
+              $ref: '#/components/headers/Set-Cookie-Session'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Encerrar a sessão atual
+      description: Revoga a sessão no servidor (escopo local) e limpa o cookie.
+      tags: [Auth]
+      x-auth-policy:
+        access: authenticated
+        roles: [client, ceo]
+        allowPending: [CHANGE_PASSWORD, ENROLL_MFA, VERIFY_MFA]
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContentClearCookie'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/session:
+    get:
+      operationId: getSession
+      summary: Sessão atual
+      description: Retorna o principal da sessão, o nível de garantia (`aal`) e as pendências.
+      tags: [Auth]
+      x-auth-policy:
+        access: authenticated
+        roles: [client, ceo]
+        allowPending: [CHANGE_PASSWORD, ENROLL_MFA, VERIFY_MFA]
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      responses:
+        '200':
+          description: Sessão válida.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/password:
+    post:
+      operationId: changePassword
+      summary: Trocar a própria senha
+      description: |
+        Exige a senha atual. A nova precisa ter de 12 a 72 bytes UTF-8 e ser diferente da atual.
+        Revoga as outras sessões do usuário e limpa a pendência `CHANGE_PASSWORD`.
+      tags: [Auth]
+      x-auth-policy:
+        access: authenticated
+        roles: [client, ceo]
+        allowPending: [CHANGE_PASSWORD, ENROLL_MFA]
+      x-rate-limit:
+        - scope: user
+          limit: 5
+          windowSeconds: 900
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          $ref: '#/components/responses/NoContent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/mfa/totp/enroll:
+    post:
+      operationId: enrollTotp
+      summary: Iniciar o cadastro de TOTP (CEO)
+      description: |
+        Cria um fator TOTP não verificado e devolve URI, segredo e QR code (exibidos uma única
+        vez). Um fator não verificado anterior é substituído. Se já existir fator verificado,
+        responde 409 `MFA_ALREADY_ENROLLED`.
+      tags: [Auth]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: [ENROLL_MFA]
+      x-rate-limit:
+        - scope: user
+          limit: 10
+          windowSeconds: 900
+      responses:
+        '200':
+          description: Fator criado, aguardando verificação.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpEnrollment'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /auth/mfa/totp/verify:
+    post:
+      operationId: verifyTotp
+      summary: Verificar código TOTP (CEO)
+      description: |
+        Ativa o fator (no primeiro uso) e eleva a sessão para `aal2`. Os cookies são reescritos.
+        Código errado → 422 `INVALID_MFA_CODE`, contado no rate limit.
+      tags: [Auth]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: [ENROLL_MFA, VERIFY_MFA]
+      x-rate-limit:
+        - scope: user
+          limit: 5
+          windowSeconds: 300
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpVerifyRequest'
+      responses:
+        '200':
+          description: Sessão elevada para aal2.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Set-Cookie:
+              $ref: '#/components/headers/Set-Cookie-Session'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me/processes:
+    get:
+      operationId: listMyProcesses
+      summary: Listar os meus processos
+      description: Processos do cliente da sessão. Não aceita id de cliente.
+      tags: [Client Panel]
+      x-auth-policy:
+        access: authenticated
+        roles: [client]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Lista paginada, do processo mais recente para o mais antigo.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyProcessList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me/processes/{processId}:
+    get:
+      operationId: getMyProcess
+      summary: Detalhar um processo meu
+      description: Processo de outro cliente ou inexistente → 404 com a mesma resposta.
+      tags: [Client Panel]
+      x-auth-policy:
+        access: authenticated
+        roles: [client]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ProcessId'
+      responses:
+        '200':
+          description: Processo com as fases (somente campos visíveis ao cliente).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyProcessDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients:
+    get:
+      operationId: listClients
+      summary: Listar clientes
+      description: Base das abas do painel dos CEOs. Ordenado por criação (mais recente primeiro).
+      tags: [Admin Clients]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: includeArchived
+          in: query
+          required: false
+          description: Inclui clientes arquivados.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Lista paginada de clientes.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createClient
+      summary: Criar cliente
+      tags: [Admin Clients]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+      responses:
+        '201':
+          description: Cliente criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{clientId}:
+    get:
+      operationId: getClient
+      summary: Detalhar cliente
+      tags: [Admin Clients]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      responses:
+        '200':
+          description: Cliente.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateClient
+      summary: Renomear, arquivar ou desarquivar cliente
+      description: Arquivar impede novos processos e novos logins; não desativa os logins existentes.
+      tags: [Admin Clients]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientRequest'
+      responses:
+        '200':
+          description: Cliente atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{clientId}/users:
+    get:
+      operationId: listClientUsers
+      summary: Listar os logins de um cliente
+      tags: [Admin Client Users]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      responses:
+        '200':
+          description: Logins do cliente (no máximo 10).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientUserList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: provisionClientUser
+      summary: Provisionar login para um cliente
+      description: |
+        Cria o login com senha temporária gerada pelo servidor (20 caracteres, CSPRNG),
+        devolvida **somente nesta resposta**. O usuário nasce com a pendência `CHANGE_PASSWORD`.
+      tags: [Admin Client Users]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 20
+          windowSeconds: 3600
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProvisionClientUserRequest'
+      responses:
+        '201':
+          description: Login criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionedClientUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/clients/{clientId}/users/{userId}:
+    patch:
+      operationId: updateClientUser
+      summary: Desativar, reativar ou renomear um login de cliente
+      description: Desativar revoga todas as sessões do usuário imediatamente.
+      tags: [Admin Client Users]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientUserRequest'
+      responses:
+        '200':
+          description: Login atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{clientId}/users/{userId}/password-reset:
+    post:
+      operationId: resetClientUserPassword
+      summary: Resetar a senha de um login de cliente
+      description: |
+        Gera uma nova senha temporária (devolvida somente nesta resposta), marca a pendência
+        `CHANGE_PASSWORD` e revoga todas as sessões do usuário.
+      tags: [Admin Client Users]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 20
+          windowSeconds: 3600
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Senha resetada.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TemporaryPassword'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/clients/{clientId}/processes:
+    get:
+      operationId: listClientProcesses
+      summary: Listar os processos de um cliente
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          description: Filtra por status.
+          schema:
+            $ref: '#/components/schemas/ProcessStatus'
+      responses:
+        '200':
+          description: Lista paginada, do mais recente para o mais antigo.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createProcess
+      summary: Criar processo para um cliente
+      description: |
+        Sem `stages`, usa o template padrão (`GET /admin/stage-templates/default`). A fase 1 já
+        nasce `in_progress`. Cliente arquivado → 422 `CLIENT_ARCHIVED`.
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ClientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProcessRequest'
+      responses:
+        '201':
+          description: Processo criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/processes/{processId}:
+    get:
+      operationId: getProcess
+      summary: Detalhar processo (visão de CEO)
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ProcessId'
+      responses:
+        '200':
+          description: Processo com fases e aprovações.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateProcess
+      summary: Renomear ou cancelar processo
+      description: Só processos `active` aceitam mudança; nos demais → 422 `PROCESS_NOT_ACTIVE`.
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ProcessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProcessRequest'
+      responses:
+        '200':
+          description: Processo atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/processes/{processId}/approvals:
+    post:
+      operationId: approveCurrentStage
+      summary: Dar "Ok" na fase atual
+      description: |
+        Conclui a fase atual e inicia a próxima (ou conclui o processo, se for a última). Basta
+        **um** CEO. `expectedStageId` precisa ser a fase atual; se não for (outro CEO já
+        aprovou ou houve um retry), responde 409 `STALE_STAGE` com `currentStageId`.
+        Operação atômica, com auditoria na mesma transação.
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 60
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ProcessId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveStageRequest'
+            examples:
+              approve:
+                value:
+                  expectedStageId: 7f1c2b4e-9a3d-4c5e-8f6a-1b2c3d4e5f60
+      responses:
+        '200':
+          description: Fase aprovada; devolve o processo atualizado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: A fase esperada não é mais a atual.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/StaleStageProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/processes/{processId}/events:
+    get:
+      operationId: listProcessEvents
+      summary: Linha do tempo do processo
+      description: Eventos de auditoria do processo em ordem cronológica crescente.
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      parameters:
+        - $ref: '#/components/parameters/ProcessId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Eventos paginados.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessEventList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/stage-templates/default:
+    get:
+      operationId: getDefaultStageTemplate
+      summary: Template padrão de fases
+      description: Alterado somente por migration.
+      tags: [Admin Processes]
+      x-auth-policy:
+        access: authenticated
+        roles: [ceo]
+        allowPending: []
+      x-rate-limit:
+        - scope: user
+          limit: 300
+          windowSeconds: 60
+      responses:
+        '200':
+          description: Fases padrão em ordem.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StageTemplate'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-rt-session
+      description: |
+        Cookie de sessão HttpOnly emitido por `POST /auth/login` (gerenciado por `@supabase/ssr`).
+        Pode ser dividido em `__Host-rt-session.0`, `.1`… O access token interno expira em 15 min
+        e é renovado de forma transparente; a sessão é checada no banco a cada requisição.
+
+  parameters:
+    ClientId:
+      name: clientId
+      in: path
+      required: true
+      description: Id do cliente.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    ProcessId:
+      name: processId
+      in: path
+      required: true
+      description: Id do processo.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Id do login (usuário) do cliente.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Tamanho da página.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Cursor opaco devolvido em `nextCursor`. Valor adulterado → 400.
+      schema:
+        $ref: '#/components/schemas/Cursor'
+
+  headers:
+    X-Request-Id:
+      description: Correlation id da requisição (também gravado nos logs e na auditoria).
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9-]{8,64}$'
+    Retry-After:
+      description: Segundos até a próxima tentativa ser aceita.
+      schema:
+        type: integer
+        minimum: 1
+    Location:
+      description: URL do recurso criado.
+      schema:
+        type: string
+        format: uri-reference
+    Set-Cookie-Session:
+      description: '`__Host-rt-session=…; HttpOnly; Secure; SameSite=Lax; Path=/` (pode vir em chunks `.0`, `.1`).'
+      schema:
+        type: string
+
+  responses:
+    NoContent:
+      description: Sucesso sem corpo.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+    NoContentClearCookie:
+      description: Sessão encerrada; o cookie é expirado.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Set-Cookie:
+          $ref: '#/components/headers/Set-Cookie-Session'
+    BadRequest:
+      description: Input inválido (`VALIDATION_ERROR`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ValidationProblem'
+    Unauthenticated:
+      description: Sessão ausente, expirada ou revogada (`UNAUTHENTICATED`); no login, `INVALID_CREDENTIALS`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        `FORBIDDEN` (papel não permitido), `ORIGIN_NOT_ALLOWED` (CSRF) ou pendência:
+        `PASSWORD_CHANGE_REQUIRED`, `MFA_ENROLLMENT_REQUIRED`, `MFA_VERIFICATION_REQUIRED`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Recurso inexistente ou de outro tenant (`NOT_FOUND`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: '`EMAIL_ALREADY_REGISTERED`, `MFA_ALREADY_ENROLLED` ou `CONFLICT`.'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: Corpo maior que 16 KiB (`PAYLOAD_TOO_LARGE`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: Corpo sem `Content-Type` application/json (`UNSUPPORTED_MEDIA_TYPE`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: |
+        Regra de negócio violada: `PROCESS_NOT_ACTIVE`, `CLIENT_ARCHIVED`, `WEAK_PASSWORD`,
+        `PASSWORD_UNCHANGED`, `INVALID_CURRENT_PASSWORD`, `INVALID_MFA_CODE`, `USER_LIMIT_REACHED`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Limite excedido (`RATE_LIMITED`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: Erro inesperado (`INTERNAL_ERROR`). Sem detalhes internos; use o `requestId`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: Dependência indisponível ou lenta (`SERVICE_UNAVAILABLE`). Retry seguro.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+    Cursor:
+      type: string
+      minLength: 1
+      maxLength: 200
+      pattern: '^[A-Za-z0-9_-]+$'
+    Role:
+      type: string
+      enum: [client, ceo]
+    Aal:
+      type: string
+      description: Nível de garantia da sessão (aal2 = MFA verificado).
+      enum: [aal1, aal2]
+    PendingAction:
+      type: string
+      enum: [CHANGE_PASSWORD, ENROLL_MFA, VERIFY_MFA]
+    ProcessStatus:
+      type: string
+      enum: [active, completed, cancelled]
+    StageStatus:
+      type: string
+      enum: [pending, in_progress, completed]
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 120
+    TemporaryPasswordValue:
+      type: string
+      minLength: 20
+      maxLength: 20
+      description: Senha temporária (CSPRNG). Exibida uma única vez; nunca logada.
+
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_ERROR
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - FORBIDDEN
+        - ORIGIN_NOT_ALLOWED
+        - PASSWORD_CHANGE_REQUIRED
+        - MFA_ENROLLMENT_REQUIRED
+        - MFA_VERIFICATION_REQUIRED
+        - NOT_FOUND
+        - STALE_STAGE
+        - EMAIL_ALREADY_REGISTERED
+        - MFA_ALREADY_ENROLLED
+        - CONFLICT
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - PROCESS_NOT_ACTIVE
+        - CLIENT_ARCHIVED
+        - WEAK_PASSWORD
+        - PASSWORD_UNCHANGED
+        - INVALID_CURRENT_PASSWORD
+        - INVALID_MFA_CODE
+        - USER_LIMIT_REACHED
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+        - SERVICE_UNAVAILABLE
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required: [type, title, status, code, requestId]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          examples: ['about:blank']
+        title:
+          type: string
+          maxLength: 200
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        detail:
+          type: string
+          maxLength: 500
+          description: Mensagem para humanos, sem detalhes internos.
+        requestId:
+          type: string
+          pattern: '^[A-Za-z0-9-]{8,64}$'
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required: [errors]
+          properties:
+            errors:
+              type: array
+              maxItems: 50
+              items:
+                type: object
+                additionalProperties: false
+                required: [path, message]
+                properties:
+                  path:
+                    type: string
+                    description: Caminho do campo (ex. `body.stages[2].name`).
+                  message:
+                    type: string
+    StaleStageProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required: [currentStageId]
+          properties:
+            currentStageId:
+              description: Fase atual no momento do conflito (null se o processo não está mais ativo).
+              oneOf:
+                - $ref: '#/components/schemas/Uuid'
+                - type: 'null'
+
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          type: string
+          minLength: 1
+          maxLength: 72
+          description: No máximo 72 bytes UTF-8.
+          writeOnly: true
+    SessionUser:
+      type: object
+      additionalProperties: false
+      required: [id, role, displayName]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        role:
+          $ref: '#/components/schemas/Role'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+    SessionClient:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          maxLength: 160
+    Session:
+      type: object
+      additionalProperties: false
+      required: [user, client, aal, pendingActions]
+      properties:
+        user:
+          $ref: '#/components/schemas/SessionUser'
+        client:
+          description: Cliente do usuário (null para CEO).
+          oneOf:
+            - $ref: '#/components/schemas/SessionClient'
+            - type: 'null'
+        aal:
+          $ref: '#/components/schemas/Aal'
+        pendingActions:
+          type: array
+          uniqueItems: true
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/PendingAction'
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          minLength: 1
+          maxLength: 72
+          writeOnly: true
+        newPassword:
+          type: string
+          minLength: 12
+          maxLength: 72
+          description: De 12 caracteres a 72 bytes UTF-8, diferente da atual.
+          writeOnly: true
+    TotpEnrollment:
+      type: object
+      additionalProperties: false
+      required: [factorId, uri, secret, qrCode]
+      properties:
+        factorId:
+          $ref: '#/components/schemas/Uuid'
+        uri:
+          type: string
+          pattern: '^otpauth://totp/'
+          description: URI otpauth para apps autenticadores.
+        secret:
+          type: string
+          description: Segredo base32 para digitação manual. Exibido uma única vez.
+        qrCode:
+          type: string
+          pattern: '^data:image/svg\+xml'
+          description: QR code em data URI SVG.
+    TotpVerifyRequest:
+      type: object
+      additionalProperties: false
+      required: [factorId, code]
+      properties:
+        factorId:
+          $ref: '#/components/schemas/Uuid'
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+
+    MyStage:
+      type: object
+      additionalProperties: false
+      description: Fase na visão do cliente (sem dados internos de aprovação).
+      required: [position, name, description, status, startedAt, completedAt]
+      properties:
+        position:
+          type: integer
+          minimum: 1
+          maximum: 30
+        name:
+          type: string
+          maxLength: 120
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+        status:
+          $ref: '#/components/schemas/StageStatus'
+        startedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    MyCurrentStage:
+      type: object
+      additionalProperties: false
+      required: [position, name]
+      properties:
+        position:
+          type: integer
+          minimum: 1
+          maximum: 30
+        name:
+          type: string
+          maxLength: 120
+    MyProcessSummary:
+      type: object
+      additionalProperties: false
+      required: [id, title, status, currentStage, totalStages, completedStages, progressPercent, createdAt, updatedAt, completedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        title:
+          type: string
+          maxLength: 160
+        status:
+          $ref: '#/components/schemas/ProcessStatus'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/MyCurrentStage'
+            - type: 'null'
+        totalStages:
+          type: integer
+          minimum: 1
+          maximum: 30
+        completedStages:
+          type: integer
+          minimum: 0
+          maximum: 30
+        progressPercent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    MyProcessDetail:
+      type: object
+      additionalProperties: false
+      required: [id, title, status, currentStage, totalStages, completedStages, progressPercent, createdAt, updatedAt, completedAt, stages]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        title:
+          type: string
+          maxLength: 160
+        status:
+          $ref: '#/components/schemas/ProcessStatus'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/MyCurrentStage'
+            - type: 'null'
+        totalStages:
+          type: integer
+          minimum: 1
+          maximum: 30
+        completedStages:
+          type: integer
+          minimum: 0
+          maximum: 30
+        progressPercent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/MyStage'
+    MyProcessList:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/MyProcessSummary'
+        nextCursor:
+          oneOf:
+            - $ref: '#/components/schemas/Cursor'
+            - type: 'null'
+
+    ClientSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name, archived, archivedAt, activeProcessCount, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          maxLength: 160
+        archived:
+          type: boolean
+        archivedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        activeProcessCount:
+          type: integer
+          minimum: 0
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    ClientDetail:
+      type: object
+      additionalProperties: false
+      description: Logins do cliente ficam em `GET /admin/clients/{clientId}/users` (outro bounded context).
+      required: [id, name, archived, archivedAt, activeProcessCount, processCount, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          maxLength: 160
+        archived:
+          type: boolean
+        archivedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        activeProcessCount:
+          type: integer
+          minimum: 0
+        processCount:
+          type: integer
+          minimum: 0
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    ClientList:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ClientSummary'
+        nextCursor:
+          oneOf:
+            - $ref: '#/components/schemas/Cursor'
+            - type: 'null'
+    CreateClientRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+    UpdateClientRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 160
+        archived:
+          type: boolean
+
+    ClientUser:
+      type: object
+      additionalProperties: false
+      required: [id, email, displayName, disabled, mustChangePassword, lastSignInAt, createdAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          $ref: '#/components/schemas/Email'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+        disabled:
+          type: boolean
+        mustChangePassword:
+          type: boolean
+        lastSignInAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    ClientUserList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ClientUser'
+    ProvisionClientUserRequest:
+      type: object
+      additionalProperties: false
+      required: [email, displayName]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+    ProvisionedClientUser:
+      type: object
+      additionalProperties: false
+      required: [user, temporaryPassword]
+      properties:
+        user:
+          $ref: '#/components/schemas/ClientUser'
+        temporaryPassword:
+          $ref: '#/components/schemas/TemporaryPasswordValue'
+    UpdateClientUserRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        disabled:
+          type: boolean
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+    TemporaryPassword:
+      type: object
+      additionalProperties: false
+      required: [temporaryPassword]
+      properties:
+        temporaryPassword:
+          $ref: '#/components/schemas/TemporaryPasswordValue'
+
+    StageInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 2000
+    CreateProcessRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 160
+        stages:
+          type: array
+          description: Fases em ordem. Omitido → template padrão.
+          minItems: 1
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/StageInput'
+    UpdateProcessRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 160
+        status:
+          type: string
+          description: Única transição manual permitida.
+          enum: [cancelled]
+    ApproveStageRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedStageId]
+      properties:
+        expectedStageId:
+          $ref: '#/components/schemas/Uuid'
+    ActorRef:
+      type: object
+      additionalProperties: false
+      required: [id, displayName]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        displayName:
+          $ref: '#/components/schemas/DisplayName'
+    StageApproval:
+      type: object
+      additionalProperties: false
+      required: [approvedBy, approvedAt]
+      properties:
+        approvedBy:
+          $ref: '#/components/schemas/ActorRef'
+        approvedAt:
+          $ref: '#/components/schemas/Timestamp'
+    AdminStage:
+      type: object
+      additionalProperties: false
+      required: [id, position, name, description, status, startedAt, completedAt, approval]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        position:
+          type: integer
+          minimum: 1
+          maximum: 30
+        name:
+          type: string
+          maxLength: 120
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+        status:
+          $ref: '#/components/schemas/StageStatus'
+        startedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        approval:
+          oneOf:
+            - $ref: '#/components/schemas/StageApproval'
+            - type: 'null'
+    AdminCurrentStage:
+      type: object
+      additionalProperties: false
+      required: [id, position, name]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        position:
+          type: integer
+          minimum: 1
+          maximum: 30
+        name:
+          type: string
+          maxLength: 120
+    ProcessSummary:
+      type: object
+      additionalProperties: false
+      required: [id, clientId, title, status, currentStage, totalStages, completedStages, version, createdAt, updatedAt, completedAt, cancelledAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        clientId:
+          $ref: '#/components/schemas/Uuid'
+        title:
+          type: string
+          maxLength: 160
+        status:
+          $ref: '#/components/schemas/ProcessStatus'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/AdminCurrentStage'
+            - type: 'null'
+        totalStages:
+          type: integer
+          minimum: 1
+          maximum: 30
+        completedStages:
+          type: integer
+          minimum: 0
+          maximum: 30
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        cancelledAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    ProcessDetail:
+      type: object
+      additionalProperties: false
+      required: [id, clientId, client, title, status, currentStage, totalStages, completedStages, version, createdAt, updatedAt, completedAt, cancelledAt, stages]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        clientId:
+          $ref: '#/components/schemas/Uuid'
+        client:
+          $ref: '#/components/schemas/SessionClient'
+        title:
+          type: string
+          maxLength: 160
+        status:
+          $ref: '#/components/schemas/ProcessStatus'
+        currentStage:
+          oneOf:
+            - $ref: '#/components/schemas/AdminCurrentStage'
+            - type: 'null'
+        totalStages:
+          type: integer
+          minimum: 1
+          maximum: 30
+        completedStages:
+          type: integer
+          minimum: 0
+          maximum: 30
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        cancelledAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/AdminStage'
+    ProcessList:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ProcessSummary'
+        nextCursor:
+          oneOf:
+            - $ref: '#/components/schemas/Cursor'
+            - type: 'null'
+    ProcessEventAction:
+      type: string
+      enum:
+        - process.created
+        - process.updated
+        - process.cancelled
+        - process.completed
+        - stage.approved
+    ProcessEvent:
+      type: object
+      additionalProperties: false
+      required: [id, occurredAt, action, actor, details]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Id sequencial do evento (bigint serializado como string).
+        occurredAt:
+          $ref: '#/components/schemas/Timestamp'
+        action:
+          $ref: '#/components/schemas/ProcessEventAction'
+        actor:
+          description: CEO que executou a ação (null se for ação de sistema).
+          oneOf:
+            - $ref: '#/components/schemas/ActorRef'
+            - type: 'null'
+        details:
+          $ref: '#/components/schemas/ProcessEventDetails'
+    ProcessEventDetails:
+      type: object
+      additionalProperties: false
+      properties:
+        stageId:
+          $ref: '#/components/schemas/Uuid'
+        stagePosition:
+          type: integer
+          minimum: 1
+          maximum: 30
+        stageName:
+          type: string
+          maxLength: 120
+        previousTitle:
+          type: string
+          maxLength: 160
+        newTitle:
+          type: string
+          maxLength: 160
+    ProcessEventList:
+      type: object
+      additionalProperties: false
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ProcessEvent'
+        nextCursor:
+          oneOf:
+            - $ref: '#/components/schemas/Cursor'
+            - type: 'null'
+    StageTemplateItem:
+      type: object
+      additionalProperties: false
+      required: [position, name, description]
+      properties:
+        position:
+          type: integer
+          minimum: 1
+          maximum: 30
+        name:
+          type: string
+          maxLength: 120
+        description:
+          type: [string, 'null']
+          maxLength: 2000
+    StageTemplate:
+      type: object
+      additionalProperties: false
+      required: [stages]
+      properties:
+        stages:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/StageTemplateItem'
