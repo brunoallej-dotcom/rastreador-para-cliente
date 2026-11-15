@@ -3,3 +3,24 @@ env
 node_modules
 venv
 settings.local.json
+
+# env: só o .env.example (placeholders) é versionado
+.env
+.env.*
+!.env.example
+
+# Next.js / Vercel
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+
+# Testes
+coverage/
+
+# Supabase CLI (estado local)
+supabase/.branches/
+supabase/.temp/
+
+# Claude Code: memória local de agents
+.claude/agent-memory-local/
