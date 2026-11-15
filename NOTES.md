@@ -5,6 +5,9 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 ## Status atual
 
 - **Fase:** especificação concluída (2026-11-15). Implementação não iniciada.
+- **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
+  worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
+  "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
 - **Próxima onda:** 0 — Fundação (`/run-wave 0`).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
@@ -33,7 +36,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 | Revisar e aceitar os ADRs 0001–0005 (`docs/adr/`) | fechamento da Onda 0 |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
 | Instalar pnpm (`corepack enable`) e Docker (Supabase local) | Onda 0 |
-| Criar repositório remoto com branch protection na `main` e GitHub Actions habilitado | CI da Onda 0 |
+| Ativar branch protection na `main` (o repositório remoto já existe) e restringir o merge a squash | CI da Onda 0 |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 3 (staging); Onda 11 (prod) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
 | Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
@@ -62,3 +65,21 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   no `.gitignore`.
 - Validação: 178 checagens estruturais e de comportamento dos hooks passaram; contrato validado
   com `@redocly/cli@2.72.1 lint` (regras recomendadas): válido, sem avisos.
+
+### 2026-11-15 — Estratégia de paralelismo com subagentes
+
+- Spec, contrato, plano e configuração do Claude Code mergeados na `main` (PR #1).
+- Análise de quais ondas podem rodar em subagente e quais são obrigatoriamente sequenciais. O
+  grafo do plano se manteve: 12 ondas em 8 passos, caminho crítico 0 → 2 → 3 → 5 → 6 → 8 → 9 → 11.
+- Plano atualizado (PR #2):
+  - sequência de execução e quem executa cada onda (2, 3, 5 e 9 na sessão principal; 1, 4, 6,
+    7, 8 e 10 em subagente);
+  - pré-requisitos na Onda 0 (hooks em worktree e `stop-gates.mjs` em `SubagentStop`, env de
+    teste via `supabase status`, dependências pré-instaladas, regra do ESLint para `route.ts`);
+  - pré-requisitos na Onda 1 (catálogo `ErrorCode` completo, handler monta as próprias
+    dependências, `rateLimit` por rota);
+  - gates de banco em fila (um único Supabase local) e restrição a agentes fora do Claude Code.
+- Não verificado: os hooks podem pular as checagens em worktree, porque `lib.mjs` prefere
+  `CLAUDE_PROJECT_DIR`. O critério de aceite da Onda 0 cobre esse caso.
+- Fora do plano por ora: mover `tests/helpers/mfa.ts` para a Onda 3 (deixaria 4, 5 e 6
+  paralelas).
