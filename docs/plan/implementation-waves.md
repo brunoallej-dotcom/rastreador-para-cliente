@@ -29,15 +29,44 @@
 ```
 
 **Por que os pares paralelos são seguros** (critérios: sem dependência, arquivos disjuntos, sem
-interface pública compartilhada alterada):
+interface pública compartilhada alterada e, na execução, sem usar o Supabase local ao mesmo
+tempo):
 
-| Par | (a) dependência | (b) arquivos | (c) interface compartilhada |
-|-----|-----------------|--------------|-----------------------------|
-| 1 ∥ 2 | 1 usa ports com fakes; 2 é só SQL | `src/shared/{http,observability,kernel}`, `src/app/api/v1/health`, `next.config.ts`, `tests/helpers/contract.ts` × `supabase/**`, `src/shared/db/database.types.ts` | nenhuma: 1 não toca `src/shared/db` |
-| 4 ∥ 5 | ambas só dependem de 3 | 4: `identity/**/*password*`, `auth/password`, `scripts/` × 5: `identity/**/*totp*` e `*mfa*`, `auth/mfa/**`, `tests/helpers/mfa.ts`; **nenhuma tem migration** (as funções estão na Onda 2) | o pipeline (`withRoute`) já trata as pendências desde a Onda 1; cada uma cria o próprio gateway, sem editar o da Onda 3 |
-| 4 ∥ 6 | 6 depende de 5, não de 4 | `identity/**` + `scripts/` × `tracking/**` + `admin/clients/{route,[clientId]/route}` + migration de clientes | 6 só **adiciona** `getClientStatus` ao `tracking/index.ts` |
-| 7 ∥ 8 | 7 usa `getClientStatus` (da Onda 6), não processos | `identity/**` + `admin/clients/[clientId]/users/**` (sem migration) × `tracking/**` (processos) + `admin/clients/[clientId]/processes` + `admin/processes/[processId]` + `admin/stage-templates` + migration de processos | 8 não altera `tracking/index.ts` |
-| 9 ∥ 10 | ambas leem o agregado da Onda 8 | 9: `approve-*`, `*events*`, repositório de processo, migration de aprovação, `admin/processes/[processId]/{approvals,events}` × 10: `*my-process*`, `supabase-client-process-queries.ts` (query service separado), `me/processes/**`; 10 não tem migration | nenhuma |
+| Par | (a) dependência | (b) arquivos | (c) interface compartilhada | (d) banco local |
+|-----|-----------------|--------------|-----------------------------|-----------------|
+| 1 ∥ 2 | 1 usa ports com fakes; 2 é só SQL | `src/shared/{http,observability,kernel}`, `src/app/api/v1/health`, `next.config.ts`, `tests/helpers/contract.ts`, `.claude/skills/new-endpoint/SKILL.md` × `supabase/**`, `src/shared/db/database.types.ts` | nenhuma: 1 não toca `src/shared/db` | só a 2 usa; sem fila |
+| 4 ∥ 5 | ambas só dependem de 3 | 4: `identity/**/*password*`, `auth/password`, `scripts/` × 5: `identity/**/*totp*` e `*mfa*`, `auth/mfa/**`, `tests/helpers/mfa.ts`; **nenhuma tem migration** (as funções estão na Onda 2); dependências npm (`tsx`, `otpauth`) já instaladas na Onda 0 | o pipeline (`withRoute`) já trata as pendências desde a Onda 1; cada uma cria o próprio gateway, sem editar o da Onda 3 | as duas usam; gates em fila |
+| 4 ∥ 6 | 6 depende de 5, não de 4 | `identity/**` + `scripts/` × `tracking/**` + `admin/clients/{route,[clientId]/route}` + migration de clientes | 6 só **adiciona** `getClientStatus` ao `tracking/index.ts` | as duas usam; gates em fila; só a 6 tem migration |
+| 7 ∥ 8 | 7 usa `getClientStatus` (da Onda 6), não processos | `identity/**` + `admin/clients/[clientId]/users/**` (sem migration) × `tracking/**` (processos) + `admin/clients/[clientId]/processes` + `admin/processes/[processId]` + `admin/stage-templates` + migration de processos | 8 não altera `tracking/index.ts` | as duas usam; gates em fila; só a 8 tem migration |
+| 9 ∥ 10 | ambas leem o agregado da Onda 8 | 9: `approve-*`, `*events*`, repositório de processo, migration de aprovação, `admin/processes/[processId]/{approvals,events}` × 10: `*my-process*`, `supabase-client-process-queries.ts` (query service separado), `me/processes/**`; 10 não tem migration | nenhuma: cada handler monta as próprias dependências, sem fábrica `deps.tracking()` compartilhada (Onda 1) | as duas usam; gates em fila; o AC-17 roda com o banco exclusivo |
+
+### Sequência de execução
+
+12 ondas em 8 passos. Caminho crítico: 0 → 2 → 3 → 5 → 6 → 8 → 9 → 11.
+
+| Passo | Ondas | Quem executa |
+|-------|-------|--------------|
+| 1 | 0 | sessão principal |
+| 2 | 1 ∥ 2 | 2 na sessão principal; 1 em subagente |
+| 3 | 3 | sessão principal |
+| 4 | 4 ∥ 5 | 5 na sessão principal; 4 em subagente |
+| 5 | 6 (a 4 pode continuar rodando) | subagente; a sessão principal coordena a fila de gates de banco |
+| 6 | 7 ∥ 8 | um subagente para cada; a sessão principal coordena a fila de gates de banco |
+| 7 | 9 ∥ 10 | 9 na sessão principal; 10 em subagente |
+| 8 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
+
+### Pré-requisitos do paralelismo com subagentes
+
+| Pré-requisito | Por quê | Onde |
+|---------------|---------|------|
+| Hooks resolvem a raiz pelo git do arquivo editado | Se `CLAUDE_PROJECT_DIR` apontar para o checkout principal, os caminhos de uma worktree não casam com `^src/` e `^supabase/`, e as checagens são puladas sem aviso | Onda 0 |
+| `stop-gates.mjs` registrado também em `SubagentStop` | Subagentes terminam com `SubagentStop`, não com `Stop` | Onda 0 |
+| Env de teste lido de `supabase status -o env` | Worktrees não têm `.env.local`, e os agentes não podem criá-lo | Onda 0 |
+| Dependências previstas até a Onda 10 já instaladas | `pnpm add` pede aprovação (trava o subagente em background) e duas branches mexendo no lockfile conflitam | Onda 0 |
+| ESLint permite `route.ts` importar `presentation/*.handler` | Sem isso, toda onda edita o `index.ts` do módulo | Onda 0 |
+| Catálogo `ErrorCode` completo | Sem isso, as ondas 4, 5, 7 e 9 editam o mesmo arquivo | Onda 1 |
+| Cada handler monta as próprias dependências | Uma fábrica `deps.<módulo>()` seria editada pelas ondas 9 e 10 | Onda 1 |
+| Gates de banco em fila | Há um único Supabase local por máquina | Execução |
 
 ---
 
@@ -59,13 +88,35 @@ interface pública compartilhada alterada):
   typecheck, unit, contract lint, gitleaks, `pnpm audit --prod`, CodeQL ou Semgrep, pgTAP com
   Supabase CLI), `.github/dependabot.yml` (npm + github-actions). Sem páginas de UI. Os ADRs
   0001–0005 passam a `accepted` depois da revisão do usuário.
+- **Escopo para o paralelismo com subagentes** (ver Pré-requisitos):
+  1. Todas as dependências previstas até a Onda 10 já no `package.json`:
+     `@supabase/supabase-js`, `@supabase/ssr`, `server-only`, `pino`, `@vercel/functions`, `zod`
+     e, em dev, `ajv`, `ajv-formats`, `yaml`, `otpauth` e `tsx`.
+  2. `tests/setup/local-env.ts` (globalSetup dos projetos `int` e `api` do Vitest): lê URL e
+     chaves de `supabase status -o env`, aceita só URL local (`127.0.0.1`/`localhost`), define
+     valores fixos de teste para `APP_ORIGIN` e `RATE_LIMIT_KEY_SECRET` e nunca lê `.env*`.
+  3. Regra de fronteira do ESLint que permite a `src/app/**/route.ts` importar só
+     `@/modules/*/presentation/*.handler`.
+  4. `.claude/hooks/lib.mjs` resolvendo a raiz com `git rev-parse --show-toplevel` a partir da
+     pasta do arquivo editado (no `Stop`/`SubagentStop`, a partir do `cwd` do evento), com
+     `CLAUDE_PROJECT_DIR` só como último recurso; testes em `.claude/hooks/*.test.mjs`
+     (`node --test`, sem dependências); `stop-gates.mjs` registrado também em `SubagentStop` no
+     `.claude/settings.json`.
 - **Depende de / paralela com**: — (sempre a primeira e sequencial).
 - **Critérios de aceite**:
   - `pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm contract:lint && pnpm build` → exit 0.
   - `pnpm db:start && pnpm db:reset` → exit 0 (banco local sobe sem migrations de domínio).
   - Teste unitário: env sem `SUPABASE_URL` → o boot falha com mensagem sem valores de segredo.
   - Workflow `ci.yml` verde no PR; `grep -E 'uses: [^@]+@[0-9a-f]{40}' .github/workflows/ci.yml` cobre todas as linhas `uses:`.
-- **Goal command**: `/goal pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm contract:lint && pnpm build terminam com exit 0, pnpm db:start && pnpm db:reset termina com exit 0, toda linha "uses:" de .github/workflows/ci.yml está pinada por SHA de 40 caracteres e "gh pr checks" não lista falhas, stop after 8 tries`
+  - O `package.json` declara todas as dependências do item 1 do escopo de paralelismo.
+  - Teste unitário do loader de env de teste: URL não local → falha, sem imprimir valores de chave.
+  - Teste do ESLint (API do ESLint no Vitest): `route.ts` importando `presentation/*.handler`
+    passa; importando `infrastructure/` ou `@/shared/db` falha.
+  - `node --test .claude/hooks/*.test.mjs` → exit 0, incluindo o caso de um arquivo dentro de
+    uma worktree com `CLAUDE_PROJECT_DIR` apontando para o checkout principal (a raiz resolvida
+    é a da worktree).
+  - `.claude/settings.json` registra `stop-gates.mjs` em `Stop` e em `SubagentStop`.
+- **Goal command**: `/goal pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test && pnpm contract:lint && pnpm build terminam com exit 0, pnpm db:start && pnpm db:reset termina com exit 0, node --test .claude/hooks/*.test.mjs termina com exit 0, .claude/settings.json registra stop-gates.mjs em Stop e em SubagentStop, o package.json declara @supabase/supabase-js, @supabase/ssr, server-only, pino, @vercel/functions, zod, ajv, ajv-formats, yaml, otpauth e tsx, toda linha "uses:" de .github/workflows/ci.yml está pinada por SHA de 40 caracteres e "gh pr checks" não lista falhas, stop after 10 tries`
 
 ## Onda 1 — Plataforma HTTP
 
@@ -79,12 +130,24 @@ interface pública compartilhada alterada):
   redação), `src/app/api/v1/health/route.ts`, headers em `next.config.ts`,
   `tests/helpers/contract.ts` (Ajv 2020 carregando `contracts/openapi.v1.yaml`, com
   `expectToMatchContract(operationId, status, body)`).
+- **Escopo para o paralelismo com subagentes** (ver Pré-requisitos):
+  - Catálogo `ErrorCode` **completo** desde já: todos os códigos de
+    `components.schemas.ErrorCode` do contrato, para nenhuma onda seguinte editar o arquivo.
+  - Contexto do `withRoute` sem container de DI: entrega `request`, `principal`, `params`,
+    `query`, `body` e `requestId`, e cada handler monta as próprias dependências no próprio
+    arquivo (sem fábrica `deps.<módulo>()`).
+  - `rateLimit` declarado na política de cada rota, igual ao `x-rate-limit` (sem registro
+    central de grupos).
+  - Correção do exemplo de presentation em `.claude/skills/new-endpoint/SKILL.md`, que hoje usa
+    `deps.tracking()`.
 - **Depende de / paralela com**: 0 / **2** (justificativa na tabela acima).
 - **Critérios de aceite**: AC-22, AC-23, AC-26 (helper + health), AC-27, AC-29. Teste da ordem
   do pipeline: requisição sem sessão e com corpo inválido → 401 (não 400). Teste de tipo:
   `withRoute` sem política não compila (`// @ts-expect-error`). Pendência fora do `allowPending`
-  → 403 com o código certo, seguindo a prioridade da spec §3.5.
-- **Goal command**: `/goal pnpm lint && pnpm typecheck && pnpm test terminam com exit 0 e pnpm test -t "AC-(22|23|26|27|29)" executa pelo menos 5 testes, todos verdes, stop after 10 tries`
+  → 403 com o código certo, seguindo a prioridade da spec §3.5. Teste unitário: o catálogo
+  `ErrorCode` é igual ao enum `components.schemas.ErrorCode` do contrato (nem a mais, nem a
+  menos). `grep -rnE 'deps\.(tracking|identity)\(' src .claude/skills` não encontra nada.
+- **Goal command**: `/goal pnpm lint && pnpm typecheck && pnpm test terminam com exit 0, pnpm test -t "AC-(22|23|26|27|29)" executa pelo menos 5 testes, todos verdes, o teste que compara o catálogo ErrorCode com o enum do contrato está verde e grep -rnE 'deps\.(tracking|identity)\(' src .claude/skills não encontra nada, stop after 10 tries`
 
 ## Onda 2 — Banco: schema, RLS e funções de identidade
 
@@ -255,13 +318,39 @@ interface pública compartilhada alterada):
 - Uma onda sequencial pode rodar como **goal loop**: invoque o Goal command dela e deixe o
   avaliador manter a sessão presa aos critérios de aceite, em vez de confiar em "parece pronto".
   Feche a onda com a skill `verify` antes de marcá-la como ✅.
-- Grupos paralelos (1∥2, 4∥5, 4∥6, 7∥8, 9∥10) podem rodar como subagents em worktrees isoladas,
-  uma onda por agent, com os resultados mergeados um PR por vez. Migrations paralelas precisam de
-  timestamps distintos; quem mergear depois roda `pnpm db:reset && pnpm db:test` de novo.
+- **Quem executa o quê.** As ondas de segurança crítica (2, 3, 5 e 9: RLS, autenticação, MFA e
+  concorrência) ficam na sessão principal. As demais (1, 4, 6, 7, 8 e 10) podem rodar como
+  subagente Sonnet 5.5 com esforço xhigh (`model: sonnet`, `effort: xhigh`,
+  `isolation: worktree`), uma onda por agente, a partir da `main` atualizada. A ordem está em
+  "Sequência de execução".
+- **Antes do primeiro fan-out** (passo 2), a Onda 0 precisa estar mergeada: é ela que corrige os
+  hooks para worktrees e para `SubagentStop`, cria o env de teste e instala as dependências.
+- **No subagente:** `pnpm install --frozen-lockfile` na worktree; sem `.env.local` (o setup de
+  testes lê o Supabase local); sem `pnpm add` (se faltar dependência, o agente para e avisa, e a
+  sessão principal a adiciona num commit próprio); só os arquivos do escopo da onda; `pnpm lint`,
+  `pnpm typecheck` e `pnpm test` à vontade; **nenhum** gate de banco.
+- **Gates de banco em fila.** Há um único Supabase local por máquina (portas e containers fixos
+  pelo `supabase/config.toml`, que é versionado e não muda por worktree). Por isso
+  `pnpm db:reset`, `pnpm db:test`, `pnpm test:int` e `pnpm test:api` rodam uma worktree por vez,
+  coordenados pela sessão principal, sempre começando por `pnpm db:reset` a partir daquela
+  worktree (as migrations diferem entre as ondas). O teste de concorrência da Onda 9 (AC-17) roda
+  com o banco exclusivo. O par 1 ∥ 2 não precisa de fila, porque a Onda 1 não usa banco.
+- **Merge** um PR por vez. O segundo faz rebase na `main` e roda de novo
+  `pnpm db:reset && pnpm db:test` e `pnpm test:api`. Em cada par, no máximo uma onda tem
+  migration, então só ela regenera `src/shared/db/database.types.ts`.
 - Regras que mantêm o paralelismo seguro: sem container de DI compartilhado (cada handler monta
   as suas dependências); cada onda cria os **próprios** arquivos em `tests/helpers/`; nenhuma
   onda altera `contracts/openapi.v1.yaml` sem bump de versão aprovado.
+- **Paralelismo dentro da onda** (opcional): na Onda 2, um subagente pode escrever os testes
+  pgTAP a partir dos AC enquanto a sessão principal escreve as migrations, combinando antes o
+  `supabase/tests/000_helpers.sql`. Na Onda 11, runbooks, k6, job do ZAP e migration de
+  `pg_cron` são frentes independentes; a configuração de produção fica com o usuário.
+- **Agentes fora do Claude Code** (Codex, Cursor, modelos GPT) não executam os hooks de
+  `.claude/hooks/`, os agents de projeto nem as skills. Eles não fazem as ondas 2, 3, 5 e 9; em
+  qualquer outra onda, `rls-auditor` (se tocar `supabase/`), `contract-guardian` e
+  `code-reviewer` rodam no Claude Code antes do PR.
 - Antes de abrir o PR de uma onda que toca `supabase/`, rode o agent `rls-auditor`; em toda onda
-  com rota nova, rode o agent `contract-guardian`.
+  com rota nova, rode o agent `contract-guardian`. Nas ondas feitas por subagente, a sessão
+  principal roda esses agents quando ele devolver a worktree.
 - Quando uma onda terminar, marque-a como ✅ aqui **e** no `NOTES.md`, e então atualize o status
   atual do `NOTES.md` antes de encerrar a sessão.
