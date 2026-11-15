@@ -4,11 +4,11 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-15). Onda 0 concluída (fundação); ondas 1 ∥ 2 a seguir.
+- **Fase:** implementação em andamento (2026-11-15). Ondas 0 e 2 concluídas; Onda 1 em revisão.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 1 ∥ 2 — Plataforma HTTP (subagente) e Banco (sessão principal).
+- **Próxima onda:** 3 — Identidade: autenticação (sessão principal), depois que a 1 for mergeada.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -16,7 +16,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 |------|---------|------------|--------------|--------|
 | 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ⬜ |
-| 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ⬜ |
+| 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |
@@ -108,3 +108,24 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 - Verificado localmente: `pnpm install --frozen-lockfile`, `lint`, `typecheck`, `test` (132),
   `test:hooks` (73), `contract:lint`, `build`, `format:check`, `db:start`, `db:reset`, `db:test`.
   O CI verde é conferido no PR antes do merge.
+
+### 2026-11-15 — Onda 2: banco
+
+- Sessão principal escreveu as 6 migrations (hardening e defaults de privilégio, identidade e
+  helpers de RLS, auditoria append-only, tabelas de rastreamento, funções de conta, rate limit)
+  e o `000_helpers.sql`; um subagente Sonnet escreveu a suíte pgTAP (401 asserts, 8 arquivos).
+- `rls-auditor`: sem CRÍTICO/ALTO. Os MÉDIOS e BAIXOS foram corrigidos antes do PR:
+  `mark_password_changed` exige prova da troca (linha de base do hash) e `aal2` para CEO com TOTP;
+  `service_role` sem escrita em `profiles`/`audit_events`/template e sem EXECUTE além de
+  `rate_limit_hit`; `session_id` malformado = sem sessão; `account.provisioned` idempotente; FK
+  composta aprovação→fase/processo; janela na PK do rate limit; texto visível recusa caracteres
+  de formatação Unicode (Cf, separadores).
+- Spec atualizada (§3.4, §3.7, §4.2): `set_account_display_name` (necessária para o PATCH de
+  login da Onda 7, que não tem migration), prova de troca de senha, mapeamento de
+  `PASSWORD_UNCHANGED`/`USER_LIMIT_REACHED`, privilégios do `service_role`.
+- A onda passou de ~700 linhas (SQL + testes), mas não foi dividida: o SQL é coeso e foi
+  auditado de uma vez.
+- Verificado: `pnpm db:reset && pnpm db:test && pnpm db:lint` → exit 0; `pnpm db:types` estável;
+  os 5 IDs (AC-08/09/10/24/25) e AC-31 presentes nos testes.
+- Pendente para as ondas de identidade: testar o trigger sob o papel real do GoTrue
+  (`auth.admin.createUser`) na Onda 3/7; criar usuários já com a senha temporária (spec §3.4).

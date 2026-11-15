@@ -224,7 +224,14 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   `app_metadata = { role: 'client', client_id }`. O trigger `private.handle_new_auth_user` cria o
   `profile` **na mesma transação** a partir de `raw_app_meta_data`, que só a secret key consegue
   escrever. Se faltar papel ou cliente, o trigger lança erro e o usuário não é criado (fail closed).
-  `raw_user_meta_data`, que o próprio usuário edita, **nunca** é lido.
+  `raw_user_meta_data`, que o próprio usuário edita, **nunca** é lido. O nome de exibição vem de
+  `app_metadata.display_name` (CEO e cliente), e o trigger também recusa cliente arquivado ou com
+  10 logins (defesa em profundidade; o caso de uso checa antes para responder 422).
+- **Senha temporária na criação:** o usuário é criado **já com a senha temporária** na mesma
+  chamada `auth.admin.createUser` (provisionamento e `ceo:create`); no reset, a senha nova é
+  gravada no Auth **antes** de chamar `require_password_change`. Só assim a linha de base de
+  `mark_password_changed()` prova que o usuário trocou a senha (criar sem senha e definir depois
+  deixaria a "troca" comprovada sem ação do usuário).
 
 ### 3.5 Autorização
 
@@ -296,14 +303,15 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
-| `current_principal()` | authenticated | Retorna o principal (ou nenhuma linha): sessão viva, perfil ativo, papel, cliente, `aal`, `has_verified_totp`, `must_change_password` |
+| `current_principal()` | authenticated | Retorna o principal (ou nenhuma linha): sessão viva, perfil ativo, papel, cliente, nome de exibição, `aal`, `has_verified_totp`, `must_change_password` |
 | `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente. Evento `client.created` |
 | `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva. Eventos `client.updated` / `client.archived` / `client.unarchived` |
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
 | `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`) |
-| `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` |
+| `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
+| `set_account_display_name(p_user_id, p_display_name)` | idem; alvo precisa ser `client` | Renomeia o login (`PATCH …/users/{userId}` com `displayName`). `account.updated` |
 | `require_password_change(p_user_id)` | idem; alvo precisa ser `client` | `must_change_password = true`, apaga as sessões. `account.password_reset` |
-| `mark_password_changed()` | authenticated (o próprio usuário) | `must_change_password = false`. `account.password_changed` |
+| `mark_password_changed()` | authenticated (o próprio usuário) | Exige prova da troca: o hash atual em `auth.users` difere da linha de base (`private.password_baselines`, gravada na criação e no reset), senão `PASSWORD_UNCHANGED`; CEO com TOTP verificado precisa de `aal2`. Então `must_change_password = false`, renova a linha de base e apaga as **demais** sessões do usuário (mantém a da requisição, AC-06). `account.password_changed` |
 | `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. `process.created` |
 | `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia ou cancela. `process.updated` / `process.cancelled` |
 | `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. `stage.approved` (+ `process.completed`) |
@@ -318,6 +326,8 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `P0001` + `STALE_STAGE` | `StaleStageError` | 409 `STALE_STAGE` |
 | `P0001` + `PROCESS_NOT_ACTIVE` | `ProcessNotActiveError` | 422 `PROCESS_NOT_ACTIVE` |
 | `P0001` + `CLIENT_ARCHIVED` | `ClientArchivedError` | 422 `CLIENT_ARCHIVED` |
+| `P0001` + `PASSWORD_UNCHANGED` | `PasswordUnchangedError` | 422 `PASSWORD_UNCHANGED` |
+| `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` |
 | `23505` | `ConflictError` | 409 `CONFLICT` |
 
@@ -522,6 +532,16 @@ papéis da aplicação.
 | `stage_approvals` | — | — | todas | RPC de CEO |
 | `audit_events` | — | — | todas | dentro das RPCs (append-only) |
 | `default_stage_template` | — | — | todas | migration |
+
+**`service_role` (secret key):** não escreve em `profiles`, `audit_events` nem
+`default_stage_template` (papel, trilha e template não são forjáveis nem com a secret key) e só
+executa `rate_limit_hit`. Mantém DML em `clients`, `processes`, `process_stages` e
+`stage_approvals` apenas para fixtures de teste no Supabase local e operação manual; o app nunca
+escreve com ela (AGENTS.md; ESLint e hooks restringem o admin client).
+
+**Texto visível** (nomes e títulos) recusa caracteres de controle **e** de formatação Unicode
+(bidi override, zero-width, BOM), que permitiriam falsificar nomes no painel (E-30), no Zod e nos
+CHECKs do banco.
 
 **Helpers de RLS** (`private`, `SECURITY DEFINER STABLE`, sempre chamados como
 `(select private.fn())` nas policies para cache por statement): `private.current_client_id()`

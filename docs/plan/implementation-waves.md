@@ -9,7 +9,7 @@
 |------|---------|------------|--------------|--------|
 | 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ⬜ |
-| 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ⬜ |
+| 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |

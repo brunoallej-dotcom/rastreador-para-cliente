@@ -27,6 +27,15 @@ Migration: $ARGUMENTS
   validação de input espelhando o Zod, `SELECT … FOR UPDATE`, a mudança e a auditoria na mesma
   transação.
 - Tenant e ator vêm de `auth.uid()`, nunca de parâmetro.
+- Auditoria: use `private.record_audit_event(papel, ação, tipo, recurso, cliente, processo)`;
+  nunca `INSERT` direto em `audit_events` (nem a secret key tem esse privilégio).
+- Privilégios: os defaults (Onda 2) já tiram tudo de `anon`, `authenticated` e, em funções, de
+  `service_role`; conceda explicitamente só o necessário (`GRANT SELECT … TO authenticated`,
+  `GRANT EXECUTE … TO authenticated`). Tabela nova que não é fixture de teste: também
+  `REVOKE INSERT, UPDATE, DELETE, TRUNCATE … FROM service_role`.
+- Texto visível (nomes, títulos): mesma regra dos CHECKs existentes, copie a classe exatamente de
+  `supabase/migrations/20261115223625_identity_core.sql` (controle + formatação Unicode, E-30),
+  sempre com escapes `\uXXXX`/`\UXXXXXXXX`, nunca caracteres invisíveis literais.
 - Erros: `RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'FORBIDDEN'` para autorização;
   `ERRCODE = 'P0001'` com `MESSAGE` do catálogo (`NOT_FOUND`, `STALE_STAGE`,
   `PROCESS_NOT_ACTIVE`, `CLIENT_ARCHIVED`, `INVALID_INPUT`) para regra de negócio.
