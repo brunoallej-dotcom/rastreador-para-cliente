@@ -2,6 +2,7 @@
 // SessionStart
 // Injeta no contexto o status das ondas (seção "Status atual" do NOTES.md) e lembretes do fluxo.
 // O conteúdo do NOTES.md é apresentado como dado, não como instrução.
+// Lê o NOTES.md da árvore do `cwd` do evento (a worktree, quando a sessão roda numa).
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { projectDir, readHookInput } from './lib.mjs';

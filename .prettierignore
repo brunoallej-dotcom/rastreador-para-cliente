@@ -1,0 +1,12 @@
+docs/
+*.md
+contracts/
+supabase/
+.claude/
+pnpm-lock.yaml
+venv/
+.next/
+coverage/
+node_modules/
+src/shared/db/database.types.ts
+next-env.d.ts

@@ -1,17 +1,30 @@
 #!/usr/bin/env node
 // PreToolUse (Write|Edit|MultiEdit|NotebookEdit)
 // Bloqueia, antes de gravar:
+//   0. qualquer caminho dentro de metadados do git (segmento `.git`): o agente nunca escreve aí;
 //   1. arquivos .env* com valores reais (só .env.example é permitido);
 //   2. edição de migration que já está na main (migrations são imutáveis);
 //   3. conteúdo novo com cara de segredo (chaves, JWT, PEM, URL de banco com senha, NEXT_PUBLIC_ secreto).
-// Exit 2 = bloqueia e explica ao Claude. Erro interno = exit 1 (avisa, não bloqueia).
-import { execFileSync } from 'node:child_process';
+// A raiz do projeto vem do git da pasta do arquivo (funciona em worktrees de subagentes, ver lib.mjs).
+// A checagem "já está na main" lê as refs do repositório, que as worktrees compartilham. Ela FALHA FECHADA:
+// se o git estourar o tempo ou falhar por qualquer motivo que não seja "o caminho não existe nessa ref",
+// a escrita na migration é bloqueada com uma mensagem dizendo que a checagem não pôde rodar.
+// Exit 2 = bloqueia e explica ao Claude. Erro interno inesperado = exit 1 (avisa, não bloqueia).
 import path from 'node:path';
-import { block, failOpen, projectDir, readHookInput, relativeToProject } from './lib.mjs';
+import {
+  block,
+  existingMainRefs,
+  failOpen,
+  gitFailureText,
+  gitResult,
+  hasGitSegment,
+  projectDir,
+  readHookInput,
+  realpathLoose,
+  relativeToProject,
+} from './lib.mjs';
 
 const HOOK = 'guard-writes';
-const MAIN_REFS = ['origin/main', 'main'];
-const GIT_TIMEOUT_MS = 3000;
 const MIN_SECRET_ENTROPY_BITS = 3.5;
 
 const SECRET_PATTERNS = [
@@ -64,29 +77,39 @@ function newContent(toolName, toolInput) {
   }
 }
 
+/**
+ * O caminho já existe na main (`refs/heads/main` ou `refs/remotes/origin/main`)?
+ * Devolve { exists } ou { error } quando o git não conseguiu responder (timeout, falha, ref ilegível).
+ * Sem nenhuma das duas refs (repositório novo), nada está "na main": { exists: false }.
+ */
 function existsOnMain(root, rel) {
-  for (const ref of MAIN_REFS) {
-    try {
-      execFileSync('git', ['cat-file', '-e', `${ref}:${rel}`], {
-        cwd: root,
-        stdio: 'ignore',
-        timeout: GIT_TIMEOUT_MS,
-      });
-      return true;
-    } catch {
-      // ref inexistente ou arquivo ausente nessa ref: tenta a próxima
-    }
+  const refs = existingMainRefs(root);
+  if (!refs.ok) return { error: gitFailureText(refs) };
+  for (const ref of refs.refs) {
+    const tree = gitResult(root, ['ls-tree', '--name-only', ref, '--', rel]);
+    if (!tree.ok) return { error: gitFailureText(tree) };
+    if (tree.stdout.trim() !== '') return { exists: true };
   }
-  return false;
+  return { exists: false };
 }
 
 try {
   const input = readHookInput();
   const toolInput = input.tool_input ?? {};
-  const root = projectDir(input);
   const target = toolInput.file_path ?? toolInput.notebook_path;
-  const rel = relativeToProject(root, target);
   const base = target ? path.basename(target) : '';
+
+  // 0. metadados do git (também por symlink: compara o caminho real)
+  const absTarget = target ? path.resolve(input.cwd || process.cwd(), target) : null;
+  if (absTarget && (hasGitSegment(absTarget) || hasGitSegment(realpathLoose(absTarget)))) {
+    block(
+      `[${HOOK}] Bloqueado: "${target}" está dentro de metadados do git (.git). ` +
+        'O agente nunca escreve em .git (hooks, config e refs são vetores de execução e de adulteração do histórico).',
+    );
+  }
+
+  const root = projectDir(input, target);
+  const rel = relativeToProject(root, target);
 
   // 1. .env reais
   if (/^\.env(\..+)?$/.test(base) && base !== '.env.example') {
@@ -96,12 +119,22 @@ try {
     );
   }
 
-  // 2. migrations imutáveis
-  if (rel && /^supabase\/migrations\/[^/]+\.sql$/.test(rel) && existsOnMain(root, rel)) {
-    block(
-      `[${HOOK}] Bloqueado: ${rel} já está na main e migrations são imutáveis. ` +
-        'Crie uma nova migration com `pnpm db:new <nome>` que corrija o problema (skill new-migration).',
-    );
+  // 2. migrations imutáveis (falha fechada se a checagem não puder rodar)
+  if (rel && /^supabase\/migrations\/[^/]+\.sql$/.test(rel)) {
+    const onMain = existsOnMain(root, rel);
+    if (onMain.error) {
+      block(
+        `[${HOOK}] Bloqueado: não foi possível verificar se ${rel} já está na main (${onMain.error}); ` +
+          'por segurança a escrita em migration não é liberada sem essa checagem. ' +
+          'Tente de novo; se persistir, confira o repositório git e avise o usuário.',
+      );
+    }
+    if (onMain.exists) {
+      block(
+        `[${HOOK}] Bloqueado: ${rel} já está na main e migrations são imutáveis. ` +
+          'Crie uma nova migration com `pnpm db:new <nome>` que corrija o problema (skill new-migration).',
+      );
+    }
   }
 
   // 3. segredos no conteúdo novo

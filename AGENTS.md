@@ -17,8 +17,8 @@ clientes e avançam fases com um "Ok". **Fase atual: só backend e banco de dado
 | [`docs/adr/`](docs/adr/) | Decisões arquiteturais (formato Nygard) |
 | [`NOTES.md`](NOTES.md) | Status atual, pendências e log de sessões |
 
-**Estado em 2026-11-15:** especificação concluída; ainda **não há código**. Os comandos abaixo
-nascem na Onda 0.
+**Estado em 2026-11-15:** Onda 0 (fundação) concluída: tooling, CI, Supabase local (portas 544xx),
+env validado e kernel. O status de cada onda está no plano e no `NOTES.md`.
 
 ## Stack
 

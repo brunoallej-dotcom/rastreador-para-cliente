@@ -1,0 +1,2 @@
+-- Seed SÓ para o banco local (`pnpm db:reset`). Nunca roda em staging ou produção.
+-- Dados de domínio (template de fases, fixtures) entram a partir da Onda 2.
