@@ -4,14 +4,14 @@
 //   1. arquivos .env* com valores reais (só .env.example é permitido);
 //   2. edição de migration que já está na main (migrations são imutáveis);
 //   3. conteúdo novo com cara de segredo (chaves, JWT, PEM, URL de banco com senha, NEXT_PUBLIC_ secreto).
+// A raiz do projeto vem do git da pasta do arquivo (funciona em worktrees de subagentes, ver lib.mjs).
+// A checagem "já está na main" lê as refs do repositório, que as worktrees compartilham.
 // Exit 2 = bloqueia e explica ao Claude. Erro interno = exit 1 (avisa, não bloqueia).
-import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { block, failOpen, projectDir, readHookInput, relativeToProject } from './lib.mjs';
+import { block, failOpen, git, projectDir, readHookInput, relativeToProject } from './lib.mjs';
 
 const HOOK = 'guard-writes';
 const MAIN_REFS = ['origin/main', 'main'];
-const GIT_TIMEOUT_MS = 3000;
 const MIN_SECRET_ENTROPY_BITS = 3.5;
 
 const SECRET_PATTERNS = [
@@ -67,11 +67,7 @@ function newContent(toolName, toolInput) {
 function existsOnMain(root, rel) {
   for (const ref of MAIN_REFS) {
     try {
-      execFileSync('git', ['cat-file', '-e', `${ref}:${rel}`], {
-        cwd: root,
-        stdio: 'ignore',
-        timeout: GIT_TIMEOUT_MS,
-      });
+      git(root, ['cat-file', '-e', `${ref}:${rel}`]);
       return true;
     } catch {
       // ref inexistente ou arquivo ausente nessa ref: tenta a próxima
@@ -83,8 +79,8 @@ function existsOnMain(root, rel) {
 try {
   const input = readHookInput();
   const toolInput = input.tool_input ?? {};
-  const root = projectDir(input);
   const target = toolInput.file_path ?? toolInput.notebook_path;
+  const root = projectDir(input, target);
   const rel = relativeToProject(root, target);
   const base = target ? path.basename(target) : '';
 

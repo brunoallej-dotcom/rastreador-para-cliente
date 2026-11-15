@@ -7,7 +7,7 @@
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ⬜ |
+| 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ⬜ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ⬜ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |

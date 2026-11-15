@@ -4,17 +4,17 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** especificação concluída (2026-11-15). Implementação não iniciada.
+- **Fase:** implementação em andamento (2026-11-15). Onda 0 concluída (fundação); ondas 1 ∥ 2 a seguir.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 0 — Fundação (`/run-wave 0`).
+- **Próxima onda:** 1 ∥ 2 — Plataforma HTTP (subagente) e Banco (sessão principal).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
-| 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ⬜ |
+| 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ⬜ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ⬜ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |
@@ -33,9 +33,8 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 | Pendência | Bloqueia |
 |-----------|----------|
-| Revisar e aceitar os ADRs 0001–0005 (`docs/adr/`) | fechamento da Onda 0 |
+| Revisar e aceitar os ADRs 0001–0005 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
-| Instalar pnpm (`corepack enable`) e Docker (Supabase local) | Onda 0 |
 | Ativar branch protection na `main` (o repositório remoto já existe) e restringir o merge a squash | CI da Onda 0 |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 3 (staging); Onda 11 (prod) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
@@ -44,6 +43,10 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 ## Observações
 
+- O Supabase local deste projeto usa as portas **544xx** (API 54421, DB 54422, Studio 54423,
+  Mailpit 54424), porque outro projeto local (`tracking-clientes`) ocupa as portas padrão 543xx.
+- pnpm 10.34.9 via corepack (`packageManager` no `package.json`); Supabase CLI 2.122.1 como
+  devDependency (a v3 foi lançada em 2026-11-02 e ainda não foi adotada).
 - `venv/` (Python) existe na raiz, mas não é usado por este projeto (ignorado pelo git).
 - O guardrail de segredos do ambiente bloqueia ler `.env.*`; o conteúdo de `.env.local` não foi
   inspecionado.
@@ -83,3 +86,25 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   `CLAUDE_PROJECT_DIR`. O critério de aceite da Onda 0 cobre esse caso.
 - Fora do plano por ora: mover `tests/helpers/mfa.ts` para a Onda 3 (deixaria 4, 5 e 6
   paralelas).
+
+### 2026-11-15 — Onda 0: fundação
+
+- Executada pela sessão principal como gerente, com três frentes paralelas em subagentes Sonnet
+  (tooling/kernel/env, hooks para worktree, CI).
+- `package.json` com todas as dependências previstas até a Onda 10 (pnpm 10.34.9, Next 16.4.6,
+  TypeScript 6.0.3, porque o typescript-eslint ainda não suporta a 7; Zod 4; Vitest 5; ESLint 10;
+  Supabase CLI 2.122.1).
+- ESLint com fronteiras de módulo (`route.ts` só importa `presentation/*.handler`), Vitest com
+  projetos `unit`/`int`/`api` (o env de teste vem de `supabase status -o env`, só URL local),
+  `env.ts` (Zod; a secret key é validada mas não exposta), kernel (`Result`, `ErrorCode`,
+  `DomainError`, `Clock`).
+- `supabase/config.toml` endurecido (sem signup, JWT 15 min, senha ≥ 12, TOTP, Realtime/Storage/
+  Edge desligados, só `public` na API, portas 544xx).
+- Hooks resolvem a raiz pelo git do arquivo editado (73 testes `node --test`, incluindo worktree
+  com `CLAUDE_PROJECT_DIR` apontando para o checkout principal); `stop-gates` também em
+  `SubagentStop`.
+- CI (`quality`, `audit`, `gitleaks`, `codeql`, `database`) com todas as Actions pinadas por SHA;
+  Dependabot para npm e Actions.
+- Verificado localmente: `pnpm install --frozen-lockfile`, `lint`, `typecheck`, `test` (132),
+  `test:hooks` (73), `contract:lint`, `build`, `format:check`, `db:start`, `db:reset`, `db:test`.
+  O CI verde é conferido no PR antes do merge.

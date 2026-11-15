@@ -4,6 +4,9 @@
 //   supabase/migrations/*.sql  → RLS, policies, grants, SECURITY DEFINER, REVOKE, SQL dinâmica
 //   src/**/*.ts(x)             → secret key, admin client, filtros PostgREST, getSession, console, route.ts fino
 //   contracts/openapi*.yaml    → Redocly lint (se instalado)
+// A raiz do projeto vem do git da pasta do arquivo (funciona em worktrees de subagentes, ver lib.mjs);
+// Prettier e Redocly são os de node_modules dessa raiz (cada worktree roda o próprio pnpm install) e,
+// se não estiverem instalados, a formatação e o lint do contrato completo são pulados.
 // Exit 2 = devolve as violações ao Claude para correção imediata. Erro interno = exit 1.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -209,8 +212,9 @@ function formatWithPrettier(root, abs) {
 
 try {
   const input = readHookInput();
-  const root = projectDir(input);
-  const rel = relativeToProject(root, input.tool_input?.file_path);
+  const target = input.tool_input?.file_path;
+  const root = projectDir(input, target);
+  const rel = relativeToProject(root, target);
   if (!rel) process.exit(0);
   const abs = path.join(root, rel);
   if (!existsSync(abs)) process.exit(0);

@@ -1,23 +1,19 @@
 #!/usr/bin/env node
-// Stop
+// Stop e SubagentStop (subagentes terminam com SubagentStop, não com Stop)
 // Impede encerrar o turno quando a árvore de trabalho tem:
 //   (a) migration nova ou alterada sem nenhum teste pgTAP novo ou alterado;
 //   (b) route.ts novo cujo path não existe em contracts/openapi.v1.yaml.
 // Bloqueia só uma vez por sequência (respeita stop_hook_active), para o Claude poder explicar e parar.
-import { execFileSync } from 'node:child_process';
+// A árvore checada é a do `cwd` do evento (a worktree do subagente, quando houver), não o checkout principal.
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { projectDir, readHookInput } from './lib.mjs';
+import { git, projectDir, readHookInput } from './lib.mjs';
 
 const GIT_TIMEOUT_MS = 5000;
 const CONTRACT = 'contracts/openapi.v1.yaml';
 
 function changedFiles(root) {
-  const out = execFileSync('git', ['status', '--porcelain=v1', '-uall'], {
-    cwd: root,
-    encoding: 'utf8',
-    timeout: GIT_TIMEOUT_MS,
-  });
+  const out = git(root, ['status', '--porcelain=v1', '-uall'], { timeout: GIT_TIMEOUT_MS });
   return out
     .split('\n')
     .filter(Boolean)

@@ -1,0 +1,73 @@
+{
+  "name": "rastreador-para-cliente",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --project unit",
+    "test:int": "vitest run --project int",
+    "test:api": "vitest run --project api",
+    "test:coverage": "vitest run --project unit --coverage",
+    "test:hooks": "node --test \".claude/hooks/*.test.mjs\"",
+    "contract:lint": "redocly lint contracts/openapi.v1.yaml",
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:status": "supabase status",
+    "db:reset": "supabase db reset --local",
+    "db:test": "supabase test db --local",
+    "db:lint": "supabase db lint --local --fail-on error",
+    "db:types": "supabase gen types typescript --local --schema public > src/shared/db/database.types.ts",
+    "db:new": "supabase migration new",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm contract:lint && pnpm db:test",
+    "ceo:create": "tsx scripts/create-ceo.ts"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "2.119.0",
+    "@vercel/functions": "3.11.3",
+    "next": "16.4.6",
+    "pino": "10.4.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "server-only": "0.0.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@next/eslint-plugin-next": "16.4.6",
+    "@redocly/cli": "2.78.0",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitest/coverage-v8": "5.1.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
+    "otpauth": "9.6.0",
+    "prettier": "3.10.1",
+    "supabase": "2.122.1",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.2",
+    "vitest": "5.1.0",
+    "yaml": "2.9.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "supabase"
+    ]
+  }
+}
