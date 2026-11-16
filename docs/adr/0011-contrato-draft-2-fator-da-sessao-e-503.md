@@ -1,6 +1,6 @@
 # ADR 0011 — Contrato `1.0.0-draft.2`: fator TOTP resolvido pela sessão e 503 documentado
 
-- **Status:** proposed (altera em parte o [ADR 0008](0008-contrato-estrito-e-entrada-nao-declarada.md))
+- **Status:** accepted (altera em parte o [ADR 0008](0008-contrato-estrito-e-entrada-nao-declarada.md))
 - **Data:** 2026-11-16
 
 ## Contexto
@@ -72,3 +72,11 @@ Em 2026-11-16 o usuário aprovou um bump minor do contrato para resolver isso.
   `factor_not_found`; o traço do sequestro continua em `auth.mfa.enrolled` (`replacedFactors`) e
   `auth.mfa.verified` (`activated`). A remoção do campo é uma mudança incompatível: fica para
   `/api/v2`.
+- **Resolver pela lista do Auth tem um custo, registrado no threat model (§8, F-60 a F-63):** quem tem a
+  senha e a publishable key pode plantar fatores direto no Auth. Um candidato não verificado deixa o
+  verify sem `factorId` ambíguo (negação de serviço, F-60: evento `auth.mfa.factor_ambiguous` em nível
+  `error`); um fator verificado plantado vira o "único verificado" e esconde a tomada atrás de um
+  `invalid_code` (F-61: o log leva o `factorId` resolvido e `candidateCount`, mas o Auth apaga os
+  candidatos não verificados quando o plantado é verificado, então o sinal é o `factorId` não ser o do
+  `auth.mfa.enrolled`). A correção de raiz é o atestado da Onda 6.1, com os
+  requisitos do F-63.

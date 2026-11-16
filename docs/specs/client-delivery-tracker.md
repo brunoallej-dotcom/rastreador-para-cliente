@@ -507,9 +507,14 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   `auth.login.failed` (HMAC do e-mail, `ipHash` e uma categoria: `invalid_credentials`,
   `account_inactive`, `upstream_unavailable` ou `upstream_error`), `auth.logout` (userId,
   `sessionId`, `ipHash`), `auth.mfa.enrolled` (`userId`, `factorId`, `replacedFactors`, `ipHash`),
-  `auth.mfa.verified` (`userId`, `factorId`, `sessionId`, `activated`, `ipHash`),
-  `auth.mfa.failed` (`userId`, `factorId` quando há fator, `factorSource`, `ipHash` e uma categoria:
-  `invalid_code`, `code_reused`, `factor_not_found` ou `factor_ambiguous`; a resposta é a mesma nas quatro), `auth.mfa.followup_failed` (`userId`, `step`:
+  `auth.mfa.verified` (`userId`, `factorId`, `factorSource`, `candidateCount`, `sessionId`,
+  `activated`, `ipHash`), `auth.mfa.failed` (`userId`, `factorId` quando há fator, `factorSource`,
+  `candidateCount`, `ipHash` e uma categoria: `invalid_code`, `code_reused`, `factor_not_found` ou
+  `factor_ambiguous`; a resposta é a mesma nas quatro). `candidateCount` é quantos fatores TOTP a
+  conta tem e só existe quando o verify não trouxe `factorId` (o app mantém um só: mais de um é
+  anômalo, F-60; a tomada por um fator verificado plantado não aumenta a conta, F-61: o sinal é o
+  `factorId` não ser o do `auth.mfa.enrolled` do mesmo usuário). `factor_ambiguous` também gera `auth.mfa.factor_ambiguous`, em nível `error` e com
+  nome estável, para alerta (o app nunca cria esse estado, F-60). Ainda: `auth.mfa.followup_failed` (`userId`, `step`:
   a revogação das outras sessões que falhou depois de um verify bom), `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
   `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
   `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).

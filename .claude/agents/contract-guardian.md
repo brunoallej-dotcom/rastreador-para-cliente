@@ -40,7 +40,8 @@ Referências: `contracts/openapi.v1.yaml`, `docs/specs/client-delivery-tracker.m
      são orçamentos que o handler ou o resolvedor gastam (`consumeUserBudget`,
      `consumeGlobalBudget`, `session-upstream`). Confira-as contra as constantes
      (`rate-limit-budgets.ts`, `SESSION_UPSTREAM_RULE`) e confirme que cada orçamento do código
-     consta no contrato;
+     consta no contrato. Entrada `programmatic` sem constante ou sem handler que a gaste, ou
+     orçamento no código (`consume*Budget(`) ausente do contrato → **ALTO**;
    - toda operação autenticada documenta o 503 (`ServiceUnavailable`) → divergência **MÉDIO**;
    - schemas Zod de params, query e body: mesmos campos, obrigatoriedade, `maxLength`/`minLength`,
      enums, formatos (`uuid`, `email`) e `.strict()` → divergência **ALTO**;
