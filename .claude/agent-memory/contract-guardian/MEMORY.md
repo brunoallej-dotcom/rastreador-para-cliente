@@ -1,0 +1,3 @@
+- [Accepted contract gaps](feedback_accepted_gaps.md) — 503 infra gap, ignored body/query, rate-limit groups (ADR 0008): don't re-report
+- [Recurring test gaps](project_recurring_test_gaps.md) — secondary API tests assert status without expectToMatchContract; e-mail normalization leniency
+- [Recurring divergences](recurring-divergences.md) — 503 accepted per ADR 0008; Origin/429 tests often skip expectToMatchContract

@@ -1,0 +1,3 @@
+- [Supabase privilege pitfalls](supabase_privilege_pitfalls.md) — service_role/supabase_admin default ACLs, claim casts, [[:cntrl:]] gaps
+- [Local DB probing](local_db_probing.md) — docker exec psql into the local container, rollback probes, role limits
+- [Wave 2 audit findings](wave2_audit_findings.md) — open MÉDIO/BAIXO items from 2026-11-15 to re-check

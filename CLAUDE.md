@@ -39,9 +39,16 @@ Do plugin AISAC: `waves` (replanejar ondas), `verify` (fechar onda), `security-s
 | Evento | Script | O que faz |
 |--------|--------|-----------|
 | `SessionStart` | `session-context.mjs` | Injeta o status das ondas (`NOTES.md`) e lembretes do fluxo |
-| `PreToolUse` (Write, Edit) | `guard-writes.mjs` | **Bloqueia** escrita em `.env*` (exceto `.env.example`), edição de migration já mergeada na main e conteúdo com cara de segredo |
-| `PostToolUse` (Write, Edit) | `post-edit-checks.mjs` | Formata com Prettier (quando instalado) e aponta violações: migration sem RLS, `SECURITY DEFINER` sem `search_path`, função sem `REVOKE`, policy de escrita, `GRANT` indevido, SQL dinâmica; no TS: uso da secret key fora do lugar, filtro PostgREST interpolado, `getSession()`, `console.*`, `route.ts` com lógica; no contrato: Redocly lint |
-| `Stop` | `stop-gates.mjs` | Não deixa encerrar com migration sem teste pgTAP, nem com `route.ts` novo fora do contrato (avisa uma vez por turno) |
+| `PreToolUse` (Write, Edit, MultiEdit, NotebookEdit) | `guard-writes.mjs` | **Bloqueia** escrita em `.env*` (exceto `.env.example`), edição de migration já mergeada na main e conteúdo com cara de segredo |
+| `PostToolUse` (Write, Edit, MultiEdit) | `post-edit-checks.mjs` | Formata com Prettier (quando instalado) e aponta violações: migration sem RLS, `SECURITY DEFINER` sem `search_path`, função sem `REVOKE`, policy de escrita, `GRANT` indevido, SQL dinâmica; no TS: uso da secret key fora do lugar, filtro PostgREST interpolado, `getSession()`, `console.*`, `route.ts` com lógica; no contrato: Redocly lint |
+| `Stop` e `SubagentStop` | `stop-gates.mjs` | Não deixa encerrar (nem o subagente devolver o trabalho) com migration sem teste pgTAP, nem com `route.ts` novo fora do contrato (avisa uma vez por turno) |
+
+O plugin AISAC, instalado no usuário e fora deste repositório, acrescenta o guard `secrets-guard`
+(`PreToolUse`, inclusive em Bash). Ele recusa comandos Bash cujo texto contenha `.env` ou um
+identificador terminado em `.key`. O segundo caso tem falso positivo conhecido: `obj.key` parece
+um arquivo de chave. A correção é no código-fonte do `@aisac/cli`, não neste repositório. Até lá,
+escreva arquivos com as ferramentas Write/Edit em vez de heredoc no Bash e prefira
+desestruturação a acessar `.key`.
 
 Quando um hook bloquear, corrija a causa. Não contorne o hook (por exemplo, escrevendo o mesmo
 conteúdo por outro caminho). Se o bloqueio parecer falso positivo, explique ao usuário.

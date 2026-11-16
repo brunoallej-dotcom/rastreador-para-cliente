@@ -1,6 +1,6 @@
 # ADR 0009 — Duração da sessão: credenciais efêmeras
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto
