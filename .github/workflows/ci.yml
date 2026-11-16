@@ -73,24 +73,25 @@ jobs:
           # findings go to the job summary and the SARIF artifact.
           GITLEAKS_ENABLE_COMMENTS: 'false'
 
-  codeql:
+  # SAST (spec SEC-18): Semgrep CE from a container image pinned by digest (ADR 0012). scripts/sast.sh
+  # runs it with Docker, so `pnpm sast` is this same scan. Nothing is uploaded: a finding fails the
+  # job and appears only in the job log. The registry packs are fetched at run time. Dependabot does
+  # not track this image: bump the digest by hand (the script reads it from SEMGREP_IMAGE below).
+  sast:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
-      security-events: write
-      actions: read
       contents: read
+    env:
+      SEMGREP_IMAGE: semgrep/semgrep@sha256:2e45517a85e13a9cca14a2a00df6bb48affd66b8ebfae1b0991cd57578362fb0 # 1.183.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          languages: javascript-typescript
-          build-mode: none
-      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          category: /language:javascript-typescript
+      - name: Check the local rules against their fixtures
+        run: sh scripts/sast.sh test
+      - name: Scan
+        run: sh scripts/sast.sh
 
   database:
     runs-on: ubuntu-24.04

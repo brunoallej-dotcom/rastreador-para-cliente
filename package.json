@@ -21,6 +21,8 @@
     "test:coverage": "vitest run --project unit --coverage",
     "test:hooks": "node --test \".claude/hooks/*.test.mjs\"",
     "contract:lint": "redocly lint contracts/openapi.v1.yaml",
+    "sast": "sh scripts/sast.sh",
+    "sast:test": "sh scripts/sast.sh test",
     "db:start": "supabase start",
     "db:stop": "supabase stop",
     "db:status": "supabase status",

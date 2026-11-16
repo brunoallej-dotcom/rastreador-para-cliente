@@ -108,7 +108,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 - Hooks resolvem a raiz pelo git do arquivo editado (73 testes `node --test`, incluindo worktree
   com `CLAUDE_PROJECT_DIR` apontando para o checkout principal); `stop-gates` também em
   `SubagentStop`.
-- CI (`quality`, `audit`, `gitleaks`, `codeql`, `database`) com todas as Actions pinadas por SHA;
+- CI (`quality`, `audit`, `gitleaks`, `sast` (Semgrep CE; era `codeql` até 2026-11-16, ADR 0012), `database`) com todas as Actions pinadas por SHA;
   Dependabot para npm e Actions.
 - Verificado localmente: `pnpm install --frozen-lockfile`, `lint`, `typecheck`, `test` (132),
   `test:hooks` (73), `contract:lint`, `build`, `format:check`, `db:start`, `db:reset`, `db:test`.
