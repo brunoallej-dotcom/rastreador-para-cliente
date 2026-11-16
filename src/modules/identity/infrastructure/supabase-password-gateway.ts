@@ -16,6 +16,12 @@ import type { ReauthClient } from './reauth-client';
  * server: the three of a sign-in (the same ones the login maps to its generic 401) and the two a
  * password update makes when the project requires the current password. They all become
  * `InvalidCurrentPasswordError`. Anything else is NOT about the password: see `verifyCurrentPassword`.
+ *
+ * `current_password_mismatch` and `current_password_required` are codes of the GoTrue server
+ * (`ErrorCodeCurrentPasswordMismatch` and `ErrorCodeCurrentPasswordRequired`, answered with a 400
+ * when `security_update_password_require_current_password` is on); the installed `@supabase/auth-js`
+ * (2.119.0) does not list them in its `ErrorCode` union. That is why the codes are compared as plain
+ * strings here and why the unit tests pin them by value: a type check cannot notice a rename.
  */
 const WRONG_PASSWORD_CODES: ReadonlySet<string> = new Set([
   'invalid_credentials',

@@ -8,11 +8,14 @@ import { clientIpFingerprint, noContent, withRoute, type WithRoute } from '@/sha
 import { DomainError, ServiceUnavailableError } from '@/shared/kernel';
 import { changePassword } from '../application/change-password';
 import { UnexpectedAuthAnswerError } from '../domain/errors';
-import { PasswordChangeIncompleteError } from '../domain/password-errors';
+import {
+  PasswordChangeIncompleteError,
+  PasswordChangeUncertainError,
+} from '../domain/password-errors';
 import { createReauthClient } from '../infrastructure/reauth-client';
 import { createSupabasePasswordGateway } from '../infrastructure/supabase-password-gateway';
 import { changePasswordBodySchema } from './change-password.schema';
-import { LOGIN_GLOBAL_BUDGET } from './login.handler';
+import { LOGIN_GLOBAL_BUDGET } from './rate-limit-budgets';
 
 const PASSWORD_CHANGE_LIMIT = 5;
 const FIFTEEN_MINUTES_SECONDS = 15 * 60;
@@ -90,6 +93,12 @@ export function createChangePasswordHandler(route: WithRoute = withRoute) {
           logger.error(
             { event: 'auth.password_change.incomplete', userId: principal.userId, sessionId },
             'auth.password_change.incomplete',
+          );
+        } else if (error instanceof PasswordChangeUncertainError) {
+          // The Auth server did not answer the update: the password may or may not be new.
+          logger.error(
+            { event: 'auth.password_change.uncertain', userId: principal.userId, sessionId },
+            'auth.password_change.uncertain',
           );
         } else if (error instanceof UnexpectedAuthAnswerError) {
           logFailure('upstream_error', { authStatus: error.authStatus, authCode: error.authCode });

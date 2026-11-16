@@ -13,8 +13,15 @@ export type FakePasswordGateway = PasswordGateway & {
   password(): string;
   /** Is the pending `CHANGE_PASSWORD` still set? */
   readonly pending: () => boolean;
-  /** Makes `markPasswordChanged` throw `ServiceUnavailableError` this many times. */
+  /** Makes `markPasswordChanged` throw `ServiceUnavailableError` this many times, committing nothing. */
   failMarkTimes(times: number): void;
+  /**
+   * The NEXT `markPasswordChanged` commits (baseline renewed, pendency cleared) and then throws
+   * `ServiceUnavailableError`: the work was done and only the answer was lost.
+   */
+  loseNextMarkAnswer(): void;
+  /** `updatePassword` throws `ServiceUnavailableError`; `applied` says whether it stored the password first. */
+  failUpdate(options: { readonly applied: boolean }): void;
   /** The backend judges every new password too weak (a stricter policy than ours). */
   rejectNewPasswordAsWeak(): void;
 };
@@ -25,6 +32,8 @@ export function createFakePasswordGateway(initialPassword: string): FakePassword
   let password = initialPassword;
   let pending = true;
   let markFailures = 0;
+  let loseMarkAnswer = false;
+  let updateFailure: { readonly applied: boolean } | undefined;
   let weak = false;
   /** What the database remembers as the password the pendency was set with (ADR 0007). */
   let baseline = initialPassword;
@@ -34,6 +43,8 @@ export function createFakePasswordGateway(initialPassword: string): FakePassword
     password: () => password,
     pending: () => pending,
     failMarkTimes: (times) => void (markFailures = times),
+    loseNextMarkAnswer: () => void (loseMarkAnswer = true),
+    failUpdate: (options) => void (updateFailure = options),
     rejectNewPasswordAsWeak: () => void (weak = true),
 
     verifyCurrentPassword(currentPassword) {
@@ -45,6 +56,10 @@ export function createFakePasswordGateway(initialPassword: string): FakePassword
 
     updatePassword({ newPassword }) {
       calls.push('update');
+      if (updateFailure !== undefined) {
+        if (updateFailure.applied) password = newPassword;
+        return Promise.reject(new ServiceUnavailableError('auth unavailable'));
+      }
       if (weak) return Promise.resolve(err(new WeakPasswordError()));
       if (newPassword === password) return Promise.resolve(err(new PasswordUnchangedError()));
       password = newPassword;
@@ -60,6 +75,10 @@ export function createFakePasswordGateway(initialPassword: string): FakePassword
       if (password === baseline) return Promise.resolve(err(new PasswordUnchangedError()));
       baseline = password;
       pending = false;
+      if (loseMarkAnswer) {
+        loseMarkAnswer = false;
+        return Promise.reject(new ServiceUnavailableError('the answer was lost'));
+      }
       return Promise.resolve(ok(undefined));
     },
   };

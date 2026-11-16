@@ -11,7 +11,7 @@ import type {
 import { apiRequest, createTestPipeline, principalFixture } from '@/shared/http/testing';
 import { ServiceUnavailableError } from '@/shared/kernel';
 import { createChangePasswordHandler } from './change-password.handler';
-import { LOGIN_GLOBAL_BUDGET } from './login.handler';
+import { LOGIN_GLOBAL_BUDGET } from './rate-limit-budgets';
 
 // The gateway is the edge (Supabase): it is replaced by the in-memory fake of the port, wired the
 // way the real one is (the budget hook runs right before the check of the current password).
@@ -301,6 +301,44 @@ describe('POST /auth/password: the outcomes', () => {
     });
     // the password is new: the log says nothing else about it
     for (const line of logs.lines) expect(line).not.toContain(FRESH);
+  });
+
+  it('M4: an update that gets no answer is 503 with the guidance of both states, and its own error-level event', async () => {
+    const fake = createFakePasswordGateway(TEMPORARY);
+    fake.failUpdate({ applied: true });
+    gateway = fake;
+    const { handler, logs } = pipeline();
+
+    const response = await handler(request({ currentPassword: TEMPORARY, newPassword: FRESH }));
+
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { code: string; detail: string };
+    expect(body.code).toBe('SERVICE_UNAVAILABLE');
+    expect(body.detail).toContain('may already have been changed');
+    expect(body.detail).toContain('new password as the current password');
+    expect(response.headers.get('retry-after')).not.toBeNull();
+    expect(logs.events('auth.password_change.uncertain')).toHaveLength(1);
+    expect(logs.events('auth.password_change.uncertain')[0]).toMatchObject({
+      level: 'error',
+      userId: client().userId,
+    });
+    expect(logs.events('auth.password_change.incomplete')).toEqual([]);
+    for (const line of logs.lines) expect(line).not.toContain(FRESH);
+  });
+
+  it('F-44: when the first mark committed and only its answer was lost, the change is 204 and nothing is logged as a failure', async () => {
+    const fake = createFakePasswordGateway(TEMPORARY);
+    fake.loseNextMarkAnswer();
+    gateway = fake;
+    const { handler, logs } = pipeline();
+
+    const response = await handler(request({ currentPassword: TEMPORARY, newPassword: FRESH }));
+
+    expect(response.status).toBe(204);
+    expect(fake.pending()).toBe(false);
+    expect(logs.events('auth.password_changed')).toHaveLength(1);
+    expect(logs.events('auth.password_change.failed')).toEqual([]);
+    expect(logs.events('auth.password_change.incomplete')).toEqual([]);
   });
 });
 

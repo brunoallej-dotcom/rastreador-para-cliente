@@ -41,6 +41,25 @@ export class InvalidCurrentPasswordError extends DomainError {
 }
 
 /**
+ * The request to store the new password failed in a way that does not say whether it was applied: a
+ * transport failure, a timeout or a 5xx may come after the Auth server already changed the password
+ * (the answer is what was lost). The old password may or may not still work, so the way out names
+ * both: repeat the request, and if the current password is then refused, the first attempt had
+ * worked and the NEW password is the current one. A 503 so a client retries; the log carries an
+ * error-level event for it.
+ */
+export class PasswordChangeUncertainError extends ServiceUnavailableError {
+  constructor(options?: DomainErrorOptions) {
+    super('the password update failed without saying whether it was applied', {
+      detail:
+        'The password may already have been changed. Repeat the request; if the current password ' +
+        'is then refused as incorrect, repeat it using the new password as the current password.',
+      ...options,
+    });
+  }
+}
+
+/**
  * The Auth server stored the new password, but the account could not be marked as changed
  * (`mark_password_changed()` kept failing): the pending `CHANGE_PASSWORD` is still there and the old
  * password no longer works. The session of this request survives, so the way out is to repeat the
