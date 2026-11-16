@@ -4,9 +4,11 @@ import {
   ClientArchivedError,
   ClientUserProvisionOrphanedError,
   ClientUserProvisionRolledBackError,
+  ClientUserProvisionUnconfirmedError,
   EmailAlreadyRegisteredError,
   UserLimitReachedError,
 } from '../domain/client-user-errors';
+import { UnexpectedAuthAnswerError } from '../domain/errors';
 import {
   CLIENT_A,
   UNKNOWN_CLIENT,
@@ -311,5 +313,223 @@ describe('provisionClientUser', () => {
         detail: (error as { detail?: string }).detail,
       }),
     ).not.toContain(PASSWORD);
+  });
+
+  describe('E-17: a login of the client that already has the e-mail', () => {
+    it('is the 409 before anything is created, whatever its case, and it is never touched', async () => {
+      const world = worldWithTwoClients();
+
+      const result = await provisionClientUser(deps(world), ceoPrincipal, {
+        ...INPUT,
+        email: 'a1@cliente.test',
+      });
+
+      expect(!result.ok && result.error).toBeInstanceOf(EmailAlreadyRegisteredError);
+      expect(world.calls).not.toContain('createClientUser');
+      expect(world.calls).not.toContain('deleteUser');
+    });
+  });
+
+  describe('F-90, E-50: a creation whose answer is lost', () => {
+    const accountOf = (world: ReturnType<typeof worldWithTwoClients>) =>
+      [...world.records.values()].find((record) => record.email === INPUT.email);
+
+    it('with the login in the list: the account is taken back and the answer is a 503, never a 422', async () => {
+      const world = worldWithTwoClients();
+      world.loseAnswerOf('createClientUser');
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+      expect(error).toMatchObject({ reason: 'answer_lost' });
+      expect(accountOf(world)).toBeUndefined();
+      expect(world.calls).toContain('deleteUser');
+    });
+
+    it('with the login in the list AND the client full because of it: still a 503, since the login exists (a 422 would say "refused")', async () => {
+      const world = worldWithTwoClients();
+      for (let index = 0; index < 8; index += 1) {
+        world.seed({
+          id: `00000000-0000-4000-8000-0000000004${String(index).padStart(2, '0')}`,
+          clientId: CLIENT_A,
+          email: `fill${index}@cliente.test`,
+        });
+      }
+      // the login that was just created is the 10th: the client is full now, and that is NOT a refusal
+      world.loseAnswerOf('createClientUser');
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+      expect(accountOf(world)).toBeUndefined();
+    });
+
+    it('with the login in the list and the deletion failing: the orphan error carries the id and why the deletion failed, as a code and a status', async () => {
+      const world = worldWithTwoClients();
+      world.loseAnswerOf('createClientUser');
+      world.failNext(
+        'deleteUser',
+        2,
+        new UnexpectedAuthAnswerError('delete the login', {
+          status: 500,
+          code: 'unexpected_failure',
+        }),
+      );
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionOrphanedError);
+      const orphan = accountOf(world);
+      expect(error).toMatchObject({
+        reason: 'answer_lost',
+        userId: orphan?.id,
+        deleteFailure: { status: 500, reason: 'unexpected_failure' },
+      });
+      expect(
+        JSON.stringify((error as ClientUserProvisionOrphanedError).deleteFailure),
+      ).not.toContain(INPUT.email);
+    });
+
+    it('a login with that e-mail that this request did not create is never deleted: it signed in, or it is not new', async () => {
+      const world = worldWithTwoClients();
+      // after the checks, somebody else's login appears with the e-mail, and the creation then fails
+      const accounts = {
+        ...world.accounts,
+        createClientUser: () => {
+          world.seed({
+            id: '00000000-0000-4000-8000-0000000005aa',
+            clientId: CLIENT_A,
+            email: INPUT.email,
+            mustChangePassword: false,
+            lastSignInAt: new Date('2026-11-16T10:00:00.000Z'),
+          });
+          return Promise.reject(new ServiceUnavailableError('create unavailable'));
+        },
+      };
+
+      await expect(
+        provisionClientUser({ ...deps(world), accounts }, ceoPrincipal, INPUT),
+      ).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(world.calls).not.toContain('deleteUser');
+      expect(world.records.has('00000000-0000-4000-8000-0000000005aa')).toBe(true);
+    });
+
+    it('a NEW login (the temporary password in use, never signed in) that appears with the e-mail meanwhile is what the request own creation looks like, so it is taken back', async () => {
+      const world = worldWithTwoClients();
+      const accounts = {
+        ...world.accounts,
+        createClientUser: () => {
+          world.seed({
+            id: '00000000-0000-4000-8000-0000000005bb',
+            clientId: CLIENT_A,
+            email: INPUT.email,
+            mustChangePassword: true,
+            lastSignInAt: null,
+          });
+          return Promise.reject(new ServiceUnavailableError('create unavailable'));
+        },
+      };
+
+      const error: unknown = await provisionClientUser(
+        { ...deps(world), accounts },
+        ceoPrincipal,
+        INPUT,
+      ).catch((caught: unknown) => caught);
+
+      // new and unused: exactly what the request's own creation looks like
+      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+      expect(world.records.has('00000000-0000-4000-8000-0000000005bb')).toBe(false);
+    });
+
+    it('with the login NOT in the list and the client archived by now: 422, the trigger refused it (E-52)', async () => {
+      const world = worldWithTwoClients();
+      world.beforeCreate = () =>
+        world.clientRows.set(CLIENT_A, { name: 'Cliente A', archived: true });
+
+      const result = await provisionClientUser(deps(world), ceoPrincipal, INPUT);
+
+      expect(!result.ok && result.error).toBeInstanceOf(ClientArchivedError);
+    });
+  });
+
+  describe('E-55: the Auth server accepts the creation and answers without a user id', () => {
+    it('the account is found by its e-mail and taken back: a 503, never a 500, and no password', async () => {
+      const world = worldWithTwoClients();
+      world.answerNextCreationWithoutId();
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+      expect(error).toMatchObject({ reason: 'answer_lost' });
+      expect([...world.records.values()].some((record) => record.email === INPUT.email)).toBe(
+        false,
+      );
+    });
+
+    it('when the look for the account fails too, the unconfirmed error stands (a 503 the handler logs)', async () => {
+      const world = worldWithTwoClients();
+      world.answerNextCreationWithoutId();
+      let lookups = 0;
+      const clients = {
+        status: (clientId: string) => {
+          lookups += 1;
+          return lookups === 1
+            ? world.clients.status(clientId)
+            : Promise.reject(new ServiceUnavailableError('status unavailable'));
+        },
+      };
+
+      const error: unknown = await provisionClientUser(
+        { ...deps(world), clients },
+        ceoPrincipal,
+        INPUT,
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ClientUserProvisionUnconfirmedError);
+      expect(error).toBeInstanceOf(UnexpectedAuthAnswerError);
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      // the account is still there: nobody could name it
+      expect([...world.records.values()].some((record) => record.email === INPUT.email)).toBe(true);
+    });
+  });
+
+  describe('code review 5: what the compensation reports', () => {
+    it('E-23: the rolled-back error carries the id of the account taken back, for the log', async () => {
+      const world = worldWithTwoClients();
+      world.failNext('recordProvisioned');
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+      expect(error).toMatchObject({ reason: 'record_failed' });
+      expect(typeof (error as ClientUserProvisionRolledBackError).userId).toBe('string');
+    });
+
+    it('E-23: the orphan error says why the last deletion failed (a code and a status, no message)', async () => {
+      const world = worldWithTwoClients();
+      world.failNext('recordProvisioned');
+      world.failNext('deleteUser', 2);
+
+      const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(ClientUserProvisionOrphanedError);
+      expect(error).toMatchObject({
+        reason: 'record_failed',
+        deleteFailure: { kind: 'SERVICE_UNAVAILABLE' },
+      });
+    });
   });
 });

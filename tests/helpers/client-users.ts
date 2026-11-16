@@ -17,6 +17,7 @@ import { POST as resetRoute } from '@/app/api/v1/admin/clients/[clientId]/users/
 import { PATCH as updateRoute } from '@/app/api/v1/admin/clients/[clientId]/users/[userId]/route';
 import { adminClient } from './fixtures';
 import { bodyOf, invoke, type CookieStore, type InvokeInit } from './http';
+import { loginAsCeoWithMfa, type CeoWithMfa } from './mfa';
 
 /** `ClientUser` of the contract, as the API answers it. */
 export type ClientUserBody = {
@@ -91,6 +92,52 @@ export const resetClientUserPasswordViaApi = (
     ...extras,
     ...withCookies(cookies),
   });
+
+const READINESS_ATTEMPTS = 40;
+const READINESS_PAUSE_MS = 500;
+
+/**
+ * Right after `supabase db reset` PostgREST has lost its connection to the database and answers every
+ * call with "Database client error. Retrying the connection." (a 503) until it reconnects, which takes a
+ * few seconds, longer than the start of a test run. That was the "unexplained `beforeAll` failure right
+ * after a reset": the first CEOs of a file failed in `mark_password_changed`, the next ones passed. It is
+ * a readiness race of the stack, not of the code under test, so the first CEO of a run waits until a
+ * trivial read (a client row, with the secret key) works, up to 20 s, and says what it last saw if it
+ * never does. It spends none of the budgets the tests care about (no login, no rate limiter).
+ */
+let postgrestReady: Promise<void> | undefined;
+
+function postgrestIsReady(): Promise<void> {
+  postgrestReady ??= (async () => {
+    let last = 'no answer';
+    for (let attempt = 0; attempt < READINESS_ATTEMPTS; attempt += 1) {
+      const { error } = await adminClient().from('clients').select('id').limit(1);
+      if (error === null) return;
+      last = `${error.code}: ${error.message}`;
+      await new Promise((resolve) => setTimeout(resolve, READINESS_PAUSE_MS));
+    }
+    throw new Error(`PostgREST never reconnected to the database (the last answer was "${last}")`);
+  })();
+  return postgrestReady;
+}
+
+/**
+ * A fresh CEO with an attested `aal2` session (`loginAsCeoWithMfa`), for the `beforeAll` of a group of
+ * tests. When the set-up fails, the error says WHICH group's CEO it was and repeats what the failing
+ * request answered (the helpers of `mfa.ts` put the status and the problem+json body, `code` included,
+ * in their messages): a bare "hook failed" after a database reset once hid a 429 or a refused sign-in
+ * that nobody could read afterwards. Never put a password or a code in the message: none of the
+ * messages it wraps has one.
+ */
+export async function ceoFixture(label: string): Promise<CeoWithMfa> {
+  try {
+    await postgrestIsReady();
+    return await loginAsCeoWithMfa();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`the CEO of "${label}" could not be set up: ${reason}`, { cause: error });
+  }
+}
 
 /** An e-mail nobody else uses, already in canonical form (lowercase). */
 export const uniqueLoginEmail = (label = 'login') =>

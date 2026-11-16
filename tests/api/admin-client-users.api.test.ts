@@ -17,6 +17,7 @@ import {
   archiveClientFixture,
   auditOfAccount,
   authUserOf,
+  ceoFixture,
   isBannedInAuth,
   listClientUsersViaApi,
   loginsWithEmail,
@@ -33,7 +34,13 @@ import {
 import { updateClientViaApi } from '../helpers/clients';
 import { expectToMatchContract } from '../helpers/contract';
 import { agePasswordBaseline } from '../helpers/db';
-import { createClient, createClientUser, createCeo, type FixtureUser } from '../helpers/fixtures';
+import {
+  adminClient,
+  createClient,
+  createClientUser,
+  createCeo,
+  type FixtureUser,
+} from '../helpers/fixtures';
 import {
   bodyOf,
   invoke,
@@ -41,12 +48,7 @@ import {
   withoutRequestId,
   type CookieStore,
 } from '../helpers/http';
-import {
-  completeFirstAccess,
-  loginAsCeoWithMfa,
-  loginViaApi,
-  type CeoWithMfa,
-} from '../helpers/mfa';
+import { completeFirstAccess, loginViaApi, type CeoWithMfa } from '../helpers/mfa';
 import {
   canSignIn,
   changePassword,
@@ -97,6 +99,16 @@ async function expectContract<T = unknown>(operationId: string, response: Respon
 }
 
 type Problem = { code: string; detail?: string; errors?: { path: string; message: string }[] };
+
+/** 503 `SERVICE_UNAVAILABLE` with a `Retry-After` of at least a second, as the contract documents. */
+async function expectUnavailable(operationId: string, response: Response): Promise<Problem> {
+  const body = await expectContract<Problem>(operationId, response);
+
+  expect(response.status).toBe(503);
+  expect(body.code).toBe('SERVICE_UNAVAILABLE');
+  expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+  return body;
+}
 
 /** `POST /auth/login` through the real route: the response, not a fixture that insists on a 200. */
 const loginResponse = (credentials: { email: string; password: string }) =>
@@ -168,7 +180,7 @@ describe('POST /admin/clients/{clientId}/users (provisionClientUser)', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('provisioning');
   });
 
   it('AC-12: a CEO provisions a login: 201 with the login and a temporary password of 20 characters, returned once', async () => {
@@ -392,7 +404,7 @@ describe('the limit of 10 logins per client', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('limit of 10');
   });
 
   async function clientWithLogins(count: number) {
@@ -476,7 +488,7 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('update');
   });
 
   it('AC-13: disabling a login: the next request of that user is 401, its login fails and the Auth server bans it', async () => {
@@ -592,7 +604,12 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
     // ...even though the Auth server was not told to ban it
     expect(await isBannedInAuth(login.id)).toBe(false);
     const [failure] = events('identity.client_user.ban_failed');
-    expect(failure).toMatchObject({ level: 'error', targetUserId: login.id, clientId: tenant.id });
+    expect(failure).toMatchObject({
+      level: 'error',
+      targetUserId: login.id,
+      clientId: tenant.id,
+      reason: 'unavailable',
+    });
     expect(logged.lines.join('\n')).not.toContain(login.email);
 
     const repeated = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
@@ -600,6 +617,110 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
     });
     expect(repeated.status).toBe(200);
     expect(await isBannedInAuth(login.id)).toBe(true);
+    // the repeat changed no state in the database: still one event
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.disabled',
+    ]);
+  });
+
+  it('F-94: an unexpected answer of the Auth server to the ban is still 200 (the database blocks the login) and is logged at error as `unexpected`', async () => {
+    const { tenant, login, cookies } = await tenantWithSignedInLogin();
+    logged.lines.length = 0;
+    const spy = spyOnSupabaseFetch((url) =>
+      url.includes('/auth/v1/admin/users/')
+        ? Response.json(
+            { code: 400, error_code: 'validation_failed', msg: login.email },
+            { status: 400 },
+          )
+        : undefined,
+    );
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+        disabled: true,
+      });
+    } finally {
+      spy.restore();
+    }
+
+    const body = await expectContract<ClientUserBody>('updateClientUser', response);
+
+    expect([response.status, body.disabled]).toEqual([200, true]);
+    expect(await sessionStatus(cookies)).toBe(401);
+    expect(events('identity.client_user.ban_failed')[0]).toMatchObject({
+      level: 'error',
+      reason: 'unexpected',
+    });
+    // what the Auth server said (it echoed the e-mail) is nowhere in the log
+    expect(logged.lines.join('\n')).not.toContain(login.email);
+  });
+
+  it('E-56: the database step of a re-enable fails after the unban: 503, the ban is put back (the login stays blocked in Auth AND in the database) and it is logged at error', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true });
+    expect(await isBannedInAuth(login.id)).toBe(true);
+    logged.lines.length = 0;
+    const spy = spyOnSupabaseFetch((url) =>
+      url.includes('/rest/v1/rpc/set_account_disabled') ? new TypeError('fetch failed') : undefined,
+    );
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+        disabled: false,
+      });
+    } finally {
+      spy.restore();
+    }
+
+    const problem = await expectContract<Problem>('updateClientUser', response);
+
+    expect([response.status, problem.code]).toEqual([503, 'SERVICE_UNAVAILABLE']);
+    expect((await profileOf(login.id))?.disabled_at).not.toBeNull();
+    expect(await isBannedInAuth(login.id)).toBe(true);
+    expect(events('identity.client_user.reban_after_failed_enable')[0]).toMatchObject({
+      level: 'error',
+      rebanned: true,
+      targetUserId: login.id,
+    });
+    // and repeating the enable works
+    const repeated = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+      disabled: false,
+    });
+    expect(repeated.status).toBe(200);
+    expect(await isBannedInAuth(login.id)).toBe(false);
+  });
+
+  it('F-92a: a login enabled in the database but still banned in Auth (the worst interleaving of two CEOs) is refused at sign-in, and repeating the enable repairs it', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    await adminClient().auth.admin.updateUserById(login.id, { ban_duration: '876000h' });
+    expect(await statusOfSignIn(login.email, login.password)).toBe('refused');
+
+    const response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+      disabled: false,
+    });
+
+    await expectContract('updateClientUser', response);
+    expect(response.status).toBe(200);
+    expect(await statusOfSignIn(login.email, login.password)).toBe(200);
+  });
+
+  it('no-op: renaming to the name the login already has writes no second account.updated', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    const rename = (displayName: string) =>
+      updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { displayName });
+
+    const first = await rename('Nome Único');
+    const same = await rename('Nome Único');
+    const other = await rename('Outro Nome');
+
+    for (const response of [first, same, other]) {
+      await expectContract('updateClientUser', response);
+      expect(response.status).toBe(200);
+    }
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.updated',
+      'account.updated',
+    ]);
   });
 
   it('E-19: a user that does not belong to the client of the path is 404, identical for another client, a CEO and an unknown id, and nothing changes', async () => {
@@ -698,7 +819,7 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('password reset');
   });
 
   it('AC-14: a reset gives a new temporary password, makes the user change it, and revokes every session', async () => {
@@ -852,22 +973,12 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('failures in the middle');
   });
 
   /** Makes the requests whose URL holds `part` fail the way a dead network does. */
   const failing = (part: string) =>
     spyOnSupabaseFetch((url) => (url.includes(part) ? new TypeError('fetch failed') : undefined));
-
-  /** 503 `SERVICE_UNAVAILABLE` with a `Retry-After` of at least a second, as the contract documents. */
-  async function expectUnavailable(operationId: string, response: Response) {
-    const body = await expectContract<Problem>(operationId, response);
-
-    expect(response.status).toBe(503);
-    expect(body.code).toBe('SERVICE_UNAVAILABLE');
-    expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
-    return body;
-  }
 
   it('E-23: the record of account.provisioned fails after createUser: the account is deleted, the answer is 503, the failure is logged at error and no password is shown', async () => {
     const tenant = await createClient();
@@ -895,7 +1006,12 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
     );
     expect(listed.items).toEqual([]);
     const [rolledBack] = events('identity.client_user.provision_rolled_back');
-    expect(rolledBack).toMatchObject({ level: 'error', clientId: tenant.id });
+    expect(rolledBack).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      reason: 'record_failed',
+      targetUserId: expect.stringMatching(/^[0-9a-f-]{36}$/) as string,
+    });
     expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
     // and the CEO can simply try again
     const retry = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
@@ -928,7 +1044,12 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
 
     await expectUnavailable('provisionClientUser', response);
     const [orphaned] = events('identity.client_user.provision_orphaned');
-    expect(orphaned).toMatchObject({ level: 'error', clientId: tenant.id });
+    // why the deletion failed is in the log as a kind, never as a message
+    expect(orphaned).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      deleteFailure: { kind: 'SERVICE_UNAVAILABLE' },
+    });
     // the account is there, in the list, born with the temporary password nobody was given...
     const listed = await expectContract<ClientUserListBody>(
       'listClientUsers',
@@ -944,7 +1065,8 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       email,
       displayName: 'Órfã',
     });
-    expect(again.status).toBe(409);
+    const conflict = await expectContract<Problem>('provisionClientUser', again);
+    expect([again.status, conflict.code]).toEqual([409, 'EMAIL_ALREADY_REGISTERED']);
     // the documented recovery: reset the password, which hands over a usable one
     const reset = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, orphan?.id ?? '');
     const { temporaryPassword } = await expectContract<{ temporaryPassword: string }>(
@@ -954,40 +1076,157 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
     expect(await statusOfSignIn(email, temporaryPassword)).toBe(200);
   });
 
-  it('E-50: a creation whose answer is lost (503) may have created the login: repeating it is 409, the login is in the list, and a reset hands it over', async () => {
+  /** The creation reaches Auth and WORKS; what the app never gets is the answer. */
+  const createAnswerLost = (method: string, path: string) =>
+    method === 'POST' && path === '/auth/v1/admin/users' ? LOSE_ANSWER : undefined;
+
+  it('F-90, E-50: a creation whose answer is lost is found in the list of the client and taken back: 503 and nothing left, never a 422 and never a login nobody was given', async () => {
     const tenant = await createClient();
     const email = uniqueLoginEmail('perdida');
-    const lost = await whileWatching(
-      (method, path) =>
-        method === 'POST' && path === '/auth/v1/admin/users' ? LOSE_ANSWER : undefined,
-      () =>
-        provisionClientUserViaApi(ceo.cookies, tenant.id, {
-          email,
-          displayName: 'Resposta perdida',
-        }),
-    );
-    await expectUnavailable('provisionClientUser', lost);
-    expect(await loginsWithEmail(email)).toBe(1);
+    logged.lines.length = 0;
 
+    const lost = await whileWatching(createAnswerLost, () =>
+      provisionClientUserViaApi(ceo.cookies, tenant.id, { email, displayName: 'Resposta perdida' }),
+    );
+
+    await expectUnavailable('provisionClientUser', lost);
+    // the creation HAD worked: the look behind found the login by its e-mail and deleted it
+    expect(await loginsWithEmail(email)).toBe(0);
+    const [rolledBack] = events('identity.client_user.provision_rolled_back');
+    expect(rolledBack).toMatchObject({
+      level: 'error',
+      reason: 'answer_lost',
+      clientId: tenant.id,
+      targetUserId: expect.stringMatching(/^[0-9a-f-]{36}$/) as string,
+    });
+    expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
+    // the CEO simply repeats it
     const repeated = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
       email,
       displayName: 'Resposta perdida',
     });
-    const conflict = await expectContract<Problem>('provisionClientUser', repeated);
-    expect([repeated.status, conflict.code]).toEqual([409, 'EMAIL_ALREADY_REGISTERED']);
+    await expectContract('provisionClientUser', repeated);
+    expect(repeated.status).toBe(201);
+  });
 
+  it('F-90, E-50: a lost answer for the LAST place of a client is still a 503 with the login taken back: the client being full is because of the login, not a refusal', async () => {
+    const tenant = await createClient();
+    for (let index = 0; index < 9; index += 1) await createClientUser({ clientId: tenant.id });
+    const email = uniqueLoginEmail('ultima');
+
+    const lost = await whileWatching(createAnswerLost, () =>
+      provisionClientUserViaApi(ceo.cookies, tenant.id, { email, displayName: 'Última vaga' }),
+    );
+
+    await expectUnavailable('provisionClientUser', lost);
+    expect(await loginsWithEmail(email)).toBe(0);
+  });
+
+  it('F-90, E-50: a lost answer and a deletion that fails: 503, `provision_answer_lost` at error with the id and why the deletion failed, the login stays in the list and a reset hands it over', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('perdida2');
+    logged.lines.length = 0;
+
+    const lost = await whileWatching(
+      (method, path) =>
+        method === 'DELETE' && path.startsWith('/auth/v1/admin/users/')
+          ? new TypeError('fetch failed')
+          : createAnswerLost(method, path),
+      () =>
+        provisionClientUserViaApi(ceo.cookies, tenant.id, { email, displayName: 'Sem exclusão' }),
+    );
+
+    await expectUnavailable('provisionClientUser', lost);
     const listed = await expectContract<ClientUserListBody>(
       'listClientUsers',
       await listClientUsersViaApi(ceo.cookies, tenant.id),
     );
     const [found] = listed.items;
     expect(found).toMatchObject({ email, mustChangePassword: true });
+    const [answerLost] = events('identity.client_user.provision_answer_lost');
+    expect(answerLost).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      targetUserId: found?.id,
+      deleteFailure: { kind: 'SERVICE_UNAVAILABLE' },
+    });
+    expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
+    // repeating the provisioning says the address is taken; the reset is the recovery
+    const again = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+      email,
+      displayName: 'Sem exclusão',
+    });
+    expect(again.status).toBe(409);
     const reset = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, found?.id ?? '');
     const { temporaryPassword } = await expectContract<{ temporaryPassword: string }>(
       'resetClientUserPassword',
       reset,
     );
     expect(await statusOfSignIn(email, temporaryPassword)).toBe(200);
+  });
+
+  /**
+   * The Auth server creates the account and answers 200 with a body that has no user (`{}`): what the
+   * app gets is an accepted creation it cannot name. `forward` says whether the account really exists.
+   */
+  function answerCreationWithoutUser(forward: boolean) {
+    const realFetch = globalThis.fetch;
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (method === 'POST' && url.endsWith('/auth/v1/admin/users')) {
+        if (forward) await (await realFetch(input, init)).arrayBuffer();
+        return Response.json({}, { status: 200 });
+      }
+      return realFetch(input, init);
+    });
+  }
+
+  it('F-90, E-55: an accepted creation whose answer has no user id: the account is found by its e-mail and taken back, a 503 and not a 500', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('semid');
+    logged.lines.length = 0;
+    const spy = answerCreationWithoutUser(true);
+    let response: Response;
+    try {
+      response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+        email,
+        displayName: 'Sem identificador',
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const body = await expectUnavailable('provisionClientUser', response);
+
+    expect(JSON.stringify(body)).not.toContain('temporaryPassword');
+    expect(await loginsWithEmail(email)).toBe(0);
+    expect(events('identity.client_user.provision_rolled_back')).toHaveLength(1);
+    expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
+  });
+
+  it('F-90, E-55: an answer with no user id and no login in the list: `provision_unconfirmed` at error, with no e-mail and no id, and a 503 that says to look in the list', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('semid2');
+    logged.lines.length = 0;
+    const spy = answerCreationWithoutUser(false);
+    let response: Response;
+    try {
+      response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+        email,
+        displayName: 'Sem identificador',
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const body = await expectUnavailable('provisionClientUser', response);
+
+    expect(body.detail).toMatch(/look for it in the list/i);
+    const [unconfirmed] = events('identity.client_user.provision_unconfirmed');
+    expect(unconfirmed).toMatchObject({ level: 'error', clientId: tenant.id });
+    expect(Object.keys(unconfirmed ?? {})).not.toContain('targetUserId');
+    expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
   });
 
   it('E-51: the database step of a reset keeps failing after the Auth server stored the password: 503 and an error log; the old password and the sessions are gone but the pending action is not set; repeating the reset finishes it', async () => {
@@ -1050,23 +1289,82 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
   });
 });
 
+describe('F-93: whatever the database says after the password is stored, the reset is incomplete', () => {
+  let ceo: CeoWithMfa;
+
+  beforeAll(async () => {
+    ceo = await ceoFixture('incomplete reset');
+  });
+
+  /** What PostgREST answers when a database function raises `sqlstate` with `message`. */
+  const databaseRefuses = (status: number, sqlstate: string, message: string) =>
+    spyOnSupabaseFetch((url) =>
+      url.includes('/rest/v1/rpc/require_password_change')
+        ? Response.json({ code: sqlstate, message, details: null, hint: null }, { status })
+        : undefined,
+    );
+
+  it('E-51: a refusal of the caller (403: the attestation expired meanwhile) is 503 with `reset_incomplete`, not the 403 that would say the reset did not happen', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    logged.lines.length = 0;
+    const spy = databaseRefuses(403, '42501', 'FORBIDDEN');
+    let response: Response;
+    try {
+      response = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
+    } finally {
+      spy.restore();
+    }
+
+    const problem = await expectContract<Problem>('resetClientUserPassword', response);
+
+    expect([response.status, problem.code]).toEqual([503, 'SERVICE_UNAVAILABLE']);
+    expect(JSON.stringify(problem)).not.toContain('temporaryPassword');
+    // the password HAS changed: that is what the answer must not hide
+    expect(await canSignIn(login.email, login.password)).toBe(false);
+    const [incomplete] = events('identity.client_user.reset_incomplete');
+    expect(incomplete).toMatchObject({
+      level: 'error',
+      targetUserId: login.id,
+      failure: { kind: 'FORBIDDEN' },
+    });
+    // the repeat finishes it
+    const repeated = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
+    const { temporaryPassword } = await expectContract<{ temporaryPassword: string }>(
+      'resetClientUserPassword',
+      repeated,
+    );
+    expect(await statusOfSignIn(login.email, temporaryPassword)).toBe(200);
+  });
+
+  it('E-51: a login that is gone by now (404) is 503 with `reset_incomplete` too, and the log keeps only the kind', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    logged.lines.length = 0;
+    const spy = databaseRefuses(400, 'P0001', 'NOT_FOUND');
+    let response: Response;
+    try {
+      response = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
+    } finally {
+      spy.restore();
+    }
+
+    await expectUnavailable('resetClientUserPassword', response);
+
+    expect(events('identity.client_user.reset_incomplete')[0]).toMatchObject({
+      failure: { kind: 'NOT_FOUND' },
+    });
+    expect(logged.lines.join('\n')).not.toContain(login.email);
+  });
+});
+
 describe('E-21: Supabase failing', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('Supabase failing');
   });
 
   const failing = (part: string) =>
     spyOnSupabaseFetch((url) => (url.includes(part) ? new TypeError('fetch failed') : undefined));
-
-  async function expectUnavailable(operationId: string, response: Response) {
-    const body = await expectContract<Problem>(operationId, response);
-
-    expect(response.status).toBe(503);
-    expect(body.code).toBe('SERVICE_UNAVAILABLE');
-    expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
-  }
 
   it('E-21: listClientUsers that cannot reach the database is 503, not a 500', async () => {
     const tenant = await createClient();
@@ -1165,7 +1463,7 @@ describe('GET /admin/clients/{clientId}/users (listClientUsers)', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('list');
   });
 
   it('RF-07: lists the logins of the client with e-mail, state and last sign-in, and only those of that client', async () => {
@@ -1219,7 +1517,7 @@ describe('an archived client keeps its logins (F-58, Q-08)', () => {
   let ceo: CeoWithMfa;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('archived client');
   });
 
   it('E-54: archiving does not revoke a login, and a CEO still lists, renames, disables, enables and resets it; only a NEW login is refused (E-16)', async () => {
@@ -1265,7 +1563,7 @@ describe('who may call the client login routes', () => {
   let login: FixtureUser;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('who may call');
     tenant = await createClient();
     login = await completeFirstAccess(await createClientUser({ clientId: tenant.id }));
   });
@@ -1320,7 +1618,7 @@ describe('the input of provisioning', () => {
   let tenant: Awaited<ReturnType<typeof createClient>>;
 
   beforeAll(async () => {
-    ceo = await loginAsCeoWithMfa();
+    ceo = await ceoFixture('input');
     tenant = await createClient();
   });
 
@@ -1399,7 +1697,7 @@ describe('the input of provisioning', () => {
 
 describe('SEC-09: provisioning and resetting share one counter of 20 per hour per CEO', () => {
   it('the 21st request of the two kinds together is 429 RATE_LIMITED with Retry-After, whichever kind it is', async () => {
-    const ceo = await loginAsCeoWithMfa();
+    const ceo = await ceoFixture('rate limit');
     const provisionBody = { email: uniqueLoginEmail('limite'), displayName: 'Limite' };
 
     // 404s: they spend the budget (the limit runs before the use case) and change nothing

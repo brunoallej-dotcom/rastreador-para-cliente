@@ -61,7 +61,9 @@ export interface AccountAdminGateway {
    * Creates the login WITH the password (so the baseline of `mark_password_changed()` is that
    * password, ADR 0007). The database trigger builds the profile from `app_metadata` in the same
    * transaction and refuses an archived client or one at the limit: that refusal is not told apart
-   * from an outage by the Auth server, so it arrives as a thrown `ServiceUnavailableError`.
+   * from an outage by the Auth server, so it arrives as a thrown `ServiceUnavailableError`. A success
+   * whose answer carries no user id is a thrown `ClientUserProvisionUnconfirmedError` (also a
+   * `ServiceUnavailableError`): the account may exist, so nobody may say it was not created.
    */
   createClientUser(
     account: NewClientUserAccount,
@@ -76,6 +78,32 @@ export interface AccountAdminGateway {
   /** Bans (a century) or unbans the account in the Auth server. `err(NotFoundError)` when there is no such user. */
   setBanned(userId: string, banned: boolean): Promise<Result<void, NotFoundError>>;
 }
+
+/**
+ * Why the second lock of a disable (the ban in the Auth server) could not be set (E-24, F-94):
+ * `unavailable` (the Auth server is slow or down: transient, repeating the disable retries it),
+ * `not_found` (the Auth server has no such user: the profile and the account disagree) or
+ * `unexpected` (an answer nobody planned for: a rejected key, a changed server).
+ */
+export type BanFailureReason = 'unavailable' | 'not_found' | 'unexpected';
+
+/**
+ * Something a use case wants on record that is neither its result nor its error: the handler turns it
+ * into an error-level log line (the application layer has no logger). Carries no e-mail, no name, no
+ * password.
+ */
+export type ClientUserNotice =
+  /** A disable that the database applied and Auth could not ban (E-24). The answer is still 200. */
+  | { readonly kind: 'ban_failed'; readonly reason: BanFailureReason }
+  /**
+   * A re-enable whose database step failed after the Auth server had lifted the ban (F-92a): the ban
+   * was put back (`rebanned`) so the login stays blocked in both places, or could not be (`reason`).
+   */
+  | {
+      readonly kind: 'reban_after_failed_enable';
+      readonly rebanned: boolean;
+      readonly reason?: BanFailureReason;
+    };
 
 /**
  * Reads the client a login belongs to, through the `tracking` module's public index (identity knows a

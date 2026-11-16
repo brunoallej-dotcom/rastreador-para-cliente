@@ -5,8 +5,48 @@ import { getEnv } from '@/shared/config/env';
 import type { Database } from './database.types';
 import { fetchWithTimeout } from './fetch-with-timeout';
 
-/** The Auth Admin API of the secret-key client (create, delete, list users, revoke by token...). */
-export type AdminAuthApi = ReturnType<typeof createClient<Database>>['auth']['admin'];
+/**
+ * What may be kept of a failed Auth Admin call: the kind of the error, its HTTP status and its code.
+ * Never the message (it can echo the e-mail of the account), so nothing a caller logs or throws from
+ * it carries PII.
+ */
+export type AdminAuthFailure = {
+  readonly name: string;
+  readonly status: number | undefined;
+  readonly code: string | undefined;
+};
+
+/**
+ * What an Auth Admin call answered: its payload (`null` when it failed or has none) or the failure
+ * reduced to `AdminAuthFailure`. A call that cannot even reach the server THROWS instead (the caller
+ * maps it to an outage).
+ */
+export type AdminAuthResult<T> = {
+  readonly data: T | null;
+  readonly error: AdminAuthFailure | null;
+};
+
+/** Arguments of `createClientUser`: the login of a client. The ROLE is not an argument (see below). */
+export type AdminCreateClientUserInput = {
+  /** Already normalized (`normalizeEmail`) and validated. */
+  readonly email: string;
+  /** The temporary password, set in the same call (ADR 0007). A secret: never logged. */
+  readonly password: string;
+  readonly displayName: string;
+  readonly clientId: string;
+};
+
+/**
+ * What a creation that Auth accepted answers. `id` is `null` when the answer carries no usable user id:
+ * the account may exist all the same, so the caller must not treat it as "nothing was created".
+ */
+export type AdminCreatedUser = { readonly id: string | null };
+
+/** The ban of a disabled login: a century (Go durations go up to hours). `none` lifts it. */
+const BAN_DURATION = '876000h';
+const UNBAN_DURATION = 'none';
+const USER_ID = z.guid();
+const CREATED_USER_ID = z.object({ user: z.object({ id: USER_ID }) });
 
 /** What `rate_limit_hit` takes: the same fields as the limiter's input. */
 export type AdminRateLimitHitInput = {
@@ -70,12 +110,28 @@ export type AdminAttestSessionInput = {
 /**
  * What the secret key may do for this app, and nothing else. The shared singleton is NEVER handed
  * out as a Supabase client: a caller with the whole client could `.from(...)` any table past RLS or
- * `.auth.signInWithPassword(...)` and leave a user session on a process-wide object. It gets the
- * Auth Admin API and a handful of named RPC wrappers instead, one per `service_role` function.
+ * `.auth.signInWithPassword(...)` and leave a user session on a process-wide object. It gets four typed
+ * Auth Admin operations for client logins and a handful of named RPC wrappers instead, one per
+ * `service_role` function. The Auth Admin API itself is NOT exposed (F-91): with it, a request path
+ * could create a CEO (`app_metadata.role`), read or change any account. The operator's script
+ * (`pnpm ceo:create`) builds its own client in `scripts/`, and nothing under `src/` may use `auth.admin`
+ * outside this file (ESLint, and the Semgrep rule `no-auth-admin-outside-facade`).
  */
 export type AdminFacade = {
-  /** The Auth Admin API. It has no sign-in and holds no session. */
-  readonly authAdmin: AdminAuthApi;
+  /**
+   * Creates the login of a client WITH its password, in one Auth call (ADR 0007), confirmed (there is
+   * no mailbox round trip). The role is FIXED to `client` in here and the caller cannot pass
+   * `app_metadata`: this wrapper cannot create a CEO or any other role (AC-31). The database trigger
+   * builds the profile from the `app_metadata` set here, in the same transaction, and refuses an
+   * archived client or one at the limit (that refusal comes back as a 500 the Auth server cannot name).
+   */
+  createClientUser(input: AdminCreateClientUserInput): Promise<AdminAuthResult<AdminCreatedUser>>;
+  /** Deletes an account (hard delete: the profile goes with it). `user_not_found` is the caller's to read. */
+  deleteUser(userId: string): Promise<AdminAuthResult<null>>;
+  /** Stores a new password. Auth also drops every session of the user (observed on the local stack). */
+  setPassword(userId: string, password: string): Promise<AdminAuthResult<null>>;
+  /** Bans (a century) or unbans (`false`) the account in the Auth server. */
+  setBan(userId: string, banned: boolean): Promise<AdminAuthResult<null>>;
   /**
    * Calls `public.rate_limit_hit` (only `service_role` may execute it) and returns what it answered,
    * unvalidated. Throws when the call fails, without echoing what the database said.
@@ -107,8 +163,8 @@ let cached: AdminFacade | undefined;
  * with the boot-time validation message instead of an obscure client error.
  *
  * Allowed callers: `src/shared/http/rate-limit/` (the limiter RPC) and
- * `src/modules/identity/infrastructure/` (the Auth Admin API and the CEO attestation RPCs); ESLint
- * enforces it. Never for business reads or writes: those go through the request-scoped client so
+ * `src/modules/identity/infrastructure/` (the four client-login operations of the Auth Admin API and
+ * the CEO attestation RPCs); ESLint enforces it. Never for business reads or writes: those go through the request-scoped client so
  * RLS decides.
  *
  * Stateless (no session, no refresh), so one instance serves the whole process.
@@ -148,8 +204,58 @@ export function getAdminFacade(): AdminFacade {
     return { data: parsed.data, error: null, status };
   };
 
+  /** Reduces an Auth error to what may be kept of it (see `AdminAuthFailure`). */
+  const failureOf = (error: { name?: unknown; status?: unknown; code?: unknown }) => ({
+    name: typeof error.name === 'string' ? error.name : 'AuthError',
+    status: typeof error.status === 'number' ? error.status : undefined,
+    code: typeof error.code === 'string' ? error.code : undefined,
+  });
+
+  /** A user id goes into the URL of the Auth Admin API: anything but a UUID never gets there. */
+  const requireUserId = (userId: string): string => {
+    if (!USER_ID.safeParse(userId).success) throw new Error('the user id is not a UUID');
+    return userId;
+  };
+
+  const settleAuth = (result: {
+    error: { name?: unknown; status?: unknown; code?: unknown } | null;
+  }) =>
+    result.error === null
+      ? { data: null, error: null }
+      : { data: null, error: failureOf(result.error) };
+
   cached = Object.freeze({
-    authAdmin: client.auth.admin,
+    async createClientUser({ email, password, displayName, clientId }: AdminCreateClientUserInput) {
+      if (!USER_ID.safeParse(clientId).success) throw new Error('the client id is not a UUID');
+      const result = await client.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        // The role is a literal in this file and an argument nowhere: the Semgrep rule
+        // `no-app-metadata-role-but-client` holds every use of `app_metadata` in src/ to it.
+        app_metadata: { role: 'client', client_id: clientId, display_name: displayName },
+      });
+      if (result.error) return { data: null, error: failureOf(result.error) };
+      // Tolerant on purpose: whatever else the answer says, an id that is a UUID is the one thing the
+      // caller can use to take the account back; without one it must not claim nothing was created.
+      const answer = CREATED_USER_ID.safeParse(result.data);
+      return { data: { id: answer.success ? answer.data.user.id : null }, error: null };
+    },
+    async deleteUser(userId: string) {
+      return settleAuth(await client.auth.admin.deleteUser(requireUserId(userId)));
+    },
+    async setPassword(userId: string, password: string) {
+      return settleAuth(
+        await client.auth.admin.updateUserById(requireUserId(userId), { password }),
+      );
+    },
+    async setBan(userId: string, banned: boolean) {
+      return settleAuth(
+        await client.auth.admin.updateUserById(requireUserId(userId), {
+          ban_duration: banned ? BAN_DURATION : UNBAN_DURATION,
+        }),
+      );
+    },
     async rateLimitHit({ bucket, windowSeconds, max }: AdminRateLimitHitInput) {
       const { data, error } = await client.rpc('rate_limit_hit', {
         p_bucket: bucket,

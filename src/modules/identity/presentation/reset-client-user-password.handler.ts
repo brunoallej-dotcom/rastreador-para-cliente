@@ -42,12 +42,14 @@ export function createResetClientUserPasswordHandler(route: WithRoute = withRout
       } catch (error) {
         if (error instanceof ClientUserResetIncompleteError) {
           // The old password no longer works and nobody has the new one: a person must find this.
+          // `failure` is a code and a status: why the database step failed, never what it said.
           logger.error(
             {
               event: 'identity.client_user.reset_incomplete',
               actorId: principal.userId,
               clientId: params.clientId,
               targetUserId: params.userId,
+              failure: error.failure,
             },
             'identity.client_user.reset_incomplete',
           );

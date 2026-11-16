@@ -4,6 +4,7 @@ import { provisionClientUser } from '../application/provision-client-user';
 import {
   ClientUserProvisionOrphanedError,
   ClientUserProvisionRolledBackError,
+  ClientUserProvisionUnconfirmedError,
 } from '../domain/client-user-errors';
 import { createSupabaseAccountAdminGateway } from '../infrastructure/supabase-account-admin-gateway';
 import { createSupabaseAccountRepository } from '../infrastructure/supabase-account-repository';
@@ -50,25 +51,34 @@ export function createProvisionClientUserHandler(route: WithRoute = withRoute) {
           { clientId: params.clientId, email: body.email, displayName: body.displayName },
         );
       } catch (error) {
+        const where = { actorId: principal.userId, clientId: params.clientId };
         if (error instanceof ClientUserProvisionOrphanedError) {
-          // An account nobody was given the password of is left behind (E-23): a person must find this.
+          // An account nobody was given the password of is left behind (E-23, E-50): a person must
+          // find this. `deleteFailure` is a code and a status, never a message.
+          const event =
+            error.reason === 'answer_lost'
+              ? 'identity.client_user.provision_answer_lost'
+              : 'identity.client_user.provision_orphaned';
           logger.error(
-            {
-              event: 'identity.client_user.provision_orphaned',
-              actorId: principal.userId,
-              clientId: params.clientId,
-              targetUserId: error.userId,
-            },
-            'identity.client_user.provision_orphaned',
+            { event, ...where, targetUserId: error.userId, deleteFailure: error.deleteFailure },
+            event,
           );
         } else if (error instanceof ClientUserProvisionRolledBackError) {
           logger.error(
             {
               event: 'identity.client_user.provision_rolled_back',
-              actorId: principal.userId,
-              clientId: params.clientId,
+              ...where,
+              targetUserId: error.userId,
+              reason: error.reason,
             },
             'identity.client_user.provision_rolled_back',
+          );
+        } else if (error instanceof ClientUserProvisionUnconfirmedError) {
+          // The Auth server said "created" without saying who: the account may exist and could not
+          // be found in the list either. No e-mail, no id: there is none to give.
+          logger.error(
+            { event: 'identity.client_user.provision_unconfirmed', ...where },
+            'identity.client_user.provision_unconfirmed',
           );
         }
         throw error;

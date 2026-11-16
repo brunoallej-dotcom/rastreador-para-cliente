@@ -35,6 +35,28 @@ export function createUpdateClientUserHandler(route: WithRoute = withRoute) {
         {
           users: createSupabaseAccountRepository(supabase, { logger }),
           accounts: createSupabaseAccountAdminGateway(),
+          // What the use case wants on record apart from its answer: a ban that was not set (the
+          // database blocks the login already; the second lock is missing until the next
+          // `{ disabled: true }`), or a ban put back after a re-enable that failed. Always `error`,
+          // so an alert can hang on it (F-94); the reason is a word, never a message.
+          report: (notice) => {
+            const event = `identity.client_user.${notice.kind}`;
+            logger.error(
+              {
+                event,
+                actorId: principal.userId,
+                clientId: params.clientId,
+                targetUserId: params.userId,
+                ...(notice.kind === 'ban_failed'
+                  ? { reason: notice.reason }
+                  : {
+                      rebanned: notice.rebanned,
+                      ...(notice.reason === undefined ? {} : { reason: notice.reason }),
+                    }),
+              },
+              event,
+            );
+          },
         },
         principal,
         {
@@ -46,19 +68,6 @@ export function createUpdateClientUserHandler(route: WithRoute = withRoute) {
       );
       if (!result.ok) return result.error;
 
-      if (!result.value.banSynced) {
-        // The database blocks the login already; the second lock is missing until the next
-        // `{ disabled: true }` (idempotent) or a sign-in attempt that Auth refuses by itself.
-        logger.error(
-          {
-            event: 'identity.client_user.ban_failed',
-            actorId: principal.userId,
-            clientId: params.clientId,
-            targetUserId: params.userId,
-          },
-          'identity.client_user.ban_failed',
-        );
-      }
       logger.info(
         {
           event: 'identity.client_user.updated',
@@ -69,7 +78,7 @@ export function createUpdateClientUserHandler(route: WithRoute = withRoute) {
         },
         'identity.client_user.updated',
       );
-      return json(200, toClientUserDto(result.value.user));
+      return json(200, toClientUserDto(result.value));
     },
   );
 }

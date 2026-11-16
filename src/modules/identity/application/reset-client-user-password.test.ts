@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ForbiddenError, NotFoundError, ServiceUnavailableError } from '@/shared/kernel';
+import {
+  ForbiddenError,
+  NotFoundError,
+  ServiceUnavailableError,
+  ValidationError,
+} from '@/shared/kernel';
 import { ClientUserResetIncompleteError } from '../domain/client-user-errors';
 import {
   CEO_ID,
@@ -137,7 +142,7 @@ describe('resetClientUserPassword', () => {
     });
   });
 
-  it('the database step whose answer was lost and is then repeated finishes without harm', async () => {
+  it('the database step whose answer was lost and is then repeated completes, and the repeat writes a SECOND account.password_reset (it is not free of side effects)', async () => {
     const world = worldWithTwoClients();
     world.loseAnswerOf('requirePasswordChange');
 
@@ -145,6 +150,93 @@ describe('resetClientUserPassword', () => {
 
     expect(result.ok).toBe(true);
     expect(world.records.get(USER_A1)).toMatchObject({ mustChangePassword: true, sessions: 0 });
+    expect(world.records.get(USER_A1)?.audit).toEqual([
+      'account.password_reset',
+      'account.password_reset',
+    ]);
+  });
+
+  describe('F-93: anything after setPassword is an incomplete reset, never the answer the database gave', () => {
+    const incomplete = async (world: ReturnType<typeof worldWithTwoClients>) => {
+      const error: unknown = await resetClientUserPassword(deps(world), ceoPrincipal, INPUT).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(ClientUserResetIncompleteError);
+      return error as ClientUserResetIncompleteError;
+    };
+
+    it('a refusal of the caller (an attestation that expired meanwhile: 403) is ClientUserResetIncompleteError, with only the code in the cause', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext(
+        'requirePasswordChange',
+        new ForbiddenError('denied for pessoa@cliente.test'),
+      );
+
+      const error = await incomplete(world);
+
+      expect(error.failure).toEqual({ kind: 'FORBIDDEN' });
+      expect(JSON.stringify({ cause: error.cause, failure: error.failure })).not.toContain(
+        'pessoa',
+      );
+      // a refusal is not retried
+      expect(world.calls.filter((call) => call === 'requirePasswordChange')).toHaveLength(1);
+      // the password HAS changed: that is what makes it incomplete and not a 403
+      expect(world.records.get(USER_A1)?.password).toBe(PASSWORD);
+    });
+
+    it('a login that is gone by now (404) is incomplete too', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext('requirePasswordChange', new NotFoundError('gone'));
+
+      const error = await incomplete(world);
+
+      expect(error.failure).toEqual({ kind: 'NOT_FOUND' });
+    });
+
+    it('an input the database refuses (a validation error) is incomplete too', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext('requirePasswordChange', new ValidationError('refused'));
+
+      const error = await incomplete(world);
+
+      expect(error.failure).toEqual({ kind: 'VALIDATION_ERROR' });
+    });
+
+    it('a bug (an unclassified error) is incomplete too, and it is not retried', async () => {
+      const world = worldWithTwoClients();
+      world.failNext('requirePasswordChange', 2, new TypeError('a bug with pessoa@cliente.test'));
+
+      const error = await incomplete(world);
+
+      expect(error.failure).toEqual({ kind: 'UNKNOWN' });
+      expect(JSON.stringify(error.failure)).not.toContain('pessoa');
+      expect(world.calls.filter((call) => call === 'requirePasswordChange')).toHaveLength(1);
+    });
+
+    it('an outage keeps its SQLSTATE and status as the reason, and is retried once', async () => {
+      const world = worldWithTwoClients();
+      world.failNext(
+        'requirePasswordChange',
+        2,
+        new ServiceUnavailableError('down', { cause: { code: '40P01', status: 500 } }),
+      );
+
+      const error = await incomplete(world);
+
+      expect(error.failure).toEqual({ kind: 'SERVICE_UNAVAILABLE', status: 500, reason: '40P01' });
+      expect(world.calls.filter((call) => call === 'requirePasswordChange')).toHaveLength(2);
+    });
+
+    it('the temporary password is returned in none of them', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext('requirePasswordChange', new ForbiddenError('denied'));
+
+      const error = await incomplete(world);
+
+      expect(JSON.stringify({ message: error.message, detail: error.detail })).not.toContain(
+        PASSWORD,
+      );
+    });
   });
 
   it('the repeat after an incomplete reset finishes the job with another password', async () => {

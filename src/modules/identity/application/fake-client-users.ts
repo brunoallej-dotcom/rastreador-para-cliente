@@ -6,9 +6,19 @@
 // throws `ServiceUnavailableError`); the database functions act only on client logins; disabling and
 // requiring a password change delete the sessions. A test can make any call fail (`failNext`) or lose
 // its answer after it worked (`loseAnswerOf`).
-import { err, NotFoundError, ok, ServiceUnavailableError, type Result } from '@/shared/kernel';
+import {
+  err,
+  NotFoundError,
+  ok,
+  ServiceUnavailableError,
+  type DomainError,
+  type Result,
+} from '@/shared/kernel';
 import { MAX_CLIENT_USERS, type ClientStatus, type ClientUser } from '../domain/client-user';
-import { EmailAlreadyRegisteredError } from '../domain/client-user-errors';
+import {
+  ClientUserProvisionUnconfirmedError,
+  EmailAlreadyRegisteredError,
+} from '../domain/client-user-errors';
 import type {
   AccountAdminGateway,
   ClientStatusDirectory,
@@ -30,6 +40,13 @@ export type FakeAccountRecord = {
   provisioned: boolean;
   /** How many times `require_password_change` ran for it (each one renews the 72 h). */
   passwordBaselines: number;
+  lastSignInAt: Date | null;
+  /**
+   * The audit events the database functions would have written, in order: `account.provisioned`,
+   * `account.disabled` / `account.enabled` (only on a change of state, like the function),
+   * `account.updated` (on EVERY rename, like the function) and `account.password_reset` (every call).
+   */
+  readonly audit: string[];
   readonly createdAt: Date;
 };
 
@@ -56,8 +73,24 @@ export type FakeClientUsers = {
   seed(account: Partial<FakeAccountRecord> & Pick<FakeAccountRecord, 'id'>): FakeAccountRecord;
   /** The client row, to archive it or rename it between two calls. */
   readonly clientRows: Map<string, { name: string; archived: boolean }>;
-  /** The next `times` calls of `method` throw `ServiceUnavailableError` before doing anything. */
-  failNext(method: FakeMethod, times?: number): void;
+  /**
+   * The next `times` calls of `method` throw before doing anything: `ServiceUnavailableError`, or the
+   * `error` given (an unexpected answer, a bug).
+   */
+  failNext(method: FakeMethod, times?: number, error?: Error): void;
+  /**
+   * The next call of a database method returns `err(error)` before doing anything (a refusal of the
+   * caller, a login that is gone): the database answered, and said no.
+   */
+  refuseNext(
+    method: 'recordProvisioned' | 'setDisabled' | 'setDisplayName' | 'requirePasswordChange',
+    error: DomainError,
+  ): void;
+  /**
+   * The next creation WORKS and then answers without a user id (the account exists and cannot be named):
+   * the gateway throws `ClientUserProvisionUnconfirmedError`.
+   */
+  answerNextCreationWithoutId(): void;
   /** The next call of `method` does its work and THEN throws `ServiceUnavailableError` (answer lost). */
   loseAnswerOf(method: FakeMethod): void;
   /** Runs right before the Auth server creates an account (to race an archive, or a full client). */
@@ -76,19 +109,28 @@ export function createFakeClientUsers(
   const clientRows = new Map(
     clients.map((client) => [client.id, { name: client.name, archived: client.archived }]),
   );
-  const failures = new Map<FakeMethod, number>();
+  const failures = new Map<FakeMethod, { times: number; error: Error | undefined }>();
+  const refusals = new Map<FakeMethod, DomainError>();
   const lost = new Set<FakeMethod>();
+  let withoutId = false;
   let sequence = 0;
 
   /** Registers the call; throws when the test made it fail. Returns whether the answer must be lost. */
   const enter = (method: FakeMethod): boolean => {
     calls.push(method);
-    const remaining = failures.get(method) ?? 0;
-    if (remaining > 0) {
-      failures.set(method, remaining - 1);
-      throw unavailable(method);
+    const failure = failures.get(method);
+    if (failure !== undefined && failure.times > 0) {
+      failure.times -= 1;
+      throw failure.error ?? unavailable(method);
     }
     return lost.delete(method);
+  };
+  /** The refusal the test queued for this database method, if any (consumed). */
+  const refusalOf = (method: FakeMethod): Result<never, DomainError> | undefined => {
+    const refusal = refusals.get(method);
+    if (refusal === undefined) return undefined;
+    refusals.delete(method);
+    return err(refusal);
   };
   const leave = (loseAnswer: boolean, method: FakeMethod) => {
     if (loseAnswer) throw unavailable(method);
@@ -100,7 +142,7 @@ export function createFakeClientUsers(
     displayName: record.displayName,
     disabled: record.disabled,
     mustChangePassword: record.mustChangePassword,
-    lastSignInAt: null,
+    lastSignInAt: record.lastSignInAt,
     createdAt: record.createdAt,
   });
 
@@ -118,6 +160,8 @@ export function createFakeClientUsers(
       sessions: 1,
       provisioned: true,
       passwordBaselines: 0,
+      lastSignInAt: null,
+      audit: [],
       createdAt: new Date(Date.UTC(2026, 10, 16, 12, 0, sequence)),
       ...account,
     };
@@ -161,16 +205,24 @@ export function createFakeClientUsers(
     },
     recordProvisioned(userId) {
       const lose = enter('recordProvisioned');
+      const refusal = refusalOf('recordProvisioned');
+      if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
       record.provisioned = true;
+      record.audit.push('account.provisioned');
       leave(lose, 'recordProvisioned');
       return Promise.resolve(ok(undefined));
     },
     setDisabled(userId, disabled) {
       const lose = enter('setDisabled');
+      const refusal = refusalOf('setDisabled');
+      if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
+      // like the function: an event only when the state changes
+      if (record.disabled !== disabled)
+        record.audit.push(disabled ? 'account.disabled' : 'account.enabled');
       record.disabled = disabled;
       if (disabled) record.sessions = 0;
       leave(lose, 'setDisabled');
@@ -178,19 +230,26 @@ export function createFakeClientUsers(
     },
     setDisplayName(userId, displayName) {
       const lose = enter('setDisplayName');
+      const refusal = refusalOf('setDisplayName');
+      if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
       record.displayName = displayName;
+      // like the function: an event on EVERY call, the same name included
+      record.audit.push('account.updated');
       leave(lose, 'setDisplayName');
       return Promise.resolve(ok(undefined));
     },
     requirePasswordChange(userId) {
       const lose = enter('requirePasswordChange');
+      const refusal = refusalOf('requirePasswordChange');
+      if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
       record.mustChangePassword = true;
       record.passwordBaselines += 1;
       record.sessions = 0;
+      record.audit.push('account.password_reset');
       leave(lose, 'requirePasswordChange');
       return Promise.resolve(ok(undefined));
     },
@@ -226,6 +285,10 @@ export function createFakeClientUsers(
         passwordBaselines: 1,
       });
       leave(lose, 'createClientUser');
+      if (withoutId) {
+        withoutId = false;
+        return Promise.reject(new ClientUserProvisionUnconfirmedError());
+      }
       return Promise.resolve(ok({ id }));
     },
     deleteUser(userId) {
@@ -262,7 +325,9 @@ export function createFakeClientUsers(
     records,
     seed,
     clientRows,
-    failNext: (method, times = 1) => void failures.set(method, times),
+    failNext: (method, times = 1, error) => void failures.set(method, { times, error }),
+    refuseNext: (method, error) => void refusals.set(method, error),
+    answerNextCreationWithoutId: () => void (withoutId = true),
     loseAnswerOf: (method) => void lost.add(method),
     beforeCreate: undefined,
     accountsOf,
