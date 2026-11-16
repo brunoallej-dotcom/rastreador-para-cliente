@@ -48,6 +48,9 @@ const NO_BREAK_SPACE = String.fromCodePoint(0x00a0);
 const IDEOGRAPHIC_SPACE = String.fromCodePoint(0x3000);
 const HANGUL_FILLER = String.fromCodePoint(0x3164);
 const CYRILLIC_CAPITAL_A = String.fromCodePoint(0x0410);
+const COMBINING_GRAPHEME_JOINER = String.fromCodePoint(0x034f);
+const VARIATION_SELECTOR_16 = String.fromCodePoint(0xfe0f);
+const MONGOLIAN_FREE_VARIATION_SELECTOR_ONE = String.fromCodePoint(0x180b);
 const FULLWIDTH_OFFSET = 0xfee0;
 const JAPANESE_PREFIX = String.fromCodePoint(0x65e5, 0x672c);
 const CJK_FIRST = 0x4e00;
@@ -80,6 +83,15 @@ async function clientsNamed(name: string): Promise<number> {
   const { data, error } = await adminClient().from('clients').select('id').eq('name', name);
   if (error) throw new Error(`reading clients failed: ${error.message}`);
   return data.length;
+}
+
+/** Archives a client through the API and checks the answer: a setup step that must not fail silently. */
+async function archiveOrFail(cookies: CookieStore, clientId: string): Promise<ClientDetailBody> {
+  const response = await updateClientViaApi(cookies, clientId, { archived: true });
+  const body = await expectContract<ClientDetailBody>('updateClient', response);
+  expect(response.status).toBe(200);
+  expect(body.archived).toBe(true);
+  return body;
 }
 
 /** How many clients there are, read with the secret key (a fixture, not a behavior). */
@@ -683,243 +695,267 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
   });
 
   describe('a client name is unique among the active clients (F-51)', () => {
-    // Its own CEO: the writes of this group (the refused ones count too) stay inside the 60 writes
-    // per minute of one user, apart from the CEOs of the other groups.
-    let nameCeo: CeoWithMfa;
-    let taken: ClientDetailBody;
+    // One CEO per sub-group: the writes (the refused ones count too) of each stay far inside the 60
+    // writes per minute of one user (about 20 and 30), whatever is added to either, and apart from
+    // the CEOs of the other groups.
+    describe('creating, and the key of a name', () => {
+      let nameCeo: CeoWithMfa;
+      let taken: ClientDetailBody;
 
-    beforeAll(async () => {
-      nameCeo = await loginAsCeoWithMfa();
-      taken = await createClientOrFail(nameCeo.cookies, uniqueClientName('Acme'));
-    });
-
-    const VARIANTS: [string, (name: string) => string][] = [
-      ['other letter case (upper)', (name) => name.toUpperCase()],
-      ['other letter case (lower)', (name) => name.toLowerCase()],
-      ['full-width letters and an ideographic space', toFullwidth],
-      ['a no-break space between the words', (name) => name.replace(' ', NO_BREAK_SPACE)],
-      ['repeated spaces between the words', (name) => name.replace(' ', '   ')],
-      ['spaces around it', (name) => ` ${name} `],
-    ];
-
-    it('E-40: a second client with the same name is 409 CONFLICT, creates nothing and names no other client', async () => {
-      const name = uniqueClientName('Duplicado');
-      const first = await createClientOrFail(nameCeo.cookies, name);
-
-      const response = await createClientViaApi(nameCeo.cookies, { name });
-      const body = await expectContract<Problem>('createClient', response);
-
-      expect(response.status).toBe(409);
-      expect(body).toMatchObject({
-        code: 'CONFLICT',
-        detail: 'A client with this name already exists.',
+      beforeAll(async () => {
+        nameCeo = await loginAsCeoWithMfa();
+        taken = await createClientOrFail(nameCeo.cookies, uniqueClientName('Acme'));
       });
-      expect(response.headers.get('location')).toBeNull();
-      expect(JSON.stringify(body)).not.toContain(first.id);
-      expect(JSON.stringify(body)).not.toContain(name);
-      expect(await clientsNamed(name)).toBe(1);
-      expect((await auditOfClient(first.id)).map((row) => row.action)).toEqual(['client.created']);
-    });
 
-    it.each(VARIANTS)(
-      'E-40: the same name with %s is 409 CONFLICT and creates nothing',
-      async (_label, vary) => {
-        const before = await clientCount();
+      const VARIANTS: [string, (name: string) => string][] = [
+        ['other letter case (upper)', (name) => name.toUpperCase()],
+        ['other letter case (lower)', (name) => name.toLowerCase()],
+        ['full-width letters and an ideographic space', toFullwidth],
+        ['a no-break space between the words', (name) => name.replace(' ', NO_BREAK_SPACE)],
+        ['repeated spaces between the words', (name) => name.replace(' ', '   ')],
+        ['spaces around it', (name) => ` ${name} `],
+        [
+          'a combining grapheme joiner inside a word',
+          (name) => name.replace('cm', `c${COMBINING_GRAPHEME_JOINER}m`),
+        ],
+        [
+          'a variation selector (emoji presentation) after a word',
+          (name) => name.replace(' ', `${VARIATION_SELECTOR_16} `),
+        ],
+        [
+          'a Mongolian free variation selector after a word',
+          (name) => name.replace(' ', `${MONGOLIAN_FREE_VARIATION_SELECTOR_ONE} `),
+        ],
+      ];
 
-        const response = await createClientViaApi(nameCeo.cookies, { name: vary(taken.name) });
+      it('E-40: a second client with the same name is 409 CONFLICT, creates nothing and names no other client', async () => {
+        const name = uniqueClientName('Duplicado');
+        const first = await createClientOrFail(nameCeo.cookies, name);
+
+        const response = await createClientViaApi(nameCeo.cookies, { name });
         const body = await expectContract<Problem>('createClient', response);
 
-        expect([response.status, body.code]).toEqual([409, 'CONFLICT']);
-        expect(await clientCount()).toBe(before);
-      },
-    );
-
-    it('E-41: renaming to the name of another active client is 409 and changes nothing; the own name in another case is fine', async () => {
-      const first = await createClientOrFail(nameCeo.cookies);
-      const second = await createClientOrFail(nameCeo.cookies);
-
-      const refused = await updateClientViaApi(nameCeo.cookies, second.id, { name: first.name });
-      const body = await expectContract<Problem>('updateClient', refused);
-
-      expect(refused.status).toBe(409);
-      expect(body).toMatchObject({
-        code: 'CONFLICT',
-        detail: 'A client with this name already exists.',
+        expect(response.status).toBe(409);
+        expect(body).toMatchObject({
+          code: 'CONFLICT',
+          detail: 'A client with this name already exists.',
+        });
+        expect(response.headers.get('location')).toBeNull();
+        expect(JSON.stringify(body)).not.toContain(first.id);
+        expect(JSON.stringify(body)).not.toContain(name);
+        expect(await clientsNamed(name)).toBe(1);
+        expect((await auditOfClient(first.id)).map((row) => row.action)).toEqual([
+          'client.created',
+        ]);
       });
-      expect(JSON.stringify(body)).not.toContain(first.id);
-      expect(await nameOfClient(second.id)).toBe(second.name);
-      expect((await auditOfClient(second.id)).map((row) => row.action)).toEqual(['client.created']);
 
-      const upper = first.name.toUpperCase();
-      const sameClient = await updateClientViaApi(nameCeo.cookies, first.id, { name: upper });
-      expect(sameClient.status).toBe(200);
-      await expectContract('updateClient', sameClient);
-      expect(await nameOfClient(first.id)).toBe(upper);
+      it.each(VARIANTS)(
+        'E-40: the same name with %s is 409 CONFLICT and creates nothing',
+        async (_label, vary) => {
+          const before = await clientCount();
 
-      const stillRefused = await updateClientViaApi(nameCeo.cookies, second.id, {
-        name: first.name,
-      });
-      await expectContract('updateClient', stillRefused);
-      expect(stillRefused.status).toBe(409);
-    });
+          const response = await createClientViaApi(nameCeo.cookies, { name: vary(taken.name) });
+          const body = await expectContract<Problem>('createClient', response);
 
-    it('E-42: unarchiving a client whose name an active client has now is 409 and it stays archived', async () => {
-      const first = await createClientOrFail(nameCeo.cookies);
-      await updateClientViaApi(nameCeo.cookies, first.id, { archived: true });
-      const second = await createClientOrFail(nameCeo.cookies, first.name);
-
-      const refused = await updateClientViaApi(nameCeo.cookies, first.id, { archived: false });
-      const body = await expectContract<Problem>('updateClient', refused);
-
-      expect(refused.status).toBe(409);
-      expect(body.code).toBe('CONFLICT');
-      expect(JSON.stringify(body)).not.toContain(second.id);
-      const detail = await expectContract<ClientDetailBody>(
-        'getClient',
-        await getClientViaApi(nameCeo.cookies, first.id),
-      );
-      expect(detail).toMatchObject({ archived: true, name: first.name });
-      expect((await auditOfClient(first.id)).map((row) => row.action)).toEqual([
-        'client.created',
-        'client.archived',
-      ]);
-
-      // a new name along with the unarchive is the way back
-      const renamed = uniqueClientName('Volta');
-      const back = await updateClientViaApi(nameCeo.cookies, first.id, {
-        name: renamed,
-        archived: false,
-      });
-      const backBody = await expectContract<ClientDetailBody>('updateClient', back);
-      expect(backBody).toMatchObject({ name: renamed, archived: false });
-    });
-
-    it('E-42: renaming to a name in use and archiving in one request is fine: the final state does not compete', async () => {
-      const active = await createClientOrFail(nameCeo.cookies);
-      const other = await createClientOrFail(nameCeo.cookies);
-
-      const response = await updateClientViaApi(nameCeo.cookies, other.id, {
-        name: active.name,
-        archived: true,
-      });
-      const body = await expectContract<ClientDetailBody>('updateClient', response);
-
-      expect(response.status).toBe(200);
-      expect(body).toMatchObject({ name: active.name, archived: true });
-    });
-
-    it('E-43: archiving frees the name, and archived clients may share one', async () => {
-      const name = uniqueClientName('Liberado');
-      const first = await createClientOrFail(nameCeo.cookies, name);
-      await updateClientViaApi(nameCeo.cookies, first.id, { archived: true });
-
-      const second = await createClientOrFail(nameCeo.cookies, name);
-      const archiveSecond = await updateClientViaApi(nameCeo.cookies, second.id, {
-        archived: true,
-      });
-      await expectContract('updateClient', archiveSecond);
-      const third = await createClientViaApi(nameCeo.cookies, { name });
-      const thirdBody = await expectContract<ClientDetailBody>('createClient', third);
-
-      expect(third.status).toBe(201);
-      expect(new Set([first.id, second.id, thirdBody.id]).size).toBe(3);
-      expect(await clientsNamed(name)).toBe(3);
-    });
-
-    it('E-44: concurrent creates with the same name: exactly one is 201 and the others are 409', async () => {
-      const name = uniqueClientName('Corrida');
-
-      const responses = await Promise.all(
-        Array.from({ length: 4 }, () => createClientViaApi(nameCeo.cookies, { name })),
+          expect([response.status, body.code]).toEqual([409, 'CONFLICT']);
+          expect(await clientCount()).toBe(before);
+        },
       );
 
-      for (const response of responses) await expectContract('createClient', response);
-      expect(responses.map((response) => response.status).sort()).toEqual([201, 409, 409, 409]);
-      expect(await clientsNamed(name)).toBe(1);
-    });
+      it('E-46: a letter of another alphabet that looks Latin is not folded (residual of T-33)', async () => {
+        const lookalike = `${CYRILLIC_CAPITAL_A}${taken.name.slice(1)}`;
 
-    it('E-44: a create and a rename to the same name at once: exactly one wins', async () => {
-      const other = await createClientOrFail(nameCeo.cookies);
-      const name = uniqueClientName('Corrida');
+        const response = await createClientViaApi(nameCeo.cookies, { name: lookalike });
+        const body = await expectContract<ClientDetailBody>('createClient', response);
 
-      const [created, renamed] = await Promise.all([
-        createClientViaApi(nameCeo.cookies, { name }),
-        updateClientViaApi(nameCeo.cookies, other.id, { name }),
-      ]);
-
-      await expectContract('createClient', created);
-      await expectContract('updateClient', renamed);
-      const statuses = [created.status, renamed.status];
-      expect(statuses.filter((status) => status === 409)).toHaveLength(1);
-      expect(statuses.filter((status) => status < 300)).toHaveLength(1);
-      expect(await clientsNamed(name)).toBe(1);
-    });
-
-    it('E-45: a create whose answer was lost (503) and is repeated is 409, and the client exists once', async () => {
-      const name = uniqueClientName('Reenvio');
-      const realFetch = globalThis.fetch;
-      // the function runs and commits; what the app never receives is its answer
-      const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-        const url = String(input instanceof Request ? input.url : input);
-        const answer = await realFetch(input, init);
-        if (!url.includes('/rest/v1/rpc/create_client')) return answer;
-        void answer.body?.cancel();
-        throw new TypeError('fetch failed');
-      });
-      let lost: Response;
-      try {
-        lost = await createClientViaApi(nameCeo.cookies, { name });
-      } finally {
-        spy.mockRestore();
-      }
-      const lostBody = await expectContract<Problem>('createClient', lost);
-      expect([lost.status, lostBody.code]).toEqual([503, 'SERVICE_UNAVAILABLE']);
-      expect(await clientsNamed(name)).toBe(1);
-
-      const repeated = await createClientViaApi(nameCeo.cookies, { name });
-      const body = await expectContract<Problem>('createClient', repeated);
-
-      expect([repeated.status, body.code]).toEqual([409, 'CONFLICT']);
-      expect(await clientsNamed(name)).toBe(1);
-    });
-
-    it('E-46: a letter of another alphabet that looks Latin is not folded (residual of T-33)', async () => {
-      const lookalike = `${CYRILLIC_CAPITAL_A}${taken.name.slice(1)}`;
-
-      const response = await createClientViaApi(nameCeo.cookies, { name: lookalike });
-      const body = await expectContract<ClientDetailBody>('createClient', response);
-
-      expect(response.status).toBe(201);
-      expect(body.id).not.toBe(taken.id);
-    });
-
-    it('E-40 to E-42: straight through PostgREST the refusal is P0001 CLIENT_NAME_TAKEN, with no detail about the other client', async () => {
-      const { supabase } = await ceoAal2Client();
-      const active = await createClientOrFail(nameCeo.cookies);
-      const archived = await createClientOrFail(nameCeo.cookies);
-      await updateClientViaApi(nameCeo.cookies, archived.id, { archived: true });
-      await createClientOrFail(nameCeo.cookies, archived.name);
-      const renamed = await createClientOrFail(nameCeo.cookies);
-
-      const create = await supabase.rpc('create_client', { p_name: active.name.toUpperCase() });
-      const rename = await supabase.rpc('update_client', {
-        p_client_id: renamed.id,
-        p_name: active.name,
-      });
-      const unarchive = await supabase.rpc('update_client', {
-        p_client_id: archived.id,
-        p_archived: false,
+        expect(response.status).toBe(201);
+        expect(body.id).not.toBe(taken.id);
       });
 
-      for (const { data, error } of [create, rename, unarchive]) {
-        expect(data).toBeNull();
-        expect(error).toMatchObject({ code: 'P0001', message: 'CLIENT_NAME_TAKEN' });
-        const shown = JSON.stringify(error).toLowerCase();
-        expect(shown).not.toContain(active.id);
-        expect(shown).not.toContain(archived.id);
-        expect(shown).not.toContain(active.name.toLowerCase());
-      }
-      expect(await nameOfClient(renamed.id)).toBe(renamed.name);
+      it('E-40 to E-42: straight through PostgREST the refusal is P0001 CLIENT_NAME_TAKEN, with no detail about the other client', async () => {
+        const { supabase } = await ceoAal2Client();
+        const active = await createClientOrFail(nameCeo.cookies);
+        const archived = await createClientOrFail(nameCeo.cookies);
+        await archiveOrFail(nameCeo.cookies, archived.id);
+        await createClientOrFail(nameCeo.cookies, archived.name);
+        const renamed = await createClientOrFail(nameCeo.cookies);
+
+        const create = await supabase.rpc('create_client', { p_name: active.name.toUpperCase() });
+        const rename = await supabase.rpc('update_client', {
+          p_client_id: renamed.id,
+          p_name: active.name,
+        });
+        const unarchive = await supabase.rpc('update_client', {
+          p_client_id: archived.id,
+          p_archived: false,
+        });
+
+        for (const { data, error } of [create, rename, unarchive]) {
+          expect(data).toBeNull();
+          expect(error).toMatchObject({ code: 'P0001', message: 'CLIENT_NAME_TAKEN' });
+          const shown = JSON.stringify(error).toLowerCase();
+          expect(shown).not.toContain(active.id);
+          expect(shown).not.toContain(archived.id);
+          expect(shown).not.toContain(active.name.toLowerCase());
+        }
+        expect(await nameOfClient(renamed.id)).toBe(renamed.name);
+      });
+    });
+
+    describe('renaming, unarchiving and racing', () => {
+      let flowCeo: CeoWithMfa;
+
+      beforeAll(async () => {
+        flowCeo = await loginAsCeoWithMfa();
+      });
+
+      it('E-41: renaming to the name of another active client is 409 and changes nothing; the own name in another case is fine', async () => {
+        const first = await createClientOrFail(flowCeo.cookies);
+        const second = await createClientOrFail(flowCeo.cookies);
+
+        const refused = await updateClientViaApi(flowCeo.cookies, second.id, { name: first.name });
+        const body = await expectContract<Problem>('updateClient', refused);
+
+        expect(refused.status).toBe(409);
+        expect(body).toMatchObject({
+          code: 'CONFLICT',
+          detail: 'A client with this name already exists.',
+        });
+        expect(JSON.stringify(body)).not.toContain(first.id);
+        expect(await nameOfClient(second.id)).toBe(second.name);
+        expect((await auditOfClient(second.id)).map((row) => row.action)).toEqual([
+          'client.created',
+        ]);
+
+        const upper = first.name.toUpperCase();
+        const sameClient = await updateClientViaApi(flowCeo.cookies, first.id, { name: upper });
+        expect(sameClient.status).toBe(200);
+        await expectContract('updateClient', sameClient);
+        expect(await nameOfClient(first.id)).toBe(upper);
+
+        const stillRefused = await updateClientViaApi(flowCeo.cookies, second.id, {
+          name: first.name,
+        });
+        await expectContract('updateClient', stillRefused);
+        expect(stillRefused.status).toBe(409);
+      });
+
+      it('E-42: unarchiving a client whose name an active client has now is 409 and it stays archived', async () => {
+        const first = await createClientOrFail(flowCeo.cookies);
+        await archiveOrFail(flowCeo.cookies, first.id);
+        const second = await createClientOrFail(flowCeo.cookies, first.name);
+
+        const refused = await updateClientViaApi(flowCeo.cookies, first.id, { archived: false });
+        const body = await expectContract<Problem>('updateClient', refused);
+
+        expect(refused.status).toBe(409);
+        expect(body.code).toBe('CONFLICT');
+        expect(JSON.stringify(body)).not.toContain(second.id);
+        const detail = await expectContract<ClientDetailBody>(
+          'getClient',
+          await getClientViaApi(flowCeo.cookies, first.id),
+        );
+        expect(detail).toMatchObject({ archived: true, name: first.name });
+        expect((await auditOfClient(first.id)).map((row) => row.action)).toEqual([
+          'client.created',
+          'client.archived',
+        ]);
+
+        // a new name along with the unarchive is the way back
+        const renamed = uniqueClientName('Volta');
+        const back = await updateClientViaApi(flowCeo.cookies, first.id, {
+          name: renamed,
+          archived: false,
+        });
+        const backBody = await expectContract<ClientDetailBody>('updateClient', back);
+        expect(backBody).toMatchObject({ name: renamed, archived: false });
+      });
+
+      it('E-42: renaming to a name in use and archiving in one request is fine: the final state does not compete', async () => {
+        const active = await createClientOrFail(flowCeo.cookies);
+        const other = await createClientOrFail(flowCeo.cookies);
+
+        const response = await updateClientViaApi(flowCeo.cookies, other.id, {
+          name: active.name,
+          archived: true,
+        });
+        const body = await expectContract<ClientDetailBody>('updateClient', response);
+
+        expect(response.status).toBe(200);
+        expect(body).toMatchObject({ name: active.name, archived: true });
+      });
+
+      it('E-43: archiving frees the name, and archived clients may share one', async () => {
+        const name = uniqueClientName('Liberado');
+        const first = await createClientOrFail(flowCeo.cookies, name);
+        await archiveOrFail(flowCeo.cookies, first.id);
+
+        const second = await createClientOrFail(flowCeo.cookies, name);
+        await archiveOrFail(flowCeo.cookies, second.id);
+        const third = await createClientViaApi(flowCeo.cookies, { name });
+        const thirdBody = await expectContract<ClientDetailBody>('createClient', third);
+
+        expect(third.status).toBe(201);
+        expect(new Set([first.id, second.id, thirdBody.id]).size).toBe(3);
+        expect(await clientsNamed(name)).toBe(3);
+      });
+
+      it('E-44: concurrent creates with the same name: exactly one is 201 and the others are 409', async () => {
+        const name = uniqueClientName('Corrida');
+
+        const responses = await Promise.all(
+          Array.from({ length: 4 }, () => createClientViaApi(flowCeo.cookies, { name })),
+        );
+
+        for (const response of responses) await expectContract('createClient', response);
+        expect(responses.map((response) => response.status).sort()).toEqual([201, 409, 409, 409]);
+        expect(await clientsNamed(name)).toBe(1);
+      });
+
+      it('E-44: a create and a rename to the same name at once: exactly one wins', async () => {
+        const other = await createClientOrFail(flowCeo.cookies);
+        const name = uniqueClientName('Corrida');
+
+        const [created, renamed] = await Promise.all([
+          createClientViaApi(flowCeo.cookies, { name }),
+          updateClientViaApi(flowCeo.cookies, other.id, { name }),
+        ]);
+
+        await expectContract('createClient', created);
+        await expectContract('updateClient', renamed);
+        const statuses = [created.status, renamed.status];
+        expect(statuses.filter((status) => status === 409)).toHaveLength(1);
+        expect(statuses.filter((status) => status < 300)).toHaveLength(1);
+        expect(await clientsNamed(name)).toBe(1);
+      });
+
+      it('E-45: a create whose answer was lost (503) and is repeated is 409, and the client exists once', async () => {
+        const name = uniqueClientName('Reenvio');
+        const realFetch = globalThis.fetch;
+        // the function runs and commits; what the app never receives is its answer
+        const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+          const url = String(input instanceof Request ? input.url : input);
+          const answer = await realFetch(input, init);
+          if (!url.includes('/rest/v1/rpc/create_client')) return answer;
+          void answer.body?.cancel();
+          throw new TypeError('fetch failed');
+        });
+        let lost: Response;
+        try {
+          lost = await createClientViaApi(flowCeo.cookies, { name });
+        } finally {
+          spy.mockRestore();
+        }
+        const lostBody = await expectContract<Problem>('createClient', lost);
+        expect([lost.status, lostBody.code]).toEqual([503, 'SERVICE_UNAVAILABLE']);
+        expect(await clientsNamed(name)).toBe(1);
+
+        const repeated = await createClientViaApi(flowCeo.cookies, { name });
+        const body = await expectContract<Problem>('createClient', repeated);
+
+        expect([repeated.status, body.code]).toEqual([409, 'CONFLICT']);
+        expect(await clientsNamed(name)).toBe(1);
+      });
     });
   });
 

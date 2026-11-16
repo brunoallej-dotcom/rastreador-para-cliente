@@ -421,6 +421,7 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` |
 | `P0001` + `CLIENT_NAME_TAKEN` | `ConflictError` (o `detail` não diz qual é o outro cliente) | 409 `CONFLICT` |
+| `40P01` (deadlock) e `40001` (falha de serialização), pelo SQLSTATE e qualquer que seja o status HTTP do PostgREST (que dá 500 aos dois) | `ServiceUnavailableError`: o Postgres desfez a transação inteira, sem linha nem auditoria, e repetir é seguro | 503 `SERVICE_UNAVAILABLE` com `Retry-After` |
 
 #### 3.7.1 Clientes (Onda 6)
 
@@ -444,17 +445,26 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
   arquivar na mesma chamada grava dois eventos, nessa ordem. A linha é travada com `FOR NO KEY UPDATE`:
   as escritas do mesmo cliente se serializam (a última vence, sem controle otimista: T-37) e a criação
   de processos e logins, que só referenciam o cliente, não espera.
-- **Nome único (F-51; E-40 a E-46).** Entre os clientes **não arquivados** não há dois nomes com a
-  mesma chave: `lower(normalize(name, NFKC))` com cada sequência de espaços reduzida a um só (índice
-  único parcial `clients_active_name_key … WHERE archived_at IS NULL`). A chave ignora maiúsculas e
-  minúsculas, formas de compatibilidade do Unicode (largura total, ligaduras, sobrescritos) e a
-  diferença entre um espaço e vários, que o HTML mostra igual. O Postgres 17 não tem `casefold()`
-  (chega no 18), então o dobramento é o de `lower()` do locale do banco: "ß" e "ss", ou "ς" e "σ",
-  seguem distintos. Letras de outro alfabeto que se parecem com as latinas (o "А" cirílico) também
-  passam: é o residual do T-33, e o frontend deve mostrar o id do cliente na hora de provisionar um
-  login (Onda 7). `create_client` e `update_client` pegam a violação **desse** índice e a trocam por
-  `P0001` + `CLIENT_NAME_TAKEN`, sem o texto do erro original (que traz o nome normalizado); o app a
-  mapeia para `ConflictError` (409 `CONFLICT`) e a resposta não diz qual é o outro cliente. Quem
+- **Nome único (F-51; E-40 a E-47).** Entre os clientes **não arquivados** não há dois nomes com a
+  mesma chave: `lower(normalize(name, NFKC))`, sem as marcas de variação invisíveis (U+034F, U+180B a
+  U+180D, U+180F, U+FE00 a U+FE0F e U+E0100 a U+E01EF) e com cada sequência de espaços reduzida a um
+  só (índice único parcial `clients_active_name_key … WHERE archived_at IS NULL`). Valem como o
+  **mesmo nome**: um acento decomposto e o composto ("Cafe" + U+0301 e "Café", mas "Cafe" e "Café"
+  seguem distintos); as formas de compatibilidade do Unicode, NFKC ("Acme™" e "AcmeTM", "①" e "1",
+  letras de largura total, ligaduras); e as diferenças só de caixa, de sequências de espaços (o HTML
+  as mostra iguais) e de marcas de variação invisíveis, que o NFKC mantém e `visible_text` aceita.
+  Só a chave perde essas marcas: o nome guardado e mostrado as mantém (o seletor de emoji U+FE0F é
+  legítimo num nome). O Postgres 17 não tem `casefold()` (chega no 18), então o dobramento é o de
+  `lower()` do locale do banco: "ß" e "ss", ou "ς" e "σ", seguem distintos. O `lower()` só dobra
+  letras fora do ASCII se o locale for Unicode (o pgTAP 014 confere, como o 013 faz com
+  `[[:alnum:]]`), e as tabelas do `normalize` e do `lower` mudam com a versão do ICU e com um upgrade
+  maior do Postgres: depois de qualquer um, `REINDEX INDEX public.clients_active_name_key`; a Onda
+  11 confere o locale do banco hospedado. Letras de outro alfabeto que se parecem com as latinas (o
+  "А" cirílico) passam: é o residual do T-33, e o frontend deve mostrar o id do cliente na hora de
+  provisionar um login (Onda 7). `create_client` e `update_client` pegam a violação **desse** índice (pelo esquema, pela tabela e
+  pelo nome do constraint; a de qualquer outro sobe como `23505`) e a trocam por `P0001` +
+  `CLIENT_NAME_TAKEN`, sem DETAIL, HINT nem nome de constraint e sem o texto do erro original (que
+  traz o nome normalizado); o app a mapeia para `ConflictError` (409 `CONFLICT`) e a resposta não diz qual é o outro cliente. Quem
   decide é o índice, não uma consulta prévia: duas escritas concorrentes com o mesmo nome não passam
   as duas (uma recebe 201 e a outra 409), e um retry de criação que já tinha sido gravada responde 409
   em vez de duplicar (E-21). A recusa vem do `INSERT` ou do `UPDATE`, antes da auditoria, e desfaz a
@@ -783,7 +793,7 @@ e `private.is_ceo()`. O helper `private.request_id()` lê o `x-request-id` do Po
 | `audit_events (process_id, occurred_at)` | linha do tempo |
 | `audit_events (client_id, occurred_at)` | auditoria por cliente |
 | `audit_events (occurred_at)` | retenção |
-| `clients (lower(normalize(name, NFKC)), espaços reduzidos) WHERE archived_at IS NULL` (unique) | nome de cliente único entre os ativos: 409 `CONFLICT` ao criar, renomear e desarquivar (F-51) |
+| `clients (lower(normalize(name, NFKC)), sem marcas de variação invisíveis, espaços reduzidos) WHERE archived_at IS NULL` (unique) | nome de cliente único entre os ativos: 409 `CONFLICT` ao criar, renomear e desarquivar (F-51) |
 | `clients (created_at DESC, id)` | paginação por cursor |
 
 ---
@@ -885,13 +895,14 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-29 | Cursor de paginação adulterado | 400 `VALIDATION_ERROR` |
 | E-30 | Texto com caracteres de controle ou Unicode não normalizado | Normaliza para NFC e rejeita caracteres de controle e de formatação, "fillers" invisíveis, texto sem nenhuma letra ou número e surrogate UTF-16 solto (400) |
 | E-31 | Verify sem `factorId` e a conta sem fator TOTP, ou com mais de um fator no mesmo estado | 422 `INVALID_MFA_CODE`, igual a código errado; conta nos dois limites; o log diz `factor_not_found` ou `factor_ambiguous` |
-| E-40 | Criar cliente com o nome de outro cliente não arquivado (igual depois da chave de §3.7.1: "ACME" e "acme", "Ａｃｍｅ" de largura total, espaços repetidos) | 409 `CONFLICT`; nada é criado, nenhum evento é gravado, e a resposta não traz o id nem o nome do outro cliente |
+| E-40 | Criar cliente com o nome de outro cliente não arquivado (igual depois da chave de §3.7.1: "ACME" e "acme", "Ａｃｍｅ" de largura total, espaços repetidos, "Ac" + U+034F + "me", um seletor de variação) | 409 `CONFLICT`; nada é criado, nenhum evento é gravado, e a resposta não traz o id nem o nome do outro cliente |
 | E-41 | Renomear cliente para o nome de outro cliente não arquivado | 409 `CONFLICT`; o cliente fica como estava, sem evento. Trocar só as maiúsculas, ou os espaços, do próprio nome é permitido |
 | E-42 | Desarquivar cliente cujo nome é agora de um cliente ativo (sozinho ou junto com um novo nome em uso) | 409 `CONFLICT`; continua arquivado, sem evento. Renomear para um nome em uso e arquivar na mesma chamada vale: o estado final não disputa o nome |
 | E-43 | Nome que só existe em clientes arquivados | Livre: criar, renomear e desarquivar (se nenhum ativo o usa) funcionam, e vários arquivados podem ter o mesmo nome. Arquivar libera o nome |
 | E-44 | Duas criações simultâneas com o mesmo nome | Exatamente um 201 e um 409 `CONFLICT`; um cliente só |
 | E-45 | Retry de `POST /admin/clients` depois de um 503 | Primeira chamada gravada: 409 `CONFLICT` e um cliente só. Primeira não gravada: 201 |
 | E-46 | Nome que difere só por uma letra de outro alfabeto parecida com a latina (o "А" cirílico) | Aceito: é o residual do T-33, tratado no frontend (id do cliente ao provisionar login, Onda 7) |
+| E-47 | Dois `PATCH` que se cruzam ao mesmo tempo, o cliente A para o nome do B e o B para o nome do A | O Postgres detecta o deadlock dos dois índices e derruba uma das transações: 503 `SERVICE_UNAVAILABLE` com `Retry-After`, sem nada gravado nem auditado. A outra termina em 409 `CONFLICT` (o nome do outro cliente não saiu). Repetir a que caiu dá 409 ou 200, conforme o estado de então |
 
 ---
 
