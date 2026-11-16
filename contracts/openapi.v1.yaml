@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Rastreador para Cliente API
-  version: 1.0.0-draft.1
+  version: 1.0.0-draft.2
   summary: Backend do rastreador de entregas (painel do cliente e painel dos CEOs).
   description: |
     Contrato normativo da API v1. Spec de origem: `docs/specs/client-delivery-tracker.md`.
@@ -20,7 +20,12 @@ info:
       com as quais a operação continua acessível. Pendência fora da lista → 403 com o `code` da
       pendência.
     - `x-rate-limit`: limites aplicados antes da autenticação (escopo `ip` ou `account`) ou depois
-      (escopo `user`). Excedido → 429 com `Retry-After`.
+      (escopo `user`). Excedido → 429 com `Retry-After`. Entradas com `programmatic: true` não são
+      regras da política da rota: são orçamentos que o servidor gasta além dela, num contador
+      nomeado (`group`) e, no escopo `global`, único para o app inteiro (todos os logins juntos).
+      Excedidos, respondem 429 com `Retry-After`, exceto o de sessão (ver `sessionCookie`), que
+      responde 401. A extensão também aparece em `sessionCookie`, porque esse orçamento é cobrado
+      de qualquer operação autenticada.
 
     ## CSRF
     Métodos não seguros exigem o header `Origin` igual a uma origem permitida (senão 403
@@ -36,6 +41,20 @@ info:
     ## Erros
     `application/problem+json` (RFC 9457) com `code` estável e `requestId`. Nunca contém stack,
     SQL ou mensagens de serviços internos. Recurso de outro tenant responde 404, nunca 403.
+    Toda operação autenticada falha fechada com 503 `SERVICE_UNAVAILABLE` (e `Retry-After`) quando
+    uma dependência de segurança (limitador de taxa, banco, Auth) está indisponível ou lenta: a
+    requisição é negada, nunca liberada.
+
+    ## Compatibilidade
+    - `1.0.0-draft.2` (minor, **sem mudança incompatível**). Aditivo: `factorId` deixa de ser
+      obrigatório em `verifyTotp` (o servidor resolve o fator da sessão); 503 documentado em toda
+      operação autenticada; `x-rate-limit` passa a listar os orçamentos programáticos
+      (`programmatic: true`). Documenta comportamento que já existia: política e 422/400 da senha em
+      `changePassword` (o schema da nova senha perde `minLength`/`maxLength`, que prometiam um 400
+      que o servidor nunca devolveu), `Set-Cookie` no 204, 503 de `changePassword`. `factorId`
+      fica `deprecated`, mas **continua aceito** com o mesmo significado: um cliente que o envia
+      não muda de comportamento.
+    - `1.0.0-draft.1`: versão inicial.
   license:
     name: Proprietário — todos os direitos reservados
     identifier: LicenseRef-Proprietary
@@ -92,7 +111,9 @@ paths:
       description: |
         Cria a sessão e grava o cookie `__Host-rt-session`. A falha é sempre
         `401 INVALID_CREDENTIALS` com corpo idêntico (e-mail inexistente, senha errada ou conta
-        desativada). Não existe cadastro público.
+        desativada). Não existe cadastro público. Além dos limites por IP e por conta, todos os
+        logins do app gastam um orçamento global (300 por 5 min, `programmatic`): acima dele, 429
+        para todos até a janela passar, o que protege a cota do Auth.
       tags: [Auth]
       security: []
       x-auth-policy:
@@ -104,6 +125,11 @@ paths:
         - scope: account
           limit: 10
           windowSeconds: 900
+        - scope: global
+          group: login
+          limit: 300
+          windowSeconds: 300
+          programmatic: true
       requestBody:
         required: true
         content:
@@ -169,6 +195,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /auth/session:
     get:
@@ -200,14 +228,33 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /auth/password:
     post:
       operationId: changePassword
       summary: Trocar a própria senha
       description: |
-        Exige a senha atual. A nova precisa ter de 12 a 72 bytes UTF-8 e ser diferente da atual.
-        Revoga as outras sessões do usuário e limpa a pendência `CHANGE_PASSWORD`.
+        Exige a senha atual. Revoga as outras sessões do usuário e limpa a pendência
+        `CHANGE_PASSWORD`; a sessão da requisição continua válida.
+
+        **Política da nova senha:** de 12 caracteres (pontos de código) a 72 bytes UTF-8, e diferente
+        da atual. Quem viola a política responde 422 `WEAK_PASSWORD`, e a igual à atual, 422
+        `PASSWORD_UNCHANGED`; nunca 400, por isso o schema de `newPassword` não declara `minLength`
+        nem `maxLength`. Senha atual errada → 422 `INVALID_CURRENT_PASSWORD`. Uma `currentPassword`
+        com mais de 72 **bytes** UTF-8 → 400 `VALIDATION_ERROR` (é validação de forma, como no login).
+
+        **Limites:** toda requisição gasta o rate limit da rota, a recusada também. A prova da senha
+        atual é um sign-in no Auth e gasta o orçamento global de logins (300 por 5 min,
+        `programmatic`): acima dele, 429.
+
+        **Cookie:** o 204 só traz `Set-Cookie` quando o token da sessão foi renovado durante a
+        chamada; o cookie é sempre o da própria sessão do usuário.
+
+        **503 `SERVICE_UNAVAILABLE`:** se a falha ocorrer depois de o Auth gravar a senha nova (ou
+        sem resposta que diga se gravou), a troca pode estar feita pela metade. Repita; se a senha
+        atual for recusada, repita usando a nova senha como senha atual.
       tags: [Auth]
       x-auth-policy:
         access: authenticated
@@ -217,6 +264,11 @@ paths:
         - scope: user
           limit: 5
           windowSeconds: 900
+        - scope: global
+          group: login
+          limit: 300
+          windowSeconds: 300
+          programmatic: true
       requestBody:
         required: true
         content:
@@ -225,7 +277,7 @@ paths:
               $ref: '#/components/schemas/ChangePasswordRequest'
       responses:
         '204':
-          $ref: '#/components/responses/NoContent'
+          $ref: '#/components/responses/NoContentSessionRefresh'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -242,6 +294,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /auth/mfa/totp/enroll:
     post:
@@ -280,6 +334,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /auth/mfa/totp/verify:
     post:
@@ -287,7 +343,20 @@ paths:
       summary: Verificar código TOTP (CEO)
       description: |
         Ativa o fator (no primeiro uso) e eleva a sessão para `aal2`. Os cookies são reescritos.
-        Código errado → 422 `INVALID_MFA_CODE`, contado no rate limit.
+
+        **Qual fator.** O corpo traz só o `code`: o servidor resolve o fator TOTP da própria sessão
+        autenticada (a identidade vem da credencial, nunca de um parâmetro). Com fator verificado
+        (login em dispositivo novo, `VERIFY_MFA` pendente), é esse; sem nenhum verificado, é o fator
+        pendente do cadastro (`ENROLL_MFA`, logo depois de `enrollTotp`). Sem nenhum fator TOTP, ou
+        com mais de um fator no mesmo estado, a resposta é 422 `INVALID_MFA_CODE`: o app nunca cria
+        mais de um (o `enrollTotp` mantém um só) e o servidor nunca tenta o código em vários fatores.
+        O campo `factorId` está obsoleto, mas continua aceito: se enviado, precisa ser fator TOTP do
+        próprio usuário; um fator alheio, inexistente ou removido responde como código errado.
+
+        **Recusas.** Código errado, vencido, já usado (replay: o mesmo código do mesmo fator é
+        recusado por 120 s) ou fator inválido → 422 `INVALID_MFA_CODE`, sempre com a mesma resposta.
+        Toda requisição conta no rate limit da rota (5 por 5 min por usuário, inclusive a que acerta)
+        e no teto diário de 20 por usuário (`programmatic`): acima de qualquer um, 429.
       tags: [Auth]
       x-auth-policy:
         access: authenticated
@@ -297,6 +366,11 @@ paths:
         - scope: user
           limit: 5
           windowSeconds: 300
+        - scope: user
+          group: totp-verify-daily
+          limit: 20
+          windowSeconds: 86400
+          programmatic: true
       requestBody:
         required: true
         content:
@@ -331,6 +405,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /me/processes:
     get:
@@ -369,6 +445,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /me/processes/{processId}:
     get:
@@ -408,6 +486,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/clients:
     get:
@@ -453,6 +533,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       operationId: createClient
       summary: Criar cliente
@@ -497,6 +579,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/clients/{clientId}:
     get:
@@ -535,6 +619,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     patch:
       operationId: updateClient
       summary: Renomear, arquivar ou desarquivar cliente
@@ -582,6 +668,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/clients/{clientId}/users:
     get:
@@ -620,6 +708,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       operationId: provisionClientUser
       summary: Provisionar login para um cliente
@@ -725,6 +815,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/clients/{clientId}/users/{userId}/password-reset:
     post:
@@ -815,6 +907,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     post:
       operationId: createProcess
       summary: Criar processo para um cliente
@@ -868,6 +962,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/processes/{processId}:
     get:
@@ -906,6 +1002,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
     patch:
       operationId: updateProcess
       summary: Renomear ou cancelar processo
@@ -955,6 +1053,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/processes/{processId}/approvals:
     post:
@@ -1066,6 +1166,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /admin/stage-templates/default:
     get:
@@ -1099,6 +1201,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
 components:
   securitySchemes:
@@ -1110,6 +1214,17 @@ components:
         Cookie de sessão HttpOnly emitido por `POST /auth/login` (gerenciado por `@supabase/ssr`).
         Pode ser dividido em `__Host-rt-session.0`, `.1`… O access token interno expira em 15 min
         e é renovado de forma transparente; a sessão é checada no banco a cada requisição.
+
+        Um cookie vencido (ou que o servidor não consegue verificar sem chamar o Auth) faz o servidor
+        chamar o Auth, e cada IP tem um orçamento para isso (60 por 15 min, `x-rate-limit`
+        programático, grupo `session-upstream`). Um IP sem orçamento recebe 401 `UNAUTHENTICATED` em
+        qualquer operação autenticada, sem que o cookie seja apagado, até a janela passar.
+      x-rate-limit:
+        - scope: ip
+          group: session-upstream
+          limit: 60
+          windowSeconds: 900
+          programmatic: true
 
   parameters:
     ClientId:
@@ -1171,13 +1286,22 @@ components:
       description: '`__Host-rt-session=…; HttpOnly; Secure; SameSite=Lax; Path=/` (pode vir em chunks `.0`, `.1`).'
       schema:
         type: string
+    Set-Cookie-Session-Refresh:
+      description: |
+        Só presente quando o token da sessão foi renovado durante a requisição: o cookie da própria
+        sessão, `__Host-rt-session=…; HttpOnly; Secure; SameSite=Lax; Path=/` (pode vir em chunks).
+      required: false
+      schema:
+        type: string
 
   responses:
-    NoContent:
-      description: Sucesso sem corpo.
+    NoContentSessionRefresh:
+      description: Sucesso sem corpo. Se o token da sessão foi renovado na requisição, o cookie vem reescrito.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Set-Cookie:
+          $ref: '#/components/headers/Set-Cookie-Session-Refresh'
     NoContentClearCookie:
       description: Sessão encerrada; o cookie é expirado.
       headers:
@@ -1282,7 +1406,10 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     ServiceUnavailable:
-      description: Dependência indisponível ou lenta (`SERVICE_UNAVAILABLE`). Retry seguro.
+      description: |
+        Dependência indisponível ou lenta (`SERVICE_UNAVAILABLE`): limitador de taxa, banco ou Auth.
+        A operação falha fechada, ou seja, nada é liberado por causa da falha. Escritas são atômicas,
+        então repetir é seguro; a exceção, `changePassword`, está na descrição da operação.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
@@ -1491,12 +1618,18 @@ components:
           type: string
           minLength: 1
           maxLength: 72
+          description: |
+            No máximo 72 **bytes** UTF-8 (`maxLength` conta caracteres e só descarta o excesso
+            óbvio: com letras de mais de um byte, 72 caracteres já passam de 72 bytes). Acima de 72
+            bytes → 400 `VALIDATION_ERROR`. Se é a senha certa, só o servidor sabe: errada → 422
+            `INVALID_CURRENT_PASSWORD`.
           writeOnly: true
         newPassword:
           type: string
-          minLength: 12
-          maxLength: 72
-          description: De 12 caracteres a 72 bytes UTF-8, diferente da atual.
+          description: |
+            Política: de 12 caracteres (pontos de código) a 72 bytes UTF-8, e diferente da atual.
+            Sem `minLength`/`maxLength` de propósito: qualquer string que viole a política é 422
+            `WEAK_PASSWORD` (E-12), nunca 400. O corpo inteiro é limitado a 16 KiB (413).
           writeOnly: true
     TotpEnrollment:
       type: object
@@ -1519,10 +1652,16 @@ components:
     TotpVerifyRequest:
       type: object
       additionalProperties: false
-      required: [factorId, code]
+      required: [code]
       properties:
         factorId:
           $ref: '#/components/schemas/Uuid'
+          deprecated: true
+          description: |
+            Obsoleto: omita. Sem ele o servidor usa o fator TOTP da sessão (ver `verifyTotp`). Se
+            enviado, precisa ser fator TOTP do próprio usuário; fator alheio, inexistente ou removido
+            → 422 `INVALID_MFA_CODE`, igual a um código errado. Nunca amplia o acesso: a identidade
+            vem da sessão.
         code:
           type: string
           pattern: '^[0-9]{6}$'
