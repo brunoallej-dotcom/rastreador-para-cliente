@@ -357,7 +357,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
     - o nome do cliente que podia ir ao log pelo `cause`;
     - o mapeamento 409 morto e o `FOR NO KEY UPDATE`;
     - as lacunas de contrato nos testes.
-  - **F-51 (clientes duplicados, retry da criação) fica com o usuário:** as duas correções
+  - **F-51 (clientes duplicados, retry da criação) fica com o usuário:** (decidido depois, opção (a): ver a entrada F-51 abaixo) as duas correções
     (índice único com 409, `Idempotency-Key`) mudam o contrato.
   - Flakes antigos corrigidos sem sleep: F-01, a virada da janela de 15 min no meio do teste, e
     F-05, o tempo da recusa sob carga.
@@ -365,3 +365,27 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   `draft.2` na main: `pnpm verify` → 1861 unit + 673 pgTAP; `pnpm db:lint` ok; `pnpm db:types` sem diff;
   `pnpm test:api` → 247/247; `pnpm test:api -t "AC-11|E-29"` → 47 verdes; `pnpm test:int` → 22/22;
   `build` e `format:check` ok; `pnpm sast` sem achados (subagente).
+
+### 2026-11-16 — F-51: nome de cliente único (complemento da Onda 6)
+
+- O usuário escolheu a opção (a) do F-51.
+- Entregue por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 6.1:
+  - **Contrato `1.0.0-draft.3`:** 409 `CONFLICT` em `createClient` e `updateClient`. O texto do
+    `ServiceUnavailable` foi corrigido, porque o retry de uma criação já gravada agora responde 409.
+  - **Migration `client_name_unique`:** índice único parcial `clients_active_name_key` sobre
+    `lower(NFKC(nome))`, ignorando marcas invisíveis de variação e sequências de espaços, só entre
+    os clientes não arquivados.
+  - `create_client` e `update_client` redefinidas e devolvendo `CLIENT_NAME_TAKEN`, inclusive ao
+    renomear ou desarquivar para um nome em uso.
+  - Deadlock ou falha de serialização (`40P01`, `40001`) vira 503 pelo SQLSTATE.
+- Revisões: code-reviewer, rls-auditor e contract-guardian. Nenhum CRÍTICO. Corrigidos: marcas
+  invisíveis na chave, texto do contrato preciso sobre o que conta como o mesmo nome, mapeamento
+  explícito do deadlock, lacunas do pgTAP.
+- **Resíduos:**
+  - homóglifos de outro alfabeto ("А" cirílico) e "ß"/"ss" passam; a Onda 7 deve mostrar o id do
+    cliente no provisionamento;
+  - a chave depende do locale do banco: a Onda 11 confere o locale hospedado, e é preciso
+    `REINDEX INDEX public.clients_active_name_key` depois de troca de ICU ou de versão major.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`: `pnpm verify` → 1879
+  unit + 768 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` → 266/266;
+  `test:api -t "E-4"` → 19; `test:int` → 22/22; `build` e `format:check` ok.
