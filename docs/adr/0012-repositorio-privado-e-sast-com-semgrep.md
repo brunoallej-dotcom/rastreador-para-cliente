@@ -1,6 +1,6 @@
 # ADR 0012 — Repositório privado até o go-live e SAST com Semgrep CE no lugar do CodeQL
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto

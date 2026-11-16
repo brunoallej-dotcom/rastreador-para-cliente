@@ -73,6 +73,7 @@ Testes unitários ficam ao lado do código (`*.test.ts`); integração usa `*.in
 | `pnpm db:types` | Gera `src/shared/db/database.types.ts` |
 | `pnpm db:new <nome>` | Nova migration com timestamp |
 | `pnpm contract:lint` | Lint do contrato OpenAPI (Redocly) |
+| `pnpm sast` / `pnpm sast:test` | SAST com Semgrep CE em Docker, igual ao job `sast` do CI (ADR 0012) / testa as regras locais de `.semgrep/` |
 | `pnpm verify` | lint + typecheck + test + contract:lint + db:test |
 | `pnpm ceo:create --email … --name …` | Cria conta de CEO (operação manual; usa a secret key do ambiente alvo) |
 
