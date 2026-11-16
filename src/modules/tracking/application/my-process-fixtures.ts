@@ -1,8 +1,18 @@
 // Fixtures shared by the unit tests of the client panel use cases. Imported by tests only.
+import { vi } from 'vitest';
 import type { MyProcessDetail, MyStage } from '../domain/client-process-queries';
 import type { StageStatus } from '../domain/stage';
+import type { PanelLogger } from './my-tenant';
 
 const AT = new Date('2026-01-01T00:00:00.000Z');
+
+/** A logger that records what the use cases log, for the tests that check the trail and the signals. */
+export function panelLoggerFixture() {
+  const info = vi.fn();
+  const error = vi.fn();
+  const logger: PanelLogger = { info, error };
+  return { logger, info, error };
+}
 
 /** A stage with every field set; `completed` and `in_progress` ones have started, as the table asks. */
 export function myStageFixture(overrides: Partial<MyStage> & Pick<MyStage, 'position'>): MyStage {

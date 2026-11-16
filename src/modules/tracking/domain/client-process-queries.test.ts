@@ -29,9 +29,23 @@ describe('progressPercent', () => {
     }
   });
 
-  it('is 0 for a process with no stage, instead of NaN', () => {
-    expect(progressPercent({ completedStages: 0, totalStages: 0 })).toBe(0);
-  });
+  it.each([
+    ['no stage', 0, 0],
+    ['a negative total', -1, -3],
+    ['more completed than stages', 4, 3],
+    ['a negative count of completed stages', -1, 3],
+    ['more than 30 stages', 31, 31],
+    ['a count that is not a whole number', 1.5, 3],
+    ['a total that is not a whole number', 1, 2.5],
+    ['NaN', Number.NaN, 3],
+  ])(
+    'fails closed on %s: it throws, it does not answer 0 or more than 100',
+    (_label, done, total) => {
+      expect(() => progressPercent({ completedStages: done, totalStages: total })).toThrow(
+        RangeError,
+      );
+    },
+  );
 });
 
 const stages = (...statuses: StageStatus[]) =>

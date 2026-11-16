@@ -1,8 +1,8 @@
 import type { InvariantViolation, ProcessListPosition, ProcessStatus } from './process';
-import type { StageStatus } from './stage';
+import { MAX_STAGES_PER_PROCESS, type StageStatus } from './stage';
 
 /**
- * What a client sees of its own processes (spec §3.6.1, RF-13): the read side of the panel, apart
+ * What a client sees of its own processes (spec §3.5.1, RF-13): the read side of the panel, apart
  * from the `Process` aggregate (spec §3.2, "query service"). It carries ONLY what the contract's
  * `MyProcess*` schemas carry: no `version`, no `clientId`, no stage or CEO ids, no approval, no
  * `cancelledAt`. Whatever is not here cannot reach the response, whoever maps it.
@@ -77,12 +77,28 @@ export interface ClientProcessQueries {
  * The progress a client sees, a whole number from 0 to 100: the completed stages over all of them,
  * rounded to the nearest integer (1 of 3 is 33, 2 of 3 is 67). With at most 30 stages, 100 happens
  * only when every stage is completed. The contract names the field and its range, not the rounding.
+ *
+ * It is undefined for a process that breaks I1 (no stage, more than 30, more completed than there are,
+ * counts that are not whole numbers), and then it THROWS: answering 0 would show a broken process as one
+ * that has not started, and a number above 100 would break the contract. The read side already refuses
+ * such a process (`summaryViolations`, 500); this is the second line, so no mapper can turn a defect
+ * into a believable number (fail closed).
  */
 export function progressPercent(
   summary: Pick<MyProcessSummary, 'completedStages' | 'totalStages'>,
 ): number {
-  if (summary.totalStages <= 0) return 0;
-  return Math.round((100 * summary.completedStages) / summary.totalStages);
+  const { completedStages, totalStages } = summary;
+  if (
+    !Number.isInteger(totalStages) ||
+    !Number.isInteger(completedStages) ||
+    totalStages < 1 ||
+    totalStages > MAX_STAGES_PER_PROCESS ||
+    completedStages < 0 ||
+    completedStages > totalStages
+  ) {
+    throw new RangeError('the progress of a process that breaks I1 is undefined');
+  }
+  return Math.round((100 * completedStages) / totalStages);
 }
 
 /** Where a stage status sits in the order a process walks them: done, then current, then waiting. */

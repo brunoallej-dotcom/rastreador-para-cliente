@@ -2,7 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
-import { ValidationError } from '@/shared/kernel';
+import { ServiceUnavailableError, ValidationError } from '@/shared/kernel';
 import type { Logger } from '@/shared/observability/logger';
 import {
   stageOrderViolations,
@@ -24,6 +24,13 @@ import { timestampSchema } from './timestamp-schema';
 
 /** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
 const DATA_EXCEPTION_CLASS = '22';
+/**
+ * Postgres rolled the statement back and nothing of it persisted: `deadlock_detected` and
+ * `serialization_failure`. For a read it means "try again", which is a 503 with `Retry-After`, never a
+ * 500 that blames the code. The SQLSTATE is matched on its own, whatever the HTTP status PostgREST
+ * chose for it, as the writes of `supabase-process-repository.ts` do.
+ */
+const ROLLED_BACK_TRANSIENTLY: ReadonlySet<string> = new Set(['40P01', '40001']);
 
 /**
  * The columns of `processes` the panel reads, explicit (no `select *`): no `version` (the contract has
@@ -64,6 +71,13 @@ const processRowSchema = z.object({
   completed_at: timestampSchema.nullable(),
   cancelled_at: timestampSchema.nullable(),
 });
+
+/**
+ * The two members the tenant check needs, and nothing else. It runs on the raw rows BEFORE the full
+ * schemas, so a row of another tenant that is also malformed still raises the tenant alarm instead of
+ * "not understood" (F-98): the more serious signal wins.
+ */
+const tenantIdentitySchema = z.object({ id: z.guid(), client_id: z.guid() });
 
 const stagePositionSchema = z.number().int().min(1).max(MAX_STAGES_PER_PROCESS);
 
@@ -153,11 +167,15 @@ function toDetail(row: DetailRow): MyProcessDetail {
 const notUnderstood = () => new Error('the processes table returned a row that is not understood');
 
 /**
- * What may travel as the `cause` of an error: the SQLSTATE, never the message or the details of the
- * database error. Those can carry the row ("Failing row contains (..., <title>)") and the logger
- * writes the `cause` chain of every 5xx error, so a title would end up in the logs (SEC-16).
+ * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message, the
+ * details or the hint of the database error. Those can carry the row ("Failing row contains (...,
+ * <title>)") and the logger writes the `cause` chain of every 5xx error, so a title would end up in the
+ * logs (SEC-16). The same shape as `supabase-process-repository.ts`.
  */
-const safeCause = (error: { code?: string }) => ({ code: error.code ?? '' });
+const safeCause = (error: { code?: string }, status: number) => ({
+  code: error.code ?? '',
+  status,
+});
 
 /** The refusal of a list position (the cursor) that the database could not read as a timestamp. */
 const invalidPosition = (code: string) =>
@@ -168,7 +186,7 @@ const invalidPosition = (code: string) =>
   );
 
 export type ClientProcessQueriesOptions = {
-  readonly logger: Pick<Logger, 'error'>;
+  readonly logger: Pick<Logger, 'error' | 'warn'>;
 };
 
 /**
@@ -180,9 +198,12 @@ export type ClientProcessQueriesOptions = {
  * The tenant is enforced three times: the query filters by the `clientId` of the session (the index
  * `processes (client_id, created_at DESC, id)` serves it), RLS filters by the profile of the session
  * (`private.current_client_id()`), and every row that comes back is compared with the tenant before
- * anything is mapped (`assertTenant`). The first two make a row of another client impossible; the
- * third turns a defect that lets one through (a policy dropped by a bad migration) into a 500 that
- * shows nothing, instead of a leak.
+ * anything is mapped (`assertTenant`). The first two are independent: a row of another client needs
+ * BOTH to fail. The third is what turns that double failure (a bug in the filter AND a policy dropped
+ * or loosened by a bad migration) into a 500 that shows nothing, instead of a leak. It is a tripwire for
+ * the two failing together, not a test of RLS: an RLS regression ALONE is invisible here, because the
+ * filter still holds, and is caught by pgTAP (003 and 018, which also inventory the policies of the three
+ * tables, F-97).
  *
  * Whatever comes back is validated with Zod, and a process that does not hold its invariants (no
  * stage, progress that does not add up) fails closed (500), as in the CEO panel (F-81).
@@ -204,10 +225,24 @@ export function createSupabaseClientProcessQueries(
       .retry(false);
 
   /**
+   * What a failed read becomes: a transaction Postgres rolled back is 503 (nothing was lost, trying again
+   * is safe), a slow or dead database is 503 (E-21), anything else is unexpected (500).
+   */
+  function readFailure(operation: string, error: { code?: string }, status: number): Error {
+    if (error.code !== undefined && ROLLED_BACK_TRANSIENTLY.has(error.code)) {
+      return new ServiceUnavailableError(`${operation}: the read was rolled back`, {
+        cause: safeCause(error, status),
+      });
+    }
+    return upstreamFailure(operation, safeCause(error, status), status);
+  }
+
+  /**
    * What a failed list query becomes. A position the database cannot read (class 22: a timestamp out
    * of range, an offset it refuses) is the caller's cursor, so it is a 400 on `query.cursor`; the
-   * cursor schema already bounds what it accepts, this is the backstop for what slips through.
-   * Anything else is unexpected (500) or an outage (503).
+   * cursor schema already bounds what it accepts, this is the backstop for what slips through, and a
+   * warning says it did (F-98: the bounds of the schema and of the database drifted apart). Anything else
+   * is `readFailure`.
    */
   function listFailure(
     error: { code?: string },
@@ -215,20 +250,24 @@ export function createSupabaseClientProcessQueries(
     after: ProcessListPosition | undefined,
   ): Error {
     if (after !== undefined && error.code?.startsWith(DATA_EXCEPTION_CLASS) === true) {
+      options.logger.warn(
+        { event: 'tracking.client_panel_cursor_refused', code: error.code },
+        'tracking.client_panel_cursor_refused',
+      );
       return invalidPosition(error.code);
     }
-    return upstreamFailure('list the client processes', safeCause(error), status);
+    return readFailure('list the client processes', error, status);
   }
 
   /**
    * A row that is not the tenant's is a defect (the filter and RLS both failed): fail closed, name the
-   * process and nothing else (no title, no client id), and map none of the rows.
+   * process and nothing else (no title, no client id), and map none of the rows. It reads the RAW rows with
+   * the two-member schema above, so it runs before, and whatever else is wrong with a foreign row.
    */
-  function assertTenant(
-    clientId: string,
-    rows: readonly { id: string; client_id: string }[],
-  ): void {
-    const foreign = rows.find((row) => row.client_id !== clientId);
+  function assertTenant(clientId: string, rawRows: unknown): void {
+    const identities = z.array(tenantIdentitySchema).safeParse(rawRows);
+    if (!identities.success) throw notUnderstood();
+    const foreign = identities.data.find((row) => row.client_id !== clientId);
     if (foreign === undefined) return;
     options.logger.error(
       { event: 'tracking.client_panel_tenant_mismatch', processId: foreign.id },
@@ -252,7 +291,9 @@ export function createSupabaseClientProcessQueries(
     throw new Error('a process read from the database breaks its invariants');
   }
 
-  function parseSummaryRows(data: unknown): SummaryRow[] {
+  /** The tenant first, then the shape: see `assertTenant`. */
+  function parseSummaryRows(clientId: string, data: unknown): SummaryRow[] {
+    assertTenant(clientId, data);
     const parsed = z.array(summaryRowSchema).safeParse(data);
     if (!parsed.success) throw notUnderstood();
     return parsed.data;
@@ -275,7 +316,7 @@ export function createSupabaseClientProcessQueries(
           .order('id', { ascending: true })
           .limit(wanted);
         if (sameInstant.error) throw listFailure(sameInstant.error, sameInstant.status, after);
-        rows.push(...parseSummaryRows(sameInstant.data));
+        rows.push(...parseSummaryRows(clientId, sameInstant.data));
       }
 
       if (rows.length < wanted) {
@@ -286,18 +327,20 @@ export function createSupabaseClientProcessQueries(
         if (after !== undefined) older = older.lt('created_at', after.createdAt);
         const result = await older;
         if (result.error) throw listFailure(result.error, result.status, after);
-        rows.push(...parseSummaryRows(result.data));
+        rows.push(...parseSummaryRows(clientId, result.data));
       }
 
-      assertTenant(clientId, rows);
+      // The invariants are checked on EVERY row that was fetched, the lookahead row included (it is the
+      // first row of the next page), so one rule holds for all of them: a corrupt process fails the page
+      // that contains it and the page before it, which is the one that would have pointed at it
+      // (fail closed: the panel never shows a page that was read next to a defect).
+      for (const row of rows) failOnViolations(row.id, summaryViolations(countersOfSummary(row)));
       const pageRows = rows.slice(0, limit);
       const last = pageRows.at(-1);
       const next: ProcessListPosition | null =
         rows.length > limit && last !== undefined
           ? { createdAt: last.created_at, id: last.id }
           : null;
-      for (const row of pageRows)
-        failOnViolations(row.id, summaryViolations(countersOfSummary(row)));
       return { items: pageRows.map(toSummary), next };
     },
 
@@ -310,12 +353,12 @@ export function createSupabaseClientProcessQueries(
         .order('position', { referencedTable: 'stages', ascending: true })
         .retry(false)
         .maybeSingle();
-      if (error) throw upstreamFailure('read the client process', safeCause(error), status);
+      if (error) throw readFailure('read the client process', error, status);
       if (data === null) return null;
 
+      assertTenant(clientId, [data]);
       const parsed = detailRowSchema.safeParse(data);
       if (!parsed.success) throw notUnderstood();
-      assertTenant(clientId, [parsed.data]);
 
       const detail = toDetail(parsed.data);
       failOnViolations(detail.id, [

@@ -27,7 +27,9 @@ export function createGetMyProcessHandler(route: WithRoute = withRoute) {
       const supabase = getRequestSupabase({ request, cookies, requestId });
       const queries = createSupabaseClientProcessQueries(supabase, { logger });
 
-      const result = await getMyProcess({ queries }, principal, { processId: params.processId });
+      const result = await getMyProcess({ queries, logger }, principal, {
+        processId: params.processId,
+      });
       return result.ok ? json(200, toMyProcessDetailDto(result.value)) : result.error;
     },
   );

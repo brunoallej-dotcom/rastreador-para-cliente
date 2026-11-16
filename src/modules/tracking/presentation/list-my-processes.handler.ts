@@ -38,7 +38,7 @@ export function createListMyProcessesHandler(route: WithRoute = withRoute) {
       const supabase = getRequestSupabase({ request, cookies, requestId });
       const queries = createSupabaseClientProcessQueries(supabase, { logger });
 
-      const result = await listMyProcesses({ queries }, principal, {
+      const result = await listMyProcesses({ queries, logger }, principal, {
         query: { limit: query.limit, ...(after === undefined ? {} : { after }) },
       });
       return result.ok ? json(200, toMyProcessListDto(result.value)) : result.error;

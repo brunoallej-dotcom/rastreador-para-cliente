@@ -11,7 +11,7 @@
 //
 // One CEO per group that writes a lot: a CEO has 60 writes a minute, refused ones included.
 import { randomUUID } from 'node:crypto';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createClientOrFail,
   createClientViaApi,
@@ -37,18 +37,21 @@ import {
   updateClientUserViaApi,
 } from '../helpers/client-users';
 import { expectToMatchContract } from '../helpers/contract';
+import { POST as logoutRoute } from '@/app/api/v1/auth/logout/route';
 import {
   approveCurrentStageAsFixture,
+  deleteProcessFixture,
   insertProcessesAtFixture,
   insertProcessWithoutStagesFixture,
 } from '../helpers/db';
 import {
-  bodyOf,
   createCookieStore,
+  invoke,
   observableHeaders,
   spyOnSupabaseFetch,
   textOf,
   withoutRequestId,
+  type CookieStore,
 } from '../helpers/http';
 import { loginAsCeoWithMfa, type CeoWithMfa } from '../helpers/mfa';
 import { changePassword, sessionJarFor } from '../helpers/password';
@@ -285,6 +288,14 @@ describe('GET /me/processes', () => {
       progressPercent: 25,
       currentStage: { position: 2, name: 'Briefing' },
     });
+  });
+
+  it('SEC-14: a 200 of the list carries Cache-Control: no-store, so no cache keeps what one client read', async () => {
+    const response = await listMyProcessesViaApi(a.login.cookies);
+    await expectContract<MyProcessListBody>('listMyProcesses', response);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
   });
 
   it('AC-20: the list equals what the CEO sees of the same processes, minus the internal fields', async () => {
@@ -586,6 +597,14 @@ describe('GET /me/processes/{processId}', () => {
     expect(body.stages[2]).toMatchObject({ startedAt: null, completedAt: null });
   });
 
+  it('SEC-14: a 200 of the detail carries Cache-Control: no-store, so no cache keeps what one client read', async () => {
+    const response = await getMyProcessViaApi(a.login.cookies, a.active);
+    await expectContract<MyProcessDetailBody>('getMyProcess', response);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
   it('AC-20: the detail equals what the CEO sees of the same process, minus the internal fields', async () => {
     for (const process of a.processes) {
       const response = await getMyProcessViaApi(a.login.cookies, process.id);
@@ -729,7 +748,9 @@ describe('GET /me/processes/{processId}', () => {
     // and the other way round
     for (const process of a.processes) {
       const asB = await getMyProcessViaApi(b.login.cookies, process.id);
+      const body = await expectContract<Problem>('getMyProcess', asB);
       expect(asB.status).toBe(404);
+      expect(body.code).toBe('NOT_FOUND');
     }
   });
 
@@ -833,6 +854,44 @@ describe('who may read the client panel', () => {
     }
   });
 
+  /** `POST /auth/logout` through the real route: how a browser ends its session. */
+  const logout = (cookies: CookieStore) =>
+    invoke(logoutRoute, { method: 'POST', path: '/auth/logout', cookies });
+
+  it('AC-04: after logout the old cookie is 401 UNAUTHENTICATED on GET /me/processes, with the JWT still valid', async () => {
+    const login = await signedInClientLogin(ceo.cookies, a.tenant.id);
+    const oldCookie = login.cookies.clone();
+    const before = await listMyProcessesViaApi(oldCookie);
+    await expectContract<MyProcessListBody>('listMyProcesses', before);
+    expect(before.status).toBe(200);
+
+    const loggedOut = await logout(login.cookies);
+    expectToMatchContract('logout', 204, undefined, loggedOut);
+    expect(loggedOut.status).toBe(204);
+
+    const reused = await listMyProcessesViaApi(oldCookie);
+    const body = await expectContract<Problem>('listMyProcesses', reused);
+    expect(reused.status).toBe(401);
+    expect(body.code).toBe('UNAUTHENTICATED');
+  });
+
+  it('AC-04: after logout the old cookie is 401 UNAUTHENTICATED on GET /me/processes/{processId}, with the JWT still valid', async () => {
+    const login = await signedInClientLogin(ceo.cookies, a.tenant.id);
+    const oldCookie = login.cookies.clone();
+    const before = await getMyProcessViaApi(oldCookie, a.active);
+    await expectContract<MyProcessDetailBody>('getMyProcess', before);
+    expect(before.status).toBe(200);
+
+    const loggedOut = await logout(login.cookies);
+    expectToMatchContract('logout', 204, undefined, loggedOut);
+    expect(loggedOut.status).toBe(204);
+
+    const reused = await getMyProcessViaApi(oldCookie, a.active);
+    const body = await expectContract<Problem>('getMyProcess', reused);
+    expect(reused.status).toBe(401);
+    expect(body.code).toBe('UNAUTHENTICATED');
+  });
+
   it('E-81: a client that still has the temporary password is 403 PASSWORD_CHANGE_REQUIRED on both routes, and is let in after the change', async () => {
     const created = await provisionOrFail(ceo.cookies, a.tenant.id);
     const jar = await sessionJarFor({
@@ -867,21 +926,26 @@ describe('who may read the client panel', () => {
     const doomed = await signedInClientLogin(ceo.cookies, tenant.id);
     const keeper = await signedInClientLogin(ceo.cookies, tenant.id);
     const process = await createProcessOrFail(ceo.cookies, tenant.id);
-    expect((await listMyProcessesViaApi(doomed.cookies)).status).toBe(200);
+    const before = await listMyProcessesViaApi(doomed.cookies);
+    await expectContract<MyProcessListBody>('listMyProcesses', before);
+    expect(before.status).toBe(200);
 
     const disabled = await updateClientUserViaApi(ceo.cookies, tenant.id, doomed.userId, {
       disabled: true,
     });
+    await expectContract('updateClientUser', disabled);
     expect(disabled.status).toBe(200);
 
-    for (const response of [
-      await listMyProcessesViaApi(doomed.cookies),
-      await getMyProcessViaApi(doomed.cookies, process.id),
-    ]) {
+    for (const [operationId, response] of [
+      ['listMyProcesses', await listMyProcessesViaApi(doomed.cookies)],
+      ['getMyProcess', await getMyProcessViaApi(doomed.cookies, process.id)],
+    ] as const) {
+      const body = await expectContract<Problem>(operationId, response);
       expect(response.status).toBe(401);
-      expect((await bodyOf(response)) as Problem).toMatchObject({ code: 'UNAUTHENTICATED' });
+      expect(body.code).toBe('UNAUTHENTICATED');
     }
     const kept = await getMyProcessViaApi(keeper.cookies, process.id);
+    await expectContract<MyProcessDetailBody>('getMyProcess', kept);
     expect(kept.status).toBe(200);
   });
 
@@ -891,26 +955,36 @@ describe('who may read the client panel', () => {
     const process = await createProcessOrFail(ceo.cookies, tenant.id);
 
     const archived = await updateClientViaApi(ceo.cookies, tenant.id, { archived: true });
+    await expectContract('updateClient', archived);
     expect(archived.status).toBe(200);
 
-    const list = await expectContract<MyProcessListBody>(
-      'listMyProcesses',
-      await listMyProcessesViaApi(login.cookies),
-    );
+    const listed = await listMyProcessesViaApi(login.cookies);
+    const list = await expectContract<MyProcessListBody>('listMyProcesses', listed);
     const detail = await getMyProcessViaApi(login.cookies, process.id);
+    const detailBody = await expectContract<MyProcessDetailBody>('getMyProcess', detail);
+    expect(listed.status).toBe(200);
     expect(idsOf(list.items)).toEqual([process.id]);
     expect(detail.status).toBe(200);
+    expect(detailBody.id).toBe(process.id);
   });
 });
 
 // ----------------------------------------------------------------------------- failure modes ----
 
 describe('the client panel when the data or the database is not healthy', () => {
+  /** Processes without stages that the tests below made: removed afterwards, so no corrupt row is left behind. */
+  const strayProcessIds: string[] = [];
+
+  afterAll(async () => {
+    for (const id of strayProcessIds) await deleteProcessFixture(id);
+  });
+
   it('E-82: a process with no stage fails the read closed (500 INTERNAL_ERROR, nothing of it shown), the list and the detail, and no other client is affected', async () => {
     const tenant = await createClientOrFail(ceo.cookies);
     const login = await signedInClientLogin(ceo.cookies, tenant.id);
     const healthy = await createProcessOrFail(ceo.cookies, tenant.id);
     const brokenId = await insertProcessWithoutStagesFixture(tenant.id, 'Sem fases');
+    strayProcessIds.push(brokenId);
 
     const list = await listMyProcessesViaApi(login.cookies);
     const detail = await getMyProcessViaApi(login.cookies, brokenId);
@@ -925,8 +999,18 @@ describe('the client panel when the data or the database is not healthy', () => 
     expect(JSON.stringify([listBody, detailBody])).not.toContain('Sem fases');
     expect(JSON.stringify([listBody, detailBody])).not.toContain(brokenId);
     // the healthy process of the same client is still readable by id, and other clients are untouched
+    await expectContract<MyProcessDetailBody>('getMyProcess', healthyDetail);
     expect(healthyDetail.status).toBe(200);
-    expect((await listMyProcessesViaApi(a.login.cookies)).status).toBe(200);
+    const others = await listMyProcessesViaApi(a.login.cookies);
+    await expectContract<MyProcessListBody>('listMyProcesses', others);
+    expect(others.status).toBe(200);
+
+    // the failure is the DATA: once the corrupt row is gone, the same client reads its list again
+    expect(await deleteProcessFixture(brokenId)).toBe(true);
+    const recovered = await listMyProcessesViaApi(login.cookies);
+    const recoveredBody = await expectContract<MyProcessListBody>('listMyProcesses', recovered);
+    expect(recovered.status).toBe(200);
+    expect(idsOf(recoveredBody.items)).toEqual([healthy.id]);
   });
 
   it('E-21: both routes answer 503 SERVICE_UNAVAILABLE with a Retry-After, not a 500, when the database cannot be reached', async () => {
@@ -985,9 +1069,48 @@ describe('the rate limit of the client panel (x-rate-limit: 300 / min per user)'
       expect(retryAfter).toBeGreaterThanOrEqual(1);
       expect(retryAfter).toBeLessThanOrEqual(60);
     }
+    // the counter is shared by the two reads of the panel: the detail of the same login is throttled too
+    const detail = await getMyProcessViaApi(limited.cookies, UNKNOWN_ID);
+    const detailBody = await expectContract<Problem>('getMyProcess', detail);
+    expect(detail.status).toBe(429);
+    expect(detailBody.code).toBe('RATE_LIMITED');
+    const detailRetryAfter = Number(detail.headers.get('retry-after'));
+    expect(detailRetryAfter).toBeGreaterThanOrEqual(1);
+    expect(detailRetryAfter).toBeLessThanOrEqual(60);
     // another login of the same client has a budget of its own
     const other = await listMyProcessesViaApi(bystander.cookies);
     expect(other.status).toBe(200);
     expect((await expectContract<MyProcessListBody>('listMyProcesses', other)).items).toEqual([]);
   }, 180_000);
+});
+
+// ----------------------------------------------------------------------------------- fixtures ----
+
+describe('the psql fixtures of tests/helpers/db.ts, against the database (F-103)', () => {
+  it('F-103: the approval fixture refuses a process that is not active, says why, and leaves it exactly as it was', async () => {
+    const view = async (processId: string) =>
+      expectContract<MyProcessDetailBody>(
+        'getMyProcess',
+        await getMyProcessViaApi(a.login.cookies, processId),
+      );
+    const cancelledBefore = await view(a.cancelled);
+    const completedBefore = await view(a.completed);
+
+    await expect(approveCurrentStageAsFixture(a.cancelled, ceo.ceo.id)).rejects.toThrow(
+      'the fixture was refused: the process is not active',
+    );
+    await expect(approveCurrentStageAsFixture(a.completed, ceo.ceo.id)).rejects.toThrow(
+      'the fixture was refused: the process is not active',
+    );
+
+    expect(await view(a.cancelled)).toEqual(cancelledBefore);
+    expect(await view(a.completed)).toEqual(completedBefore);
+  });
+
+  it('F-103: the approval fixture refuses a process that does not exist, and the delete fixture says there was nothing to delete', async () => {
+    await expect(approveCurrentStageAsFixture(UNKNOWN_ID, ceo.ceo.id)).rejects.toThrow(
+      'the fixture was refused: the process is not active',
+    );
+    expect(await deleteProcessFixture(UNKNOWN_ID)).toBe(false);
+  });
 });

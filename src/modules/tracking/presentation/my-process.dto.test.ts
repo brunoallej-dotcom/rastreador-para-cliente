@@ -181,4 +181,19 @@ describe('toMyProcessSummaryDto and toMyProcessListDto', () => {
     expect(decodeMyProcessCursor(more.nextCursor ?? '')).toEqual({ ok: true, value: position });
     expect(last).toEqual({ items: [], nextCursor: null });
   });
+
+  it('F-81: a process whose counts break I1 is not mapped into a believable progress: the mapping throws (500 path)', () => {
+    const healthy = summary('00000000-0000-4000-8000-0000000001a1');
+
+    for (const broken of [
+      { ...healthy, totalStages: 0, completedStages: 0 },
+      { ...healthy, totalStages: 3, completedStages: 4 },
+    ]) {
+      expect(() => toMyProcessSummaryDto(broken)).toThrow(RangeError);
+      expect(() => toMyProcessListDto({ items: [healthy, broken], next: null })).toThrow(
+        RangeError,
+      );
+      expect(() => toMyProcessDetailDto({ ...broken, stages: [] })).toThrow(RangeError);
+    }
+  });
 });

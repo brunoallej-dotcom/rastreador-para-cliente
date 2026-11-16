@@ -133,7 +133,7 @@ function fakeSupabase(outcomes: Outcome[]) {
 }
 
 const queriesOver = (outcomes: Outcome[]) => {
-  const logger = { error: vi.fn() };
+  const logger = { error: vi.fn(), warn: vi.fn() };
   const fake = fakeSupabase(outcomes);
   return {
     queries: createSupabaseClientProcessQueries(fake.supabase, { logger }),
@@ -360,7 +360,7 @@ describe('find', () => {
     await expect(half.queries.find(TENANT, P1)).rejects.toThrow('breaks its invariants');
   });
 
-  it('E-21: a slow or dead database is a ServiceUnavailableError, with only the SQLSTATE as cause', async () => {
+  it('E-21: a slow or dead database is a ServiceUnavailableError, with only the SQLSTATE and the status as cause', async () => {
     const { queries } = queriesOver([
       {
         data: null,
@@ -372,7 +372,7 @@ describe('find', () => {
     const error = await queries.find(TENANT, P1).catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ServiceUnavailableError);
-    expect((error as Error).cause).toEqual({ code: 'PGRST000' });
+    expect((error as Error).cause).toEqual({ code: 'PGRST000', status: 503 });
     expect(JSON.stringify((error as Error).cause)).not.toContain('secreto');
   });
 
@@ -385,7 +385,56 @@ describe('find', () => {
 
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(ServiceUnavailableError);
-    expect((error as Error).cause).toEqual({ code: 'XX000' });
+    expect((error as Error).cause).toEqual({ code: 'XX000', status: 400 });
+  });
+
+  it.each(['40P01', '40001'])(
+    'a read that Postgres rolled back (%s) is 503, whatever the HTTP status, with the SQLSTATE and the status as cause',
+    async (code) => {
+      for (const status of [400, 500]) {
+        const { queries } = queriesOver([failure(code, 'Failing row (Processo secreto)', status)]);
+
+        const error = await queries.find(TENANT, P1).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(ServiceUnavailableError);
+        expect((error as Error).cause).toEqual({ code, status });
+        expect(JSON.stringify((error as Error).cause)).not.toContain('secreto');
+      }
+    },
+  );
+
+  it('F-98: a row of another tenant that is ALSO malformed still raises the tenant alarm, not "not understood"', async () => {
+    const { queries, logger } = queriesOver([
+      answer(
+        detailRowOf(P1, [stageRowOf(1, 'in_progress')], {
+          client_id: OTHER_TENANT,
+          status: 'archived',
+          created_at: 'yesterday',
+          title: 42,
+        }),
+      ),
+    ]);
+
+    await expect(queries.find(TENANT, P1)).rejects.toThrow('not the tenant of the session');
+
+    expect(logger.error).toHaveBeenCalledWith(
+      { event: 'tracking.client_panel_tenant_mismatch', processId: P1 },
+      'tracking.client_panel_tenant_mismatch',
+    );
+  });
+
+  it('a row with no readable id or client id is not understood, and raises no tenant alarm', async () => {
+    const noClient = queriesOver([
+      answer({ ...detailRowOf(P1, [stageRowOf(1, 'in_progress')]), client_id: null }),
+    ]);
+    const noId = queriesOver([
+      answer({ ...detailRowOf(P1, [stageRowOf(1, 'in_progress')]), id: 'nope' }),
+    ]);
+
+    await expect(noClient.queries.find(TENANT, P1)).rejects.toThrow('not understood');
+    await expect(noId.queries.find(TENANT, P1)).rejects.toThrow('not understood');
+    expect(noClient.logger.error).not.toHaveBeenCalled();
+    expect(noId.logger.error).not.toHaveBeenCalled();
   });
 });
 
@@ -573,6 +622,24 @@ describe('list', () => {
     expect((error as Error).cause).toEqual({ code: '22008' });
   });
 
+  it('F-98: a position the database refused is logged as a warning with the SQLSTATE only, so a drift of the bounds is seen', async () => {
+    const { queries, logger } = queriesOver([
+      failure('22008', 'date/time field value out of range: "2026-01-01T00:00:00+15:59"'),
+    ]);
+
+    await queries
+      .list(TENANT, { limit: 5, after: { createdAt: SECOND, id: P1 } })
+      .catch((caught: unknown) => caught);
+
+    expect(logger.warn.mock.calls).toEqual([
+      [
+        { event: 'tracking.client_panel_cursor_refused', code: '22008' },
+        'tracking.client_panel_cursor_refused',
+      ],
+    ]);
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('2026');
+  });
+
   it('a class 22 error with no position given is not the caller fault: 500', async () => {
     const { queries } = queriesOver([failure('22008', 'out of range')]);
 
@@ -580,6 +647,81 @@ describe('list', () => {
 
     expect(error).not.toBeInstanceOf(ValidationError);
     expect(error).toBeInstanceOf(Error);
+  });
+
+  it('a class 22 error with no position given logs no cursor warning', async () => {
+    const { queries, logger } = queriesOver([failure('22008', 'out of range')]);
+
+    await queries.list(TENANT, { limit: 5 }).catch((caught: unknown) => caught);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(['40P01', '40001'])(
+    'a read that Postgres rolled back (%s) is 503 on the first query and on the second, with the SQLSTATE and the status as cause',
+    async (code) => {
+      const first = queriesOver([failure(code, 'Failing row (Processo secreto)', 500)]);
+      const second = queriesOver([
+        answer([]),
+        failure(code, 'Failing row (Processo secreto)', 400),
+      ]);
+
+      const firstError = await first.queries
+        .list(TENANT, { limit: 5 })
+        .catch((caught: unknown) => caught);
+      const secondError = await second.queries
+        .list(TENANT, { limit: 5, after: { createdAt: SECOND, id: P1 } })
+        .catch((caught: unknown) => caught);
+
+      expect(firstError).toBeInstanceOf(ServiceUnavailableError);
+      expect((firstError as Error).cause).toEqual({ code, status: 500 });
+      expect(secondError).toBeInstanceOf(ServiceUnavailableError);
+      expect((secondError as Error).cause).toEqual({ code, status: 400 });
+    },
+  );
+
+  it('F-98: a row of another tenant that is ALSO malformed still raises the tenant alarm, in the first query and in the second', async () => {
+    const foreignAndBroken = {
+      ...summaryRowOf(P2, SECOND, { clientId: OTHER_TENANT }),
+      total_stages: [],
+    };
+    const first = queriesOver([answer([summaryRowOf(P1, FIRST), foreignAndBroken])]);
+    const second = queriesOver([answer([]), answer([foreignAndBroken])]);
+
+    await expect(first.queries.list(TENANT, { limit: 5 })).rejects.toThrow(
+      'not the tenant of the session',
+    );
+    await expect(
+      second.queries.list(TENANT, { limit: 5, after: { createdAt: SECOND, id: P1 } }),
+    ).rejects.toThrow('not the tenant of the session');
+
+    for (const { logger } of [first, second]) {
+      expect(logger.error).toHaveBeenCalledWith(
+        { event: 'tracking.client_panel_tenant_mismatch', processId: P2 },
+        'tracking.client_panel_tenant_mismatch',
+      );
+    }
+  });
+
+  it('F-81: the invariants are checked on the lookahead row too: a corrupt process fails the page that points at it', async () => {
+    const corrupt = summaryRowOf(P2, SECOND, {
+      completed: 2,
+      current: [{ position: 1, name: 'x' }],
+    });
+    const { queries, logger } = queriesOver([answer([summaryRowOf(P1, FIRST), corrupt])]);
+
+    // limit 1: P1 is the page, P2 is only the row that tells there is a next page
+    await expect(queries.list(TENANT, { limit: 1 })).rejects.toThrow('breaks its invariants');
+
+    expect(logger.error).toHaveBeenCalledWith(
+      {
+        event: 'tracking.process_invariant_violated',
+        panel: 'client',
+        processId: P2,
+        invariants: ['I2'],
+      },
+      'tracking.process_invariant_violated',
+    );
   });
 
   it('E-21: a slow or dead database is a ServiceUnavailableError', async () => {
