@@ -411,7 +411,9 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   `auth.login.failed` (HMAC do e-mail, `ipHash` e uma categoria: `invalid_credentials`,
   `account_inactive`, `upstream_unavailable` ou `upstream_error`), `auth.logout` (userId,
   `sessionId`, `ipHash`), `auth.mfa.enrolled`, `auth.mfa.verified`,
-  `auth.mfa.failed`, `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo).
+  `auth.mfa.failed`, `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
+  `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
+  `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).
   `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
   diferentes dos valores gravados no banco: o log não guarda IP nem e-mail e não se liga às linhas
   de `rate_limit_counters`.

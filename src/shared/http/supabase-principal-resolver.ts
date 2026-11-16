@@ -238,7 +238,15 @@ export function createSupabasePrincipalResolver(
       // makes WebCrypto reject the key import with a DOMException, which the library does not wrap.
       // It is a verdict about the token, not an outage: 401. Deliberately narrow: only these two
       // error names of that one exception type, so a genuine bug still surfaces as a 500.
-      if (failed && isKeyImportRejection(failure)) return null;
+      if (failed && isKeyImportRejection(failure)) {
+        // Logged: if the project's own key ever started failing this way (a misconfigured key),
+        // every user would get 401, and this line is what tells that apart from forged tokens.
+        input.logger.warn(
+          { event: 'auth.session_key_rejected', errorName: failure.name },
+          'auth.session_key_rejected',
+        );
+        return null;
+      }
 
       if (failed) {
         forgetKidOnFailure(knownKids, session, failure, made);
@@ -269,7 +277,7 @@ export function createSupabasePrincipalResolver(
 
 const KEY_IMPORT_REJECTIONS: ReadonlySet<string> = new Set(['DataError', 'NotSupportedError']);
 
-function isKeyImportRejection(error: unknown): boolean {
+function isKeyImportRejection(error: unknown): error is DOMException {
   return error instanceof DOMException && KEY_IMPORT_REJECTIONS.has(error.name);
 }
 

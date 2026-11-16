@@ -4,11 +4,11 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-15). Ondas 0, 1 e 2 concluídas.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0, 1, 2 e 3 concluídas.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 3 — Identidade: autenticação (sessão principal).
+- **Próximas ondas:** 4 ∥ 5 — troca de senha + `ceo:create` e MFA TOTP (subagentes em worktree).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -17,7 +17,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ✅ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
-| 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |
+| 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
@@ -33,10 +33,11 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 | Pendência | Bloqueia |
 |-----------|----------|
-| Revisar e aceitar os ADRs 0001–0005 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
+| Revisar e aceitar os ADRs 0001–0009 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
+| F-03: bloqueio direcionado de conta (threat model T-04, §8): escolher a mudança no §3.9 da spec | risco aberto até a decisão |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
 | Ativar branch protection na `main` (o repositório remoto já existe) e restringir o merge a squash | CI da Onda 0 |
-| Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 3 (staging); Onda 11 (prod) |
+| Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
 | Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
 | Q-07 (retenção) e Q-12 (domínio) | Onda 11 |
@@ -152,3 +153,47 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 - Verificado: `pnpm lint && pnpm typecheck && pnpm test` (959) → exit 0; `pnpm test -t
   "AC-(22|23|26|27|29)"` → 115 verdes; `pnpm test:api` (health) → 4/4; `build`, `format:check`,
   `contract:lint` e `test:hooks` ok; nenhum `deps.<módulo>()`.
+
+### 2026-11-16 — Onda 3: autenticação
+
+- Executada por subagente Sonnet (xhigh) em worktree, com a sessão principal como manager (pedido
+  do usuário; o plano previa a Onda 3 na sessão principal por ser de segurança crítica). Para
+  compensar, a sessão principal reexecutou todos os gates a cada rodada e rodou threat-modeler,
+  code-reviewer (duas passadas), contract-guardian e rls-auditor.
+- Entregue: `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`; limitador do Postgres
+  (HMAC do sujeito, cache de negações por instância); resolver de principal do Supabase
+  (`getClaims()` + `current_principal()`); cookies de login em buffer (só vão na resposta de
+  sucesso); logout confirma a revogação no banco e restaura os cookies com 503 se falhar.
+- Sessão (ADR 0009): no máximo 12 h desde o login e 4 h sem uso, aplicados no Auth
+  (`[auth.sessions]`), no teto do cookie em `setAll` e no banco (`private.session_is_alive`, nova
+  migration). A última atividade é a mais recente entre `refreshed_at`, o refresh token mais novo
+  e `created_at`, porque o GoTrue não grava `refreshed_at` em toda renovação.
+- Local: o Supabase local assina com ES256 e JWKS (não HS256), então `getClaims()` verifica
+  localmente quando o `kid` é conhecido.
+- Threat model (F-01..F-14): F-01 orçamento `session-upstream` por IP (60/15 min) para toda chamada
+  ao Auth feita ao resolver a sessão; F-02 teto global de login (300/5 min, escopo `global` só
+  programático); F-05 piso de 400 ms nas recusas de login; F-06 cache de negações; F-07 limpeza
+  oportunista do rate limit (nova migration); F-08 limites de sessão no banco; F-09 hashes nos
+  logs; F-11 request id gerado no servidor (o do cliente vai para `clientRequestId`); F-12 fachada
+  estreita do admin client.
+- code-reviewer, 1ª passada: 1 ALTO (a previsão do F-01 lia o cookie diferente do auth-js/ssr e
+  podia ser contornada) e MÉDIOS (alg não suportado dava 500; o restore podia desfazer uma rotação
+  de refresh token). Corrigidos: previsão que falha fechada e usa o parser do próprio ssr, medição
+  real das chamadas ao Auth com cobrança depois do fato, `peekDenial` sem banco, restore só quando
+  a sessão sumiu do jar. 2ª passada: 1 MÉDIO (trabalho abandonado depois do prazo ainda chamava o
+  Auth), corrigido pela sessão principal: o fence também bloqueia o `fetch` do cliente; log
+  `auth.session_key_rejected`.
+- Trade-off aceito (T-29): atrás de um IP que um forjador esgotou, até um token verificado
+  localmente leva 401 até o fim da janela (o cookie é mantido). O ganho de disponibilidade sem isso
+  seria pequeno, porque todo navegador precisa de refresh a cada 15 min.
+- Hook: o secrets-guard do AISAC recusa comandos Bash cujo texto contenha um identificador
+  terminado em "ponto key" (parece extensão de arquivo de chave), mesmo quando é só código de teste
+  ou texto de documentação. Falso positivo, visto duas vezes; o conteúdo foi escrito pelo Edit, que
+  passa pelo `guard-writes.mjs`.
+- Pendentes no threat model §8: F-03 (bloqueio direcionado, decisão do usuário), F-04 (Onda 11),
+  F-13 (`secure_password_change`, Onda 4), F-14, medir o p95 da recusa de conta desativada em
+  produção e subir `REFUSED_LOGIN_FLOOR_MS` se preciso (Onda 11). O contrato continua sem 503 em
+  `logout`/`getSession` (ADR 0008).
+- Verificado (sessão principal, a partir de `pnpm db:reset`): `pnpm verify` → 1349 unit + 459
+  pgTAP; `pnpm db:lint` ok; `pnpm test:api` → 75/75 duas vezes; `pnpm test:api -t "AC-0[1-4]"` →
+  8 verdes; `pnpm test:int` → 11/11; `build`, `format:check` e `test:hooks` (179) ok.

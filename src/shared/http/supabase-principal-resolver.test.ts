@@ -504,7 +504,7 @@ describe('createSupabasePrincipalResolver: refusing what the library would crash
     'a %s from the key import (a token that asks a key for an algorithm it cannot verify) is a 401, and the kid is kept',
     async (name) => {
       const kids = knownEs256();
-      const { resolver, input, fence } = setup(
+      const { resolver, input, fence, logs } = setup(
         new DOMException('the key cannot verify that algorithm', name),
         PRINCIPAL,
         false,
@@ -515,6 +515,10 @@ describe('createSupabasePrincipalResolver: refusing what the library would crash
 
       expect(kids.has('key-1')).toBe(true);
       expect(fence).not.toHaveBeenCalled();
+      // logged, so a misconfigured project key (everyone gets 401) is told apart from forgeries
+      expect(logs.events('auth.session_key_rejected')).toEqual([
+        expect.objectContaining({ level: 'warn', errorName: name }),
+      ]);
     },
   );
 

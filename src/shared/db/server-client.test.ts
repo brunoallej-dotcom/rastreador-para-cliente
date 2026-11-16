@@ -246,6 +246,27 @@ describe('fenceRequestClient: abandoned work cannot touch the jar afterwards', (
     expect(otherCookies.getAll().length).toBeGreaterThan(0);
   });
 
+  it('blocks every request made after the fence: nothing reaches the network or the counter', async () => {
+    const calls = stubFetch(() => json(FAKE_SESSION));
+    const request = requestOf();
+    const client = getRequestSupabase({
+      request,
+      cookies: createFakeCookieStore(),
+      requestId: 'request-id-1',
+    });
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+    const sentBefore = calls.length;
+    const countedBefore = getRequestAuthCalls(request);
+
+    fenceRequestClient(request);
+    const late = await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+    await client.from('profiles').select('id');
+
+    expect(late.error).not.toBeNull();
+    expect(calls.length).toBe(sentBefore);
+    expect(getRequestAuthCalls(request)).toBe(countedBefore);
+  });
+
   it('is a no-op for a request that has no client', () => {
     expect(() => fenceRequestClient(requestOf())).not.toThrow();
   });

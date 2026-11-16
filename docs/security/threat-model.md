@@ -146,10 +146,11 @@ flowchart LR
   intervalo de reuso (10 s) e depois trata como reuso e revoga a família. O resolvedor fecha o jar
   (`fenceRequestClient`) para que o trabalho abandonado não escreva cookies, mas não consegue desfazer
   o refresh do lado do Auth.
-- **Chamadas ao Auth depois do prazo (T-29):** o `getClaims()` abandonado por prazo pode continuar
-  tentando de novo (o auth-js repete um refresh que falha por rede, por até cerca de 30 s). Essas
-  chamadas acontecem depois da medição e não são cobradas; só ocorrem quando o Auth já está
-  falhando e são limitadas pelas tentativas de uma única requisição que já gastou uma unidade.
+- **Chamadas ao Auth depois do prazo (T-29):** o `getClaims()` abandonado por prazo continua
+  tentando de novo (o auth-js repete um refresh que falha por rede, por até cerca de 30 s). O fence
+  também bloqueia o `fetch` do cliente: cada nova tentativa falha na hora, sem requisição, então
+  nada chega ao Auth sem cobrança. Resta só a requisição que já estava em voo no momento do fence,
+  que termina pelo próprio timeout de 5 s.
 - **Insider CEO:** um CEO pode aprovar indevidamente. Mitigado por auditoria, não por prevenção.
   Desfazer aprovação fica para a v1.1 (Q-05).
 

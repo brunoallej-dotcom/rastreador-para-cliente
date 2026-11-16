@@ -48,10 +48,11 @@ export function getRequestAuthCalls(request: NextRequest): number {
 }
 
 /**
- * From now on the request's client can no longer write cookies. Call it when giving up on the
- * client's work (a deadline, an outage): the abandoned work may finish later and write a rotated
- * session into the jar, after the response was decided and possibly after the jar was restored.
- * Writes made before the fence stand.
+ * From now on the request's client can neither write cookies nor make requests. Call it when giving
+ * up on the client's work (a deadline, an outage): the abandoned work may finish later and write a
+ * rotated session into the jar, after the response was decided and possibly after the jar was
+ * restored, and its retries would keep calling Auth without being charged (F-01). Writes made
+ * before the fence stand; a request already in flight still ends by its own 5 s timeout.
  */
 export function fenceRequestClient(request: NextRequest): void {
   const record = clientsByRequest.get(request);
@@ -87,6 +88,12 @@ export function getRequestSupabase(input: RequestSupabaseInput): RequestSupabase
   const fence = { closed: false };
   const authUrlPrefix = `${env.SUPABASE_URL.replace(/\/+$/, '')}/auth/v1/`;
   const countedFetch: FetchFunction = (input, init) => {
+    // Abandoned work must not reach Supabase at all: after a deadline the library keeps retrying a
+    // failing refresh for up to ~30 s, and those calls were never charged to the `session-upstream`
+    // budget (F-01). Each retry now fails here at once, without a request.
+    if (fence.closed) {
+      return Promise.reject(new DOMException('the request client was fenced', 'AbortError'));
+    }
     if (urlOf(input).startsWith(authUrlPrefix)) authCalls.count += 1;
     return fetchWithTimeout(input, init);
   };
