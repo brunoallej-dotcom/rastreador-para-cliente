@@ -13,8 +13,9 @@ import {
   type Result,
 } from '@/shared/kernel';
 import type { Logger } from '@/shared/observability/logger';
-import { ClientArchivedError, ProcessNotActiveError } from '../domain/errors';
+import { ClientArchivedError, ProcessNotActiveError, StaleStageError } from '../domain/errors';
 import {
+  currentStageOf,
   invariantViolations,
   PROCESS_STATUSES,
   summaryViolations,
@@ -46,6 +47,7 @@ const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
 const CLIENT_ARCHIVED_MESSAGE = 'CLIENT_ARCHIVED';
 const PROCESS_NOT_ACTIVE_MESSAGE = 'PROCESS_NOT_ACTIVE';
+const STALE_STAGE_MESSAGE = 'STALE_STAGE';
 /**
  * Postgres rolled the whole transaction back and nothing of it persisted (no row, no audit event), so
  * repeating the call is safe: `deadlock_detected` and `serialization_failure`. PostgREST answers
@@ -244,8 +246,8 @@ export type ProcessRepositoryOptions = {
 /**
  * `ProcessRepository` over Supabase, as the signed-in user (the request-scoped client, never the
  * admin client): reads go through `from('processes')` and RLS, writes only through the
- * `create_process` and `update_process` functions, which check the CEO role, `aal2` and the TOTP
- * factor by themselves and write the audit event in the same transaction.
+ * `create_process`, `update_process` and `approve_current_stage` functions, which check the CEO role,
+ * `aal2` and the TOTP factor by themselves and write the audit event in the same transaction.
  *
  * Whatever comes back is validated with Zod. Database errors are mapped by the table of spec §3.7;
  * an unmapped one is an unexpected error (500) and a slow or dead database is a 503 (E-21). The
@@ -273,7 +275,7 @@ export function createSupabaseProcessRepository(
 
   /** Maps what a write function raised. Returns the domain error, or throws for the unexpected. */
   function refusalOf(
-    operation: 'create_process' | 'update_process',
+    operation: 'create_process' | 'update_process' | 'approve_current_stage',
     notFoundDetail: string,
     error: { code?: string; message: string },
     status: number,
@@ -373,6 +375,24 @@ export function createSupabaseProcessRepository(
     return ok(process);
   }
 
+  /**
+   * The conflict of an approval whose expected stage is not the current one: the stage that is current
+   * NOW, read again, because the function's error carries nothing of the row (spec §3.7.3). Only an
+   * active process has a current stage to name; one that is no longer active (a cancellation or the last
+   * approval landed in between) has none (`null`, the contract's `StaleStageProblem`). A process that
+   * cannot be read any more is a 404, like any row that vanished after a write.
+   */
+  async function staleStageOf(processId: string): Promise<DomainError> {
+    const process = await find(processId);
+    if (process === null) {
+      return new NotFoundError('process not found after a stale approval', {
+        detail: 'Process not found.',
+      });
+    }
+    const current = process.status === 'active' ? currentStageOf(process) : null;
+    return new StaleStageError(current?.id ?? null, { cause: { code: RAISE_EXCEPTION } });
+  }
+
   return {
     async create(input: NewProcess): Promise<Result<Process, DomainError>> {
       const { data, error, status } = await supabase.rpc('create_process', {
@@ -403,6 +423,21 @@ export function createSupabaseProcessRepository(
         ...(patch.cancel === undefined ? {} : { p_cancel: patch.cancel }),
       });
       if (error) return err(refusalOf('update_process', 'Process not found.', error, status));
+
+      return readAfterWrite(processId);
+    },
+
+    async approve(processId, expectedStageId): Promise<Result<Process, DomainError>> {
+      const { error, status } = await supabase.rpc('approve_current_stage', {
+        p_process_id: processId,
+        p_expected_stage_id: expectedStageId,
+      });
+      if (error) {
+        if (error.code === RAISE_EXCEPTION && error.message === STALE_STAGE_MESSAGE) {
+          return err(await staleStageOf(processId));
+        }
+        return err(refusalOf('approve_current_stage', 'Process not found.', error, status));
+      }
 
       return readAfterWrite(processId);
     },

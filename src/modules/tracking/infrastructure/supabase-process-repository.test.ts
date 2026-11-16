@@ -7,7 +7,7 @@ import {
   ServiceUnavailableError,
   ValidationError,
 } from '@/shared/kernel';
-import { ClientArchivedError, ProcessNotActiveError } from '../domain/errors';
+import { ClientArchivedError, ProcessNotActiveError, StaleStageError } from '../domain/errors';
 import { createSupabaseProcessRepository } from './supabase-process-repository';
 
 const CLIENT = '00000000-0000-4000-8000-00000000000a';
@@ -558,6 +558,230 @@ describe('update', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(NotFoundError);
+  });
+});
+
+describe('approve', () => {
+  const stageRows = (current: 1 | 2) => [
+    stageRowOf(
+      S1,
+      1,
+      current === 1 ? 'in_progress' : 'completed',
+      current === 1 ? [] : [approvalRow],
+    ),
+    stageRowOf(S2, 2, current === 1 ? 'pending' : 'in_progress'),
+  ];
+
+  it('AC-16: calls approve_current_stage with the process and the expected stage only, and reads the process back', async () => {
+    const { repository, queries, remaining } = repositoryOver([
+      answer({ ...writeRowOf(P1), version: 2 }),
+      answer({ ...detailRowOf(P1, stageRows(2)), version: 2 }),
+    ]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(queries[0]).toEqual([
+      ['rpc', 'approve_current_stage', { p_process_id: P1, p_expected_stage_id: S1 }],
+    ]);
+    // the second read is the detail read, with the stages and their approvals
+    expect(queries[1]?.[1]).toEqual(['select', DETAIL_SELECT]);
+    expect(remaining()).toBe(0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.version).toBe(2);
+    expect(result.value.stages.map((stage) => stage.status)).toEqual(['completed', 'in_progress']);
+    expect(result.value.stages[0]?.approval?.approvedBy).toEqual({
+      id: CEO,
+      displayName: 'CEO Um',
+    });
+  });
+
+  it('the approver is not an argument: nothing but the two ids goes to the database', async () => {
+    const { repository, queries } = repositoryOver([
+      answer(writeRowOf(P1)),
+      answer(detailRowOf(P1, stageRows(2))),
+    ]);
+
+    await repository.approve(P1, S1);
+
+    const [, , args] = queries[0]?.[0] ?? [];
+    expect(Object.keys(args as object).sort()).toEqual(['p_expected_stage_id', 'p_process_id']);
+  });
+
+  it.each([
+    [
+      'E-03: a completed or cancelled process',
+      failure('P0001', 'PROCESS_NOT_ACTIVE'),
+      ProcessNotActiveError,
+      'PROCESS_NOT_ACTIVE',
+    ],
+    ['an unknown process', failure('P0001', 'NOT_FOUND'), NotFoundError, 'NOT_FOUND'],
+    ['invalid input', failure('P0001', 'INVALID_INPUT'), ValidationError, 'VALIDATION_ERROR'],
+    ['a denial', failure('42501', 'FORBIDDEN'), ForbiddenError, 'FORBIDDEN'],
+  ])('maps %s to its domain error, with no second read', async (_label, outcome, type, code) => {
+    const { repository, queries } = repositoryOver([outcome]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBeInstanceOf(type);
+    expect(result.error.code).toBe(code);
+    expect(queries).toHaveLength(1);
+  });
+
+  it('a process that is not there names the process in the 404', async () => {
+    const { repository } = repositoryOver([failure('P0001', 'NOT_FOUND')]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(!result.ok && result.error.detail).toBe('Process not found.');
+  });
+
+  it('a denial is logged as a bypass of layer 1 and carries no detail of the database', async () => {
+    const { repository, warn } = repositoryOver([
+      failure('42501', 'FORBIDDEN: Failing row contains (Processo Secreto)'),
+    ]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(warn.warn).toHaveBeenCalledWith(
+      { event: 'authz.database_denied', operation: 'approve_current_stage' },
+      'authz.database_denied',
+    );
+    expect(JSON.stringify(!result.ok && result.error)).not.toContain('Secreto');
+    expect(!result.ok && result.error.detail).toBe('Access denied.');
+  });
+
+  it('E-01, E-02: STALE_STAGE reads the process again and names the stage that is current now', async () => {
+    const { repository, queries, remaining } = repositoryOver([
+      failure('P0001', 'STALE_STAGE'),
+      answer(detailRowOf(P1, stageRows(2))),
+    ]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBeInstanceOf(StaleStageError);
+    expect(result.error.code).toBe('STALE_STAGE');
+    expect(result.error.extensions).toEqual({ currentStageId: S2 });
+    expect(queries).toHaveLength(2);
+    expect(queries[1]?.[1]).toEqual(['select', DETAIL_SELECT]);
+    expect(remaining()).toBe(0);
+  });
+
+  it('E-01: the cause of a stale stage is the code alone: nothing of the database error', async () => {
+    const { repository } = repositoryOver([
+      failure('P0001', 'STALE_STAGE'),
+      answer(detailRowOf(P1, stageRows(2))),
+    ]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(!result.ok && result.error.cause).toEqual({ code: 'P0001' });
+  });
+
+  it('a stale stage on a process that is no longer active (a cancel landed in between) has no current stage', async () => {
+    const cancelled = {
+      ...detailRowOf(P1, stageRows(2)),
+      status: 'cancelled',
+      cancelled_at: AT,
+    };
+    const { repository } = repositoryOver([failure('P0001', 'STALE_STAGE'), answer(cancelled)]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(!result.ok && result.error.extensions).toEqual({ currentStageId: null });
+  });
+
+  it('a stale stage on a process that cannot be read any more is a 404', async () => {
+    const { repository } = repositoryOver([failure('P0001', 'STALE_STAGE'), answer(null)]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBeInstanceOf(NotFoundError);
+  });
+
+  it('E-21: the re-read after a stale stage that cannot reach the database is a 503', async () => {
+    const { repository } = repositoryOver([
+      failure('P0001', 'STALE_STAGE'),
+      failure('', 'fetch failed', 0),
+    ]);
+
+    await expect(repository.approve(P1, S1)).rejects.toBeInstanceOf(ServiceUnavailableError);
+  });
+
+  it('E-21: a rolled back transaction (deadlock, serialization failure) and an unreachable database are a 503', async () => {
+    for (const outcome of [
+      failure('40P01', 'deadlock detected', 500),
+      failure('40001', 'could not serialize access', 500),
+      failure('', 'fetch failed', 0),
+    ]) {
+      const { repository } = repositoryOver([outcome]);
+      await expect(repository.approve(P1, S1)).rejects.toBeInstanceOf(ServiceUnavailableError);
+    }
+  });
+
+  it('a 503 from a rolled back transaction carries the SQLSTATE and the status, never the message', async () => {
+    const { repository } = repositoryOver([
+      failure('40P01', 'deadlock detected: process 1 waits on Processo Secreto', 500),
+    ]);
+
+    const error = await repository.approve(P1, S1).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ServiceUnavailableError);
+    expect((error as Error).cause).toEqual({ code: '40P01', status: 500 });
+    expect(JSON.stringify((error as Error).cause)).not.toContain('Secreto');
+  });
+
+  it('an unmapped error (a CHECK violation too) is an unexpected error (500), with only code and status as cause', async () => {
+    const { repository } = repositoryOver([
+      failure(
+        '23514',
+        'new row violates check constraint: Failing row contains (Processo Secreto)',
+      ),
+    ]);
+
+    const error = await repository.approve(P1, S1).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(ServiceUnavailableError);
+    expect((error as Error).cause).toEqual({ code: '23514', status: 400 });
+    expect(JSON.stringify((error as Error).cause)).not.toContain('Secreto');
+  });
+
+  it('E-21: an approval saved and then lost from sight (the session ended) is a 404, not a 500', async () => {
+    const { repository } = repositoryOver([answer(writeRowOf(P1)), answer(null)]);
+
+    const result = await repository.approve(P1, S1);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBeInstanceOf(NotFoundError);
+  });
+
+  it('E-21: an approval saved whose read back cannot reach the database is a 503', async () => {
+    const { repository } = repositoryOver([answer(writeRowOf(P1)), failure('', 'fetch failed', 0)]);
+
+    await expect(repository.approve(P1, S1)).rejects.toBeInstanceOf(ServiceUnavailableError);
+  });
+
+  it('F-81: a process that breaks an invariant after the approval is a 500 and is logged without any title', async () => {
+    // two stages in progress after an approval (I2): only a defect or a hand-made row gets here
+    const broken = detailRowOf(P1, [
+      stageRowOf(S1, 1, 'in_progress'),
+      stageRowOf(S2, 2, 'in_progress'),
+    ]);
+    const { repository, warn } = repositoryOver([answer(writeRowOf(P1)), answer(broken)]);
+
+    await expect(repository.approve(P1, S1)).rejects.toThrow(
+      'a process read from the database breaks its invariants',
+    );
+    expect(warn.error).toHaveBeenCalledWith(
+      { event: 'tracking.process_invariant_violated', processId: P1, invariants: ['I2'] },
+      'tracking.process_invariant_violated',
+    );
   });
 });
 
