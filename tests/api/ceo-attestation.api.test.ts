@@ -14,7 +14,13 @@ import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import type * as LoggerModule from '@/shared/observability/logger';
 import type { Database } from '@/shared/db/database.types';
 import { timing } from '@/shared/http/response-floor';
-import { agePasswordBaseline, resetFirstActivation } from '../helpers/db';
+import {
+  activationProofOf,
+  agePasswordBaseline,
+  backendChallengeIdsOf,
+  firstActivationFactorOf,
+  resetFirstActivation,
+} from '../helpers/db';
 import { listClientsViaApi } from '../helpers/clients';
 import { expectToMatchContract } from '../helpers/contract';
 import {
@@ -518,9 +524,10 @@ describe('E-37: fail closed', () => {
     expect(await listClientsStatus(cookies)).toBe(403);
 
     // the CEO verifies again with the next code: the activation by the backend is recovered from the
-    // challenge that did verify the factor, and the session is attested. The principal of the retry
-    // is a returning one (VERIFY_MFA, no ENROLL_MFA), but the database says it ACTIVATED the factor now,
-    // so the other sessions of the CEO are signed out all the same (F-72)
+    // proof the database wrote when Auth activated the factor (F-73), and the session is attested. The
+    // principal of the retry is a returning one (VERIFY_MFA, no ENROLL_MFA), but the database says it
+    // ACTIVATED the factor now (F-72), and it deletes the other sessions of the CEO in the same
+    // transaction (F-74): the app asks the Auth server for no revocation at all
     const retrySpy = spyOnSupabaseFetch();
     let retry: Response;
     try {
@@ -531,14 +538,13 @@ describe('E-37: fail closed', () => {
     expect(retry.status).toBe(200);
     expect(await bodyOf(retry)).toMatchObject({ aal: 'aal2', pendingActions: [] });
     expect(await listClientsStatus(cookies)).toBe(200);
-    const revocations = (calls: string[]) =>
-      calls.filter((call) => call.includes('/auth/v1/logout') && call.includes('scope=others'));
-    expect(revocations(spy.calls)).toEqual([]); // the 503 attempt revoked nothing
-    expect(revocations(retrySpy.calls)).toHaveLength(1); // the recovery did (F-72)
+    const logouts = (calls: string[]) => calls.filter((call) => call.includes('/auth/v1/logout'));
+    expect(logouts(spy.calls)).toEqual([]);
+    expect(logouts(retrySpy.calls)).toEqual([]);
     expect(events('auth.mfa.verified').at(-1)).toMatchObject({ activated: true });
   });
 
-  it('F-72: a verification of a factor the database had ALREADY activated does not sign the other sessions out', async () => {
+  it('F-72: a verification of a factor the database had ALREADY activated reports no activation', async () => {
     const legit = await loginAsCeoWithMfa();
     const secondLogin = await loginViaApi(legit.ceo);
     const spy = spyOnSupabaseFetch();
@@ -549,9 +555,7 @@ describe('E-37: fail closed', () => {
       spy.restore();
     }
 
-    expect(
-      spy.calls.filter((call) => call.includes('/auth/v1/logout') && call.includes('scope=others')),
-    ).toEqual([]);
+    expect(spy.calls.filter((call) => call.includes('/auth/v1/logout'))).toEqual([]);
     expect(events('auth.mfa.verified').at(-1)).toMatchObject({ activated: false });
     expect(await listClientsStatus(legit.cookies)).toBe(200); // the first session is untouched
   });
@@ -707,6 +711,111 @@ describe('E-39 (F-65): the replay guard is not a code oracle at PostgREST', () =
 
     expect(result.error?.code).toBe('42501');
     expect(result.data).toBeNull();
+  });
+});
+
+// --------------------------------------------------------------------------------- F-73 ----
+
+describe('F-73: the mark and the proof of the activation are written when Auth activates the factor', () => {
+  it('F-73: with the attestation unavailable (503) the mark and the proof already exist, so deleting the factor at Auth does not reopen the enrollment', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const enrollment = await enrollTotp(cookies);
+    expect(await firstActivationFactorOf(ceo.id)).toBeUndefined();
+
+    const spy = spyOnSupabaseFetch((url) =>
+      url.includes('/rest/v1/rpc/attest_mfa_session')
+        ? Response.json({ message: 'down' }, { status: 503 })
+        : undefined,
+    );
+    let failed: Response;
+    try {
+      failed = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+    } finally {
+      spy.restore();
+    }
+    expect(failed.status).toBe(503);
+
+    // nothing was attested, and yet the activation trigger ran in the transaction of the Auth server
+    expect(await firstActivationFactorOf(ceo.id)).toBe(enrollment.factorId);
+    expect(await activationProofOf(enrollment.factorId)).toEqual({
+      byBackend: true,
+      hasChallenge: true,
+      hasInstant: true,
+    });
+
+    // the session the verification elevated at Auth is aal2 there: with it the factor can be deleted
+    const tokens = readSessionCookie(cookies);
+    const holder = createSupabaseClient<Database>(
+      process.env.SUPABASE_URL ?? '',
+      process.env.SUPABASE_PUBLISHABLE_KEY ?? '',
+      { auth: { persistSession: false, autoRefreshToken: false } },
+    );
+    const adopted = await holder.auth.setSession({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+    });
+    expect(adopted.error).toBeNull();
+    const removed = await holder.auth.mfa.unenroll({ factorId: enrollment.factorId });
+    expect(removed.error).toBeNull();
+    expect(await factorsOf(ceo.id)).toEqual([]);
+    logged.lines.length = 0;
+
+    // enrolling through the backend (a new login: the password is all it takes) is refused
+    const again = await loginViaApi(ceo);
+    const response = await enrollTotpViaApi(again);
+
+    expect(response.status).toBe(409);
+    expect(await bodyOf(response)).toMatchObject({ code: 'MFA_ALREADY_ENROLLED' });
+    expect(events('auth.mfa.reenrollment_refused')).toEqual([
+      expect.objectContaining({ level: 'error', userId: ceo.id }),
+    ]);
+  });
+});
+
+// ------------------------------------------------------------------ the challenge id stays here ----
+
+describe('the id of a challenge the backend creates never leaves the server (F-63)', () => {
+  /** True when `text` carries none of the ids. */
+  const carriesNone = (text: string, ids: readonly string[]) =>
+    ids.every((id) => !text.includes(id));
+  const headersOf = (response: Response) =>
+    [...response.headers].map(([name, value]) => `${name}: ${value}`).join('\n');
+
+  it('a verification that works: not in the response, its headers, the cookies or any log line', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const enrollment = await enrollTotp(cookies);
+
+    const response = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+
+    expect(response.status).toBe(200);
+    const ids = await backendChallengeIdsOf(ceo.id);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(carriesNone(await response.clone().text(), ids)).toBe(true);
+    expect(carriesNone(headersOf(response), ids)).toBe(true);
+    expect(carriesNone(decodeURIComponent(cookies.header() ?? ''), ids)).toBe(true);
+    expect(carriesNone(logged.lines.join(''), ids)).toBe(true);
+  });
+
+  it('a verification the attestation refuses (the oracle): not in the 422, its headers, any log line or the audit trail', async () => {
+    const legit = await loginAsCeoWithMfa();
+    const code = nextTotpCode(legit.secret);
+    const attacker = await directAal2Session(
+      legit.ceo,
+      { factorId: legit.factorId, secret: legit.secret },
+      code,
+    );
+    logged.lines.length = 0;
+
+    const response = await verifyTotpViaApi(await cookiesOf(attacker.supabase), { code });
+
+    expect(response.status).toBe(422);
+    const ids = await backendChallengeIdsOf(legit.ceo.id);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(carriesNone(await response.clone().text(), ids)).toBe(true);
+    expect(carriesNone(headersOf(response), ids)).toBe(true);
+    expect(carriesNone(logged.lines.join(''), ids)).toBe(true);
+    const audit = JSON.stringify(await auditOf(legit.ceo.id, 'auth.mfa_attestation_refused'));
+    expect(carriesNone(audit, ids)).toBe(true);
   });
 });
 

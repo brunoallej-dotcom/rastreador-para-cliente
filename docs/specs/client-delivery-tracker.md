@@ -289,12 +289,22 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   verificado, o verificou e nenhum challenge verificado de fora do backend jamais existiu para ele; a
   derivação se recupera de uma falha entre o verify e o atestado, e o atestado devolve
   `attested_activated` quando foi ele que ativou (é isso que faz o app derrubar as outras sessões,
-  F-72). A prova não depende de o Auth guardar linhas de challenge: o registro do backend não tem
-  `CASCADE` para elas e guarda uma cópia do instante da verificação (F-71). **Primeira ativação, uma
-  vez só (F-64):** `private.mfa_first_activations` (uma linha por usuário, **sem FK para o fator**) é
-  gravada na primeira ativação; depois dela, o cadastro e a ativação de um fator NOVO (o antigo foi
-  apagado direto no Auth por quem tinha uma `aal2`) são recusados (`factor_reenrolled`, 409
-  `MFA_ALREADY_ENROLLED` no enroll), até o reset de MFA do operador (E-25, Onda 11). **Recusa:**
+  F-72). **A prova da ativação é gravada pelo banco quando o Auth ativa o fator (F-73):** um gatilho
+  (`on_mfa_factor_verified`, `AFTER UPDATE OF status` em `auth.mfa_factors`, só para fatores do
+  registro) roda na MESMA transação do verify do Auth e grava (a) a marca da primeira ativação do
+  usuário e (b) no registro do fator o challenge verificado mais recente, o instante dele e se a
+  ativação foi do backend (esse challenge foi registrado com o fator ainda não verificado, e nenhum
+  challenge verificado de fora do backend existia). O atestado confia só nessas tabelas para "ativado
+  pelo backend": não relê `auth.mfa_challenges` para isso, que o Auth hospedado pode não guardar
+  (F-71), e um atestado que falha (503, `session_not_found` forçado por um logout global de quem tem
+  a senha, `challenge_stale`) não deixa a janela do F-64 aberta. **Primeira ativação, uma vez só
+  (F-64):** `private.mfa_first_activations` (uma linha por usuário, com o `factor_id` que a criou,
+  **sem FK para o fator**) é gravada pelo gatilho; depois dela, o cadastro e a ativação de um fator
+  NOVO (o antigo foi apagado direto no Auth por quem tinha uma `aal2`) são recusados
+  (`factor_reenrolled`, 409 `MFA_ALREADY_ENROLLED` no enroll), e só o atestado do próprio fator da marca
+  passa, até o reset de MFA do operador (E-25, Onda 11, que apaga a marca e os registros do usuário,
+  F-75). A marca é decidida sob trava do perfil e o `INSERT` dela devolve a linha: se nada foi inserido
+  e a marca é de outro fator, é recusa. **Recusa:**
   devolve o motivo e grava `auth.mfa_attestation_refused` na auditoria (sem ator; motivo, id do fator,
   `severity` e `revoked`); os **sinais de ataque** (`oracle`, `factor_not_backend`,
   `factor_not_activated_by_backend`, `challenge_not_backend`, `challenge_not_found`, `challenge_reused`,
@@ -305,15 +315,15 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   também vem do `audit_events`, que sobrevive a um 503 depois do COMMIT (F-68). Não vira negação de
   serviço contra o CEO sem um código verificado direto no Auth: código errado não deixa challenge
   verificado.
-- **Ativação do primeiro fator derruba as outras sessões (F-20):** quando um verify **ativa** o
+- **Ativação do primeiro fator derruba as outras sessões (F-20, F-74):** quando um verify **ativa** o
   primeiro fator (o atestado devolve `attested_activated`, também no retry de um atestado que falhou,
-  F-72, e não a pendência `ENROLL_MFA`), o app chama `signOut({ scope: 'others' })`
-  no client da requisição: as outras sessões do CEO morrem e os cookies da sessão atual ficam como
-  estão. Assim uma sessão aberta só com a senha (ou um cookie `aal1` roubado) não sobrevive ao
-  momento em que a conta ganha o segundo fator. É melhor esforço: se falhar, o verify continua
-  valendo e o log registra `auth.mfa.followup_failed`. O cliente do Auth trata 401, 403 e 404 da
-  revogação como "já desconectado", então uma revogação que o Auth recusou por esses status não
-  aparece no app.
+  F-72, e não a pendência `ENROLL_MFA`), o PRÓPRIO atestado apaga as outras sessões do usuário
+  (`DELETE FROM auth.sessions`), dentro da transação, como o `mark_password_changed()` faz: as outras
+  sessões do CEO morrem e a sessão atestada fica. Assim uma sessão aberta só com a senha (ou um cookie
+  `aal1` roubado) não sobrevive ao momento em que a conta ganha o segundo fator. O app não chama mais o
+  `signOut({ scope: 'others' })` do Auth, que era melhor esforço, fora da transação e sem retry (a
+  revogação por SQL não tem a ressalva de o cliente do Auth tratar 401, 403 e 404 como "já
+  desconectado").
 - **Janela do refresh token antigo (F-23, resíduo):** o refresh token que o navegador tinha
   **antes** do verify continua valendo pelo intervalo de reuso do Auth
   (`refresh_token_reuse_interval`, 10 s) e responde com a sessão atual, já `aal2`. Rotacionar de
@@ -645,8 +655,7 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   conta tem e só existe quando o verify não trouxe `factorId` (o app mantém um só: mais de um é
   anômalo, F-60; a tomada por um fator verificado plantado não aumenta a conta, F-61: o sinal é o
   `factorId` não ser o do `auth.mfa.enrolled` do mesmo usuário). `factor_ambiguous` também gera `auth.mfa.factor_ambiguous`, em nível `error` e com
-  nome estável, para alerta (o app nunca cria esse estado, F-60). Ainda: `auth.mfa.followup_failed` (`userId`, `step`:
-  a revogação das outras sessões que falhou depois de um verify bom), `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
+  nome estável, para alerta (o app nunca cria esse estado, F-60). Ainda: `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
   `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
   `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).
   `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
@@ -813,14 +822,16 @@ de 120 s.
 
 **`private.mfa_backend_factors`** (RLS sem policy, sem grants): `factor_id uuid` PK (FK `auth.mfa_factors`,
 `ON DELETE CASCADE`), `user_id`, `enrolled_session_id` (só investigação), `enrolled_at`, `activated_at` e
-`activation_challenge_id` (os dois nulos ou os dois preenchidos). **`private.mfa_first_activations`**
-(F-64): `user_id` PK (FK `auth.users`, `ON DELETE CASCADE`, **nenhuma FK para o fator**),
-`first_activated_at`; só o runbook de reset de MFA (E-25) a apaga. **`private.mfa_backend_challenges`**:
-`challenge_id` PK (**sem** FK para `auth.mfa_challenges`, F-71), `factor_id` (FK com `CASCADE`), `user_id`,
-`factor_was_verified`, `recorded_at`, `verified_at` (cópia do instante da verificação).
-**`private.mfa_session_attestations`**: `session_id` PK (FK `auth.sessions`, `ON DELETE CASCADE`),
-`user_id`, `factor_id` (FK `auth.mfa_factors`, `ON DELETE CASCADE`), `challenge_id` (`UNIQUE`, sem FK de
-propósito), `attested_at`. Só as funções `SECURITY DEFINER` leem e escrevem (§3.4, ADR 0013).
+`activation_challenge_id` (os dois nulos ou os dois preenchidos) e a PROVA da ativação, gravada pelo gatilho
+`on_mfa_factor_verified` (F-73): `proof_challenge_id`, `proof_verified_at` e `proof_by_backend` (NULL = o
+gatilho não viu a ativação: o fator nunca é atestado). **`private.mfa_first_activations`** (F-64): `user_id` PK
+(FK `auth.users`, `ON DELETE CASCADE`), `factor_id` (o fator que a criou, **nenhuma FK para ele**),
+`first_activated_at`; gravada pelo gatilho de ativação; só o runbook de reset de MFA (E-25) a apaga, junto com
+os registros do usuário (F-75). **`private.mfa_backend_challenges`**: `challenge_id` PK (**sem** FK para
+`auth.mfa_challenges`, F-71), `factor_id` (FK com `CASCADE`), `user_id`, `factor_was_verified`, `recorded_at`.
+**`private.mfa_session_attestations`**: `session_id` PK (FK `auth.sessions`, `ON DELETE CASCADE`), `user_id`,
+`factor_id` (FK `auth.mfa_factors`, `ON DELETE CASCADE`), `challenge_id` (`UNIQUE`, sem FK de propósito),
+`attested_at`. Só as funções `SECURITY DEFINER` leem e escrevem (§3.4, ADR 0013).
 
 **`private.password_baselines`** (já da Onda 2): além de provar a troca (`mark_password_changed()`), a
 `recorded_at` dela é o início das 72 h da senha temporária (F-41); um perfil com `must_change_password`
@@ -972,7 +983,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-34 | Login com senha temporária de mais de 72 h | 401 `INVALID_CREDENTIALS` genérico, igual ao da conta desativada (mesmo caminho e piso de tempo); sem cookie; o log diz `account_inactive` |
 | E-35 | Reset da senha temporária por um CEO | Grava uma linha de base nova: o novo login funciona e as 72 h recomeçam |
 | E-36 | Refresh do token de uma sessão atestada | O `session_id` e o `aal2` sobrevivem; o atestado continua valendo |
-| E-37 | O banco não consegue queimar o código, gravar o registro do challenge ou o atestado | 503 (falha fechada) com `detail` dizendo que o código foi usado e que o CEO espere o próximo (repetir o mesmo é um replay recusado); o código não é tentado no Auth se o challenge não foi registrado; a sessão fica sem atestado (`VERIFY_MFA`) e o próximo código a atesta. Se o Auth já tinha ativado o fator, o atestado do retry o ativa (`attested_activated`) e as outras sessões caem (F-72) |
+| E-37 | O banco não consegue queimar o código, gravar o registro do challenge ou o atestado | 503 (falha fechada) com `detail` dizendo que o código foi usado e que o CEO espere o próximo (repetir o mesmo é um replay recusado); o código não é tentado no Auth se o challenge não foi registrado; a sessão fica sem atestado (`VERIFY_MFA`) e o próximo código a atesta. Se o Auth já tinha ativado o fator, o gatilho já gravou a marca e a prova (F-73) e o atestado do retry o ativa (`attested_activated`): o próprio atestado apaga as outras sessões (F-72, F-74) |
 | E-38 | O fator verificado do CEO é apagado direto no Auth (com uma `aal2` achada lá) e alguém tenta o `enroll` pelo backend (F-64) | 409 `MFA_ALREADY_ENROLLED`; todas as sessões do usuário são apagadas; `auth.mfa.reenrollment_refused` (nível `error`) e `auth.mfa_attestation_refused` (`severity: alert`, motivo `factor_reenrolled`) na auditoria; vale também para um novo login. Só o reset de MFA do operador (E-25) reabre o cadastro |
 | E-39 | Uma sessão só de senha (ou um CEO) chama `consume_totp_code` pelo PostgREST (F-65) | 42501: a função é do `service_role`; a de dois argumentos deixou de existir |
 | E-40 | Criar cliente com o nome de outro cliente não arquivado (igual depois da chave de §3.7.1: "ACME" e "acme", "Ａｃｍｅ" de largura total, espaços repetidos, "Ac" + U+034F + "me", um seletor de variação) | 409 `CONFLICT`; nada é criado, nenhum evento é gravado, e a resposta não traz o id nem o nome do outro cliente |

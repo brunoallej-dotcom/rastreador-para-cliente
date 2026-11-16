@@ -88,12 +88,8 @@ export type FakeMfa = MfaGateway &
     readonly calls: string[];
     /** Has a verification succeeded (a session was elevated)? */
     elevated(): boolean;
-    /** How many times the other sessions were revoked. */
-    revocations(): number;
     /** Makes the next calls of that method throw `ServiceUnavailableError`. */
-    failWith(
-      method: 'list' | 'remove' | 'enroll' | 'verify' | 'current' | 'revoke' | 'session',
-    ): void;
+    failWith(method: 'list' | 'remove' | 'enroll' | 'verify' | 'current' | 'session'): void;
     /** The next `enrollTotp` answers as if another enrollment had raced this one. */
     conflictOnNextEnroll(error: ConflictError | MfaAlreadyEnrolledError): void;
     /** The attestor sharing this state; its calls go to the same `calls` log. */
@@ -110,7 +106,6 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
   let nextId = 1;
   let nextChallenge = 1;
   let elevated = false;
-  let revocations = 0;
   /** `factorId:digest` of every code the replay guard already burned (accepted or refused). */
   const burned = new Set<string>();
   const burnLog: string[] = [];
@@ -234,7 +229,6 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
       factors = [...factors, { ...factor, backendEnrolled: false, activated: false }];
     },
     elevated: () => elevated,
-    revocations: () => revocations,
     failWith: (method) => void failing.add(method),
     conflictOnNextEnroll: (error) => {
       enrollError = error;
@@ -313,13 +307,6 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
       calls.push('session');
       unavailable('session');
       return Promise.resolve(FAKE_SESSION_ID);
-    },
-
-    revokeOtherSessions() {
-      calls.push('revoke');
-      unavailable('revoke');
-      revocations += 1;
-      return Promise.resolve();
     },
 
     current() {

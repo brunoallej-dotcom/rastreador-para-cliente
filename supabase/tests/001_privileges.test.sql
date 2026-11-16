@@ -4,7 +4,7 @@
 -- Inclui a secret key (service_role): sem escrita em profiles, audit_events e template e sem
 -- acesso a private.password_baselines.
 BEGIN;
-SELECT plan(61);
+SELECT plan(63);
 
 -- AC-10: anon não tem privilégio algum em public ---------------------------------------------
 SELECT cmp_ok(
@@ -403,25 +403,51 @@ SELECT throws_ok(
 RESET ROLE;
 
 -- F-63: o atestado não pode ser contornado em silêncio. A única definição de "aal2 de verdade" é
--- private.session_is_attested(); nenhuma outra função de public ou private lê o claim `aal` do JWT (nem
--- os claims direto), então uma função de CEO nova que o fizesse reprova aqui, não passa despercebida.
+-- private.session_is_attested(). O guarda olha o corpo de toda função de public e private, inclusive o
+-- `BEGIN ATOMIC` (cujo `prosrc` é vazio: `pg_get_function_sqlbody`), por qualquer um destes sinais:
+--   * a palavra `aal` (o claim `->> 'aal'`, `#>> '{aal}'`, `@>`, a coluna `auth.sessions.aal`...);
+--   * `request.jwt` (os claims lidos direto, sem `auth.jwt()`);
+--   * a palavra `execute` (SQL dinâmica, que esconde qualquer um dos dois acima).
+-- Só as funções da lista abaixo, as que PRECISAM tocar `aal`, passam: `session_is_attested` (o claim) e
+-- `attest_mfa_session` (confere `auth.sessions.aal = 'aal2'` antes de atestar). Uma função de CEO nova
+-- que leia `aal` por qualquer caminho reprova aqui e tem de ser justificada, não passa despercebida. Os
+-- predicados das policies também não podem falar de `aal` nem de `jwt`: elas chamam is_ceo().
 SELECT is_empty(
   $$ SELECT n.nspname || '.' || p.proname
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname IN ('public', 'private')
-        AND (p.prosrc ~ $re$'aal'$re$ OR p.prosrc ~* $re$request\.jwt\.claim$re$)
-        AND NOT (n.nspname = 'private' AND p.proname = 'session_is_attested') $$,
-  'F-63: nenhuma função de public ou private além de session_is_attested lê o claim aal do JWT'
+        AND (p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), ''))
+              ~* $re$\maal\M|request\.jwt|\mexecute\M$re$
+        AND n.nspname || '.' || p.proname NOT IN (
+          'private.session_is_attested',
+          'public.attest_mfa_session'
+        ) $$,
+  'F-63: nenhuma função de public ou private, fora da lista de duas, lê aal, os claims do JWT ou usa SQL dinâmica'
 );
 SELECT is(
-  (SELECT count(*)::integer
+  (SELECT array_agg(n.nspname || '.' || p.proname ORDER BY n.nspname, p.proname)
      FROM pg_proc p
      JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = 'private' AND p.proname = 'session_is_attested'
-      AND p.prosrc ~ $re$'aal'$re$),
-  1,
-  'F-63: o guarda de catálogo acima enxerga a leitura do claim (session_is_attested a faz): não é um teste vazio'
+    WHERE n.nspname IN ('public', 'private')
+      AND (p.prosrc || coalesce(pg_get_function_sqlbody(p.oid), ''))
+            ~* $re$\maal\M|request\.jwt|\mexecute\M$re$),
+  ARRAY['private.session_is_attested', 'public.attest_mfa_session'],
+  'F-63: o guarda enxerga exatamente as duas funções permitidas (não é um teste vazio, e a lista não tem folga)'
+);
+SELECT is_empty(
+  $$ SELECT c.relname || '.' || pol.polname
+       FROM pg_policy pol
+       JOIN pg_class c ON c.oid = pol.polrelid
+      WHERE coalesce(pg_get_expr(pol.polqual, pol.polrelid), '')
+            || coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), '') ~* 'aal|jwt' $$,
+  'F-63: nenhuma policy lê aal nem o JWT: elas chamam private.is_ceo() e as funções de tenant'
+);
+SELECT cmp_ok(
+  (SELECT count(*)::integer FROM pg_policy pol
+    WHERE coalesce(pg_get_expr(pol.polqual, pol.polrelid), '') ~ 'is_ceo'),
+  '>', 5,
+  'F-63: o guarda de policies enxerga as policies de CEO (elas chamam is_ceo()): não é um teste vazio'
 );
 
 SELECT * FROM finish();

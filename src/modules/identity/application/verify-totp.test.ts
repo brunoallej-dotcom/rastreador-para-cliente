@@ -86,10 +86,9 @@ describe('verifyTotp', () => {
   });
 
   it('F-21: the same code sent twice is refused the second time (code_reused), even when it was a right one', async () => {
-    const { mfa, deps: d } = deps();
+    const { deps: d } = deps();
     const first = await verifyTotp(d, enrolling, input);
     expect(first.ok).toBe(true);
-    const revocationsAfterFirst = mfa.revocations();
 
     const second = await verifyTotp(d, returning, input);
 
@@ -98,7 +97,6 @@ describe('verifyTotp', () => {
       expect(second.error).toBeInstanceOf(InvalidMfaCodeError);
       expect((second.error as InvalidMfaCodeError).reason).toBe('code_reused');
     }
-    expect(mfa.revocations()).toBe(revocationsAfterFirst);
   });
 
   it('SEC-11: only a CEO verifies; for a client the gateway is never called', async () => {
@@ -123,12 +121,12 @@ describe('verifyTotp', () => {
     }
   });
 
-  it('a session with no principal is not hardened any further: nothing is revoked', async () => {
+  it('a session with no principal is never attested: the attestation is not even asked for', async () => {
     const { mfa, deps: d } = deps({ principalAfterVerify: null });
 
     await verifyTotp(d, enrolling, input);
 
-    expect(mfa.revocations()).toBe(0);
+    expect(mfa.attestor.attestations()).toEqual([]);
   });
 
   it('fails closed when the elevated session belongs to another user', async () => {
@@ -147,32 +145,28 @@ describe('verifyTotp', () => {
   });
 });
 
-describe('verifyTotp: the first activation signs the other sessions out', () => {
-  it('F-20: the verification that ACTIVATES the first factor signs the other sessions out', async () => {
-    const { mfa, deps: d } = deps();
+describe('verifyTotp: the first activation (the database signs the other sessions out, F-20, F-74)', () => {
+  it('F-20: the verification that ACTIVATES the first factor says so (the database deleted the other sessions)', async () => {
+    const { deps: d } = deps();
 
     const result = await verifyTotp(d, enrolling, input);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.activated).toBe(true);
-    expect(result.value.otherSessionsRevoked).toBe(true);
-    expect(mfa.revocations()).toBe(1);
   });
 
-  it('F-20: a later login that only verifies the same factor does NOT sign the other sessions out', async () => {
-    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+  it('F-20: a later login that only verifies the same factor does not activate anything', async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
 
     const result = await verifyTotp(d, returning, input);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.activated).toBe(false);
-    expect(result.value.otherSessionsRevoked).toBeNull();
-    expect(mfa.revocations()).toBe(0);
   });
 
-  it('F-20: revoking the other sessions comes after the new principal was read', async () => {
+  it('F-74: the use case asks the Auth server for no revocation: after the attestation it only reads the principal', async () => {
     const { mfa, deps: d } = deps();
 
     await verifyTotp(d, enrolling, input);
@@ -184,21 +178,8 @@ describe('verifyTotp: the first activation signs the other sessions out', () => 
       'current',
       'session',
       attested(FACTOR),
-      'revoke',
       'current',
     ]);
-  });
-
-  it('F-20: a failed revocation does not fail the verification, and says so', async () => {
-    const { mfa, deps: d } = deps();
-    mfa.failWith('revoke');
-
-    const result = await verifyTotp(d, enrolling, input);
-
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.value.session.principal.aal).toBe('aal2');
-    expect(result.value.otherSessionsRevoked).toBe(false);
   });
 });
 
@@ -233,7 +214,6 @@ describe('verifyTotp without a factor id (the factor of the session, E-31)', () 
       attested(FACTOR),
       'current',
     ]);
-    expect(mfa.revocations()).toBe(0);
   });
 
   it('the first use: with nothing verified, the one unverified candidate of the enrollment is used and activated', async () => {
@@ -246,7 +226,6 @@ describe('verifyTotp without a factor id (the factor of the session, E-31)', () 
     expect(result.value.factorId).toBe(FACTOR);
     expect(result.value.activated).toBe(true);
     expect(mfa.factors()).toEqual([{ id: FACTOR, verified: true }]);
-    expect(mfa.revocations()).toBe(1);
   });
 
   it('a verified factor wins over an unverified leftover next to it', async () => {
@@ -474,13 +453,12 @@ describe('verifyTotp: the attestation of the session (ADR 0013, F-50 b, F-63)', 
     },
   );
 
-  it('E-33: a refused attestation signs nobody else out from here (the database deleted the sessions) and reads nothing more', async () => {
+  it('E-33: a refused attestation reads nothing more (the database already deleted the sessions)', async () => {
     const { mfa, deps: d } = deps();
     mfa.attestor.refuseNextAttestationWith('oracle');
 
     await verifyTotp(d, enrolling, input);
 
-    expect(mfa.revocations()).toBe(0);
     expect(mfa.calls.filter((call) => call === 'current')).toHaveLength(1);
   });
 
@@ -579,13 +557,12 @@ describe('verifyTotp: the attestation of the session (ADR 0013, F-50 b, F-63)', 
     expect(mfa.elevated()).toBe(false);
   });
 
-  it('F-63: fail closed: if the attestation cannot be written the answer is a 503, nobody is signed out and the session is never reported as aal2', async () => {
+  it('F-63: fail closed: if the attestation cannot be written the answer is a 503 and the session is never reported as aal2', async () => {
     const { mfa, deps: d } = deps();
     mfa.attestor.failWith('attest');
 
     await expect(verifyTotp(d, enrolling, input)).rejects.toBeInstanceOf(ServiceUnavailableError);
 
-    expect(mfa.revocations()).toBe(0);
     expect(mfa.calls.filter((call) => call === 'current')).toHaveLength(1);
   });
 
@@ -668,30 +645,26 @@ describe('verifyTotp: the review of Wave 6.1 (F-65, F-72, E-37)', () => {
     expect(mfa.calls).toEqual([`verify:${OTHER}`, burned(OTHER)]);
   });
 
-  it('F-72: it is the ATTESTATION that says the factor was activated: a retry whose principal no longer has ENROLL_MFA still signs the other sessions out', async () => {
+  it('F-72: it is the ATTESTATION that says the factor was activated: a retry whose principal no longer has ENROLL_MFA still reports the activation (the database deletes the other sessions)', async () => {
     // Auth already verified the factor on the first try (its attestation failed); the retry's principal
     // is a returning one (VERIFY_MFA), but the database has not activated the factor yet
-    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: false }] });
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: false }] });
 
     const result = await verifyTotp(d, returning, input);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.activated).toBe(true);
-    expect(result.value.otherSessionsRevoked).toBe(true);
-    expect(mfa.revocations()).toBe(1);
   });
 
-  it('F-72: a factor the database had already activated is not activated again: nobody is signed out, whatever the pending actions say', async () => {
-    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: true }] });
+  it('F-72: a factor the database had already activated is not activated again, whatever the pending actions say', async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: true }] });
 
     const result = await verifyTotp(d, enrolling, input);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.activated).toBe(false);
-    expect(result.value.otherSessionsRevoked).toBeNull();
-    expect(mfa.revocations()).toBe(0);
   });
 
   it.each([

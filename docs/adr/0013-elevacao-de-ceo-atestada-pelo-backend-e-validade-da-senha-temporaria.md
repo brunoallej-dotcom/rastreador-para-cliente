@@ -41,10 +41,11 @@ O controle principal do F-50 continua sendo a publishable key tratada como segre
    `authenticated` e `service_role`; só as funções `SECURITY DEFINER` os tocam):
    - `mfa_backend_factors`: o fator que o `POST /auth/mfa/totp/enroll` criou (usuário, sessão que
      cadastrou, hora) e, depois, a ativação pelo backend (hora e challenge);
-   - `mfa_first_activations`: a marca de que o usuário já ativou um fator pelo backend (§C, F-64);
+   - `mfa_first_activations`: a marca de que o usuário já teve um fator ativado, com o fator que a
+     criou (§C, F-64, F-73);
    - `mfa_backend_challenges`: cada challenge que o backend criou, gravado **antes** de o Auth
-     verificá-lo, com o estado do fator naquele instante (`factor_was_verified`) e uma cópia do
-     instante da verificação (§C, F-71);
+     verificá-lo, com o estado do fator naquele instante (`factor_was_verified`); a prova da ativação
+     fica no registro do fator, gravada por um gatilho (§C, F-71, F-73);
    - `mfa_session_attestations`: um atestado por `session_id` (FK `ON DELETE CASCADE` para
      `auth.sessions`), amarrado a usuário, fator e challenge do backend; `challenge_id` é `UNIQUE`.
 4. **Quatro funções `SECURITY DEFINER` com `search_path` vazio, `EXECUTE` só para o `service_role`**
@@ -69,7 +70,9 @@ O controle principal do F-50 continua sendo a publishable key tratada como segre
      por quem chama: um atestado que falhou por indisponibilidade depois de o Auth já ter ativado o
      fator se recupera no próximo verify (a derivação acha o challenge que ativou), sem trancar o CEO.
      O atestado diz ao app quando foi ele que ativou (`attested_activated`), e é isso, não a
-     pendência `ENROLL_MFA`, que faz o app derrubar as outras sessões (F-20, F-72).
+     pendência `ENROLL_MFA`, que faz o atestado derrubar as outras sessões (F-20, F-72, F-74).
+     "Ativado pelo backend" vem da prova que o gatilho de ativação gravou (§C, F-73), não de uma
+     releitura do Auth.
    - **Mais três conferências (F-67).** A sessão tem de ter sido elevada por **este** fator
      (`auth.sessions.factor_id`, que o Auth grava no verify); um challenge atesta uma sessão só; e o
      challenge que o backend registra tem de ser novo (menos de 60 s) e ainda não verificado.
@@ -209,10 +212,39 @@ mudou, com o achado de cada mudança:
   hipótese de uma limpeza de 24 h **não se confirmou** na fonte nem no Auth local (uma linha verificada
   continuava lá 281 s depois), e não dá para descartar uma limpeza do lado hospedado. Por isso a prova
   não depende de o Auth guardar linhas: `mfa_backend_challenges` não tem FK nem `CASCADE` para
-  `auth.mfa_challenges`, e o atestado copia o instante da verificação para o registro do backend. A
-  ativação é derivada dessa cópia quando o Auth já não tem o challenge. (A checagem do **oráculo** olha
-  os 120 s mais recentes de `auth.mfa_challenges`, que o Auth tem de guardar por esse tempo.)
+  `auth.mfa_challenges`, e (§D, F-73) o gatilho de ativação grava no registro do fator o instante e a
+  origem da ativação, que o atestado lê no lugar do Auth. (A checagem do **oráculo** olha os 120 s mais
+  recentes de `auth.mfa_challenges`, que o Auth tem de guardar por esse tempo: é a parte PARCIAL.)
 - **F-72: a revogação do F-20 perdia-se no retry.** `activated` vinha da pendência `ENROLL_MFA`; depois
   de um atestado que falhou com o Auth já tendo ativado o fator, o retry não a tinha e a derivação
   ativava o fator sem derrubar as outras sessões. Agora o atestado devolve `attested_activated` quando
   ele ativa, e a revogação segue isso.
+
+### D. Segunda revisão de 2026-11-16: F-73 a F-75
+
+- **F-73 (baixo): a marca e a prova nascem quando o Auth ativa o fator, não quando o atestado dá certo.**
+  Se o atestado da ativação falhasse (503, `session_not_found` forçado por um logout global de quem
+  tem a senha, `challenge_stale`), a janela do F-64 ficava aberta até o próximo verify, e a
+  derivação ainda lia `auth.mfa_challenges`. Um gatilho `on_mfa_factor_verified`
+  (`AFTER UPDATE OF status ON auth.mfa_factors`, status passando a `verified`, só para fatores do
+  registro), seguindo o precedente do `on_auth_user_created`, roda na transação do verify do Auth (o
+  `challenge.Verify` vem antes do `UpdateStatus` no código do Auth, e as duas escritas estão na mesma
+  `db.Transaction`) e grava: a marca da primeira ativação, com o `factor_id`, e, no registro do fator, a
+  prova (o challenge verificado mais recente, o instante dele e se a ativação foi do backend). O
+  atestado não relê o Auth para isso. A marca escrita cedo só bloqueia: falha segura. A marca agora diz
+  qual fator a criou: o atestado do próprio fator marcado passa, o de outro é `factor_reenrolled`. A
+  marca é decidida sob trava do perfil (`FOR NO KEY UPDATE`) e o `INSERT` dela devolve a linha; nada
+  inserido com a marca de outro fator é recusa, não um silencioso `ON CONFLICT DO NOTHING`. **A Onda 11
+  precisa conferir no Supabase hospedado** o suporte a gatilhos em `auth.mfa_factors` e a `REFERENCES`
+  para `auth.sessions` e `auth.mfa_factors` (o local aceita).
+- **F-74 (baixo): a revogação do F-20 passa para dentro do atestado.** O `attest_mfa_session` que
+  devolve `attested_activated` apaga as outras sessões do usuário (`DELETE FROM auth.sessions`, a
+  atestada fica), na mesma transação, como o `mark_password_changed()`. **O app deixou de chamar** o
+  `signOut({ scope: 'others' })` do Auth: era melhor esforço, fora da transação e sem retry, e a
+  revogação por SQL o torna redundante (sem a chamada, o verify tem uma ida a menos ao Auth e o evento
+  `auth.mfa.followup_failed` deixou de existir).
+- **F-75 (baixo): a saída da marca é o runbook do operador.** O reset de MFA da Onda 11 (E-25) tem de
+  apagar a linha do usuário em `private.mfa_first_activations` **e** os registros dele
+  (`mfa_backend_factors`, `mfa_backend_challenges`, `mfa_session_attestations`), por SQL; nenhuma outra
+  coisa a apaga. E o alerta sobre o `audit_events` (`auth.mfa_attestation_refused`, F-68) é um **gate de
+  go-live**, não um item de qualidade.

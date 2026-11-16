@@ -287,16 +287,6 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       return sessionId.data;
     },
 
-    async revokeOtherSessions() {
-      // `others`: the Auth client leaves the current session (and so the cookies) as it is. It
-      // reports success for a 401, 403 or 404 of the Auth server (it takes them for "already signed
-      // out"), so a revocation that did not happen for that reason is not visible here.
-      const { error } = await attempt('revoke the other sessions', () =>
-        supabase.auth.signOut({ scope: 'others' }),
-      );
-      if (error) throw failure('revoke the other sessions', error);
-    },
-
     current() {
       return readCurrentPrincipal(supabase);
     },

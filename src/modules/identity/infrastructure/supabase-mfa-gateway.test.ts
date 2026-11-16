@@ -682,26 +682,6 @@ describe('SupabaseMfaGateway.currentSessionId', () => {
   });
 });
 
-describe('SupabaseMfaGateway.revokeOtherSessions', () => {
-  it('F-20: revoking signs the user out of the OTHER sessions only (scope others)', async () => {
-    const { supabase, signOut } = fakeSupabase();
-
-    await createSupabaseMfaGateway(supabase).revokeOtherSessions();
-
-    expect(signOut).toHaveBeenCalledWith({ scope: 'others' });
-  });
-
-  it('F-20: a revocation the Auth server refuses is an error for the caller to report', async () => {
-    const { supabase } = fakeSupabase({
-      signOut: { data: null, error: authError(500, 'unexpected_failure') },
-    });
-
-    await expect(createSupabaseMfaGateway(supabase).revokeOtherSessions()).rejects.toBeInstanceOf(
-      ServiceUnavailableError,
-    );
-  });
-});
-
 describe('SupabaseMfaGateway.current', () => {
   it('reads the principal of the session the client carries now (the elevated one)', async () => {
     const { supabase, rpc } = fakeSupabase({

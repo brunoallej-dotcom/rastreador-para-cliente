@@ -53,8 +53,8 @@ const FIVE_MINUTES_SECONDS = 5 * 60;
  * CEO in the database and is an ALERT in the log (`auth.mfa.attestation_refused`, error level, with the
  * reason and no PII). A failure to record or attest is a 503 and the session stays at `VERIFY_MFA`.
  *
- * When the verification activated the FIRST factor, the use case signs the CEO out of their other
- * sessions. It is best effort: a failure is logged at warn level and the verification stands.
+ * When the verification activated the FIRST factor, the database signs the CEO out of their other
+ * sessions inside the attestation (F-20, F-74): nothing is asked of the Auth server for it.
  *
  * The log carries ids and a reason, never the code, the secret or a token.
  *
@@ -151,7 +151,7 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
         return result.error;
       }
 
-      const { session, activated, otherSessionsRevoked, foreignFactorCount } = result.value;
+      const { session, activated, foreignFactorCount } = result.value;
 
       // The id of the session the verification elevated: the same one as before, with new tokens.
       const accessToken = readAccessToken(snapshotSessionCookies(cookies));
@@ -178,17 +178,6 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
             foreignFactorCount,
           },
           'auth.mfa.foreign_factor',
-        );
-      }
-      // Best effort: a failed revocation is a warning, and the verification stands.
-      if (otherSessionsRevoked === false) {
-        logger.warn(
-          {
-            event: 'auth.mfa.followup_failed',
-            userId: principal.userId,
-            step: 'revoke_other_sessions',
-          },
-          'auth.mfa.followup_failed',
         );
       }
       return json(200, toSessionDto(session));

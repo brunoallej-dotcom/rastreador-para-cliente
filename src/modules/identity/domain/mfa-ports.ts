@@ -89,14 +89,6 @@ export interface MfaGateway {
    * nothing is attested for a session the backend cannot name.
    */
   currentSessionId(): Promise<string>;
-
-  /**
-   * Signs the user out of every session but the current one, whose cookies stay as they are. Used
-   * when a verification activates the FIRST factor, so a session opened with a password alone (a
-   * stolen one included, F-20) does not outlive the moment the account gets its second factor.
-   * Throws when the Auth server answered with an error it does not treat as "already signed out".
-   */
-  revokeOtherSessions(): Promise<void>;
 }
 
 /**

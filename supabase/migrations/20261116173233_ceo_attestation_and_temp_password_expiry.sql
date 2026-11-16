@@ -38,7 +38,11 @@
 --   * F-67: o challenge registrado tem de ser novo e não verificado; a sessão tem de ter sido elevada
 --     pelo fator atestado; um challenge atesta uma sessão só;
 --   * F-71: a prova da ativação não depende de o Auth guardar as linhas de `mfa_challenges`;
---   * F-69: a migration para se existir CEO com fator verificado fora do registro.
+--   * F-69: a migration para se existir CEO com fator verificado fora do registro;
+--   * F-73: um gatilho em `auth.mfa_factors` grava a marca da primeira ativação e a PROVA da ativação
+--     (o challenge que ativou, o instante e se foi do backend) NA TRANSAÇÃO em que o Auth ativa o fator,
+--     sem depender de o atestado dar certo depois nem de o Auth guardar o challenge;
+--   * F-74: o atestado que ativa o fator apaga as outras sessões do usuário na própria transação (F-20).
 --
 -- Comportamento do GoTrue local em que isto se apoia (verificado na Onda 6.1, anotado no ADR 0013):
 --   * `auth.sessions.aal` existe e vira `aal2` na mesma linha (mesmo `id`) quando o verify passa; o
@@ -59,6 +63,14 @@ CREATE TABLE private.mfa_backend_factors (
   enrolled_at             timestamptz NOT NULL DEFAULT now(),
   activated_at            timestamptz,
   activation_challenge_id uuid,
+  -- A PROVA da ativação, gravada pelo gatilho `on_mfa_factor_verified` na transação em que o Auth
+  -- marca o fator como verificado (F-73): o challenge verificado mais recente do fator, o instante em
+  -- que foi verificado e se a ativação foi do backend (esse challenge foi registrado com o fator ainda
+  -- não verificado e nenhum challenge verificado de fora do backend existe para o fator). NULL = o
+  -- fator ainda não foi verificado, ou foi por um caminho que o gatilho não viu: nunca é atestado.
+  proof_challenge_id      uuid,
+  proof_verified_at       timestamptz,
+  proof_by_backend        boolean,
   CONSTRAINT mfa_backend_factors_activation_ck CHECK (
     (activated_at IS NULL) = (activation_challenge_id IS NULL)
   )
@@ -70,15 +82,19 @@ REVOKE ALL ON private.mfa_backend_factors FROM PUBLIC, anon, authenticated, serv
 -- CASCADE de auth.users
 CREATE INDEX mfa_backend_factors_user_id_idx ON private.mfa_backend_factors (user_id);
 
--- Marca de que o usuário JÁ ativou um fator pelo backend (F-64). NÃO tem FK para o fator: apagar o
--- fator (o `DELETE /factors/{id}` do Auth, que uma `aal2` obtida direto no Auth consegue) leva o
--- registro do fator e os atestados pelo CASCADE, mas não esta linha. Com ela, nem o cadastro nem a
--- ativação de um fator NOVO passam pelo backend (`register_backend_totp_factor` e
--- `attest_mfa_session` recusam com `factor_reenrolled`): quem apagou o fator do CEO não consegue
--- cadastrar o dele no lugar. Só o runbook de reset de MFA (E-25, Onda 11) apaga a linha, por SQL,
--- como operação manual. Nenhuma função da API a apaga.
+-- Marca de que o usuário JÁ teve um fator ativado (F-64). NÃO tem FK para o fator: apagar o fator (o
+-- `DELETE /factors/{id}` do Auth, que uma `aal2` obtida direto no Auth consegue) leva o registro do
+-- fator e os atestados pelo CASCADE, mas não esta linha. Com ela, nem o cadastro nem a ativação de um
+-- fator NOVO passam pelo backend (`register_backend_totp_factor` e `attest_mfa_session` recusam com
+-- `factor_reenrolled`): quem apagou o fator do CEO não consegue cadastrar o dele no lugar. Quem a grava
+-- é o gatilho `on_mfa_factor_verified`, no instante em que o Auth ativa um fator do registro (F-73), e
+-- só então: uma marca escrita cedo só bloqueia. `factor_id` diz QUAL fator a criou (sem FK): o atestado
+-- do próprio fator marcado passa, o de qualquer outro é `factor_reenrolled`. Só o runbook de reset de
+-- MFA (E-25, Onda 11) apaga a linha, por SQL, como operação manual, junto com os registros do usuário
+-- (F-75). Nenhuma função da API a apaga.
 CREATE TABLE private.mfa_first_activations (
   user_id            uuid PRIMARY KEY REFERENCES auth.users (id) ON DELETE CASCADE,
+  factor_id          uuid NOT NULL,
   first_activated_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE private.mfa_first_activations ENABLE ROW LEVEL SECURITY;
@@ -87,15 +103,14 @@ REVOKE ALL ON private.mfa_first_activations FROM PUBLIC, anon, authenticated, se
 -- Challenges que o backend criou. `factor_was_verified` guarda o estado do fator no momento em que o
 -- backend registrou o challenge (antes do verify): é a prova de que um challenge pode ter sido a
 -- ativação do fator. Sem FK para `auth.mfa_challenges` de propósito (F-71): se o Auth apagar o
--- challenge, a prova não some com ele. `verified_at` é uma cópia do instante da verificação, feita
--- pela função de atestado (o Auth pode apagar o original). O fator apagado leva as linhas (CASCADE).
+-- challenge, a prova não some com ele (o instante da verificação fica no registro do fator, gravado
+-- pelo gatilho). O fator apagado leva as linhas (CASCADE).
 CREATE TABLE private.mfa_backend_challenges (
   challenge_id        uuid PRIMARY KEY,
   factor_id           uuid NOT NULL REFERENCES auth.mfa_factors (id) ON DELETE CASCADE,
   user_id             uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
   factor_was_verified boolean NOT NULL,
-  recorded_at         timestamptz NOT NULL DEFAULT now(),
-  verified_at         timestamptz
+  recorded_at         timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE private.mfa_backend_challenges ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON private.mfa_backend_challenges FROM PUBLIC, anon, authenticated, service_role;
@@ -355,6 +370,96 @@ AS $$
 $$;
 REVOKE EXECUTE ON FUNCTION public.list_backend_totp_factors() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.list_backend_totp_factors() TO authenticated;
+
+-- Gatilho de ativação (F-73) -------------------------------------------------------------------------
+-- O Auth ativa um fator com `UPDATE auth.mfa_factors SET status = 'verified'`, na MESMA transação em
+-- que marca o challenge como verificado (`challenge.Verify` vem antes do `UpdateStatus`, em
+-- `verifyTOTPFactor`). Este gatilho roda nessa transação, para fatores que o backend cadastrou, e:
+--   * grava a marca da primeira ativação do usuário (`mfa_first_activations`), com o fator: dali em
+--     diante o F-64 vale mesmo que o atestado falhe (503, `session_not_found` forçado por um logout
+--     global de quem tem a senha, `challenge_stale`...) e o CEO só volte a verificar depois;
+--   * grava no registro do fator a PROVA da ativação, uma vez: o challenge verificado mais recente, o
+--     instante dele e se a ativação foi do backend (esse challenge foi registrado com o fator ainda não
+--     verificado, e nenhum challenge verificado de fora do backend existe para o fator).
+-- O atestado confia só nas tabelas do backend para "ativado pelo backend": não relê `auth.mfa_challenges`
+-- para isso, que o Auth hospedado pode não guardar. Gravar a marca de um fator ativado por outro
+-- caminho (um chute certo direto no Auth no candidato do backend) também só bloqueia: falha segura.
+-- Um fator que o backend não cadastrou (plantado) não passa por aqui. O gatilho não levanta erro por
+-- dado inesperado (um erro derrubaria o verify do Auth, e o MFA com ele).
+-- Precedente: `on_auth_user_created`, em `auth.users`. O suporte a gatilhos em `auth.mfa_factors` (e ao
+-- REFERENCES para `auth.sessions` e `auth.mfa_factors`, das tabelas acima) no Supabase hospedado precisa
+-- ser conferido na Onda 11.
+CREATE FUNCTION private.snapshot_mfa_activation()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_user_id    uuid;
+  v_challenge  uuid;
+  v_verified   timestamptz;
+  v_by_backend boolean;
+BEGIN
+  -- só fatores do backend; a linha é travada (a ativação e o atestado se serializam)
+  SELECT bf.user_id
+    INTO v_user_id
+    FROM private.mfa_backend_factors bf
+   WHERE bf.factor_id = NEW.id
+     FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  INSERT INTO private.mfa_first_activations (user_id, factor_id)
+  VALUES (v_user_id, NEW.id)
+  ON CONFLICT (user_id) DO NOTHING;
+
+  -- a prova: o challenge verificado mais recente é o que acabou de ativar o fator
+  SELECT c.id, c.verified_at
+    INTO v_challenge, v_verified
+    FROM auth.mfa_challenges c
+   WHERE c.factor_id = NEW.id
+     AND c.verified_at IS NOT NULL
+   ORDER BY c.verified_at DESC, c.id
+   LIMIT 1;
+
+  v_by_backend := v_challenge IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+        FROM private.mfa_backend_challenges b
+       WHERE b.challenge_id = v_challenge
+         AND b.factor_id = NEW.id
+         AND NOT b.factor_was_verified
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM auth.mfa_challenges c
+       WHERE c.factor_id = NEW.id
+         AND c.verified_at IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM private.mfa_backend_challenges b WHERE b.challenge_id = c.id
+         )
+    );
+
+  UPDATE private.mfa_backend_factors bf
+     SET proof_challenge_id = v_challenge,
+         proof_verified_at = v_verified,
+         proof_by_backend = v_by_backend
+   WHERE bf.factor_id = NEW.id
+     AND bf.proof_by_backend IS NULL;
+
+  RETURN NULL;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION private.snapshot_mfa_activation() FROM PUBLIC, anon, authenticated;
+
+CREATE TRIGGER on_mfa_factor_verified
+  AFTER UPDATE OF status ON auth.mfa_factors
+  FOR EACH ROW
+  WHEN (NEW.status = 'verified' AND OLD.status IS DISTINCT FROM NEW.status)
+  EXECUTE FUNCTION private.snapshot_mfa_activation();
 
 -- Funções do service_role (o app chama pelo client admin da infraestrutura de identidade) ------------
 -- Nenhuma lê `auth.uid()`: o ator é o próprio app, e os ids vêm como parâmetro. Por isso cada uma
@@ -630,15 +735,15 @@ GRANT EXECUTE ON FUNCTION public.record_backend_mfa_challenge(uuid, uuid, uuid) 
 --   * o challenge é desse fator, foi verificado há menos de 120 s e é um challenge do backend, e
 --     nenhuma outra sessão foi atestada com ele;
 --   * oráculo: nenhum challenge verificado nos últimos 120 s foi criado fora do backend;
---   * ativação: um fator que o backend cadastrou só é "ativado pelo backend" se um challenge dele,
---     registrado quando o fator ainda não estava verificado, foi verificado, e nenhum challenge
---     verificado de fora do backend jamais existiu para ele. A ativação é derivada, então um atestado
---     que falhou por indisponibilidade depois de o Auth já ter ativado o fator se recupera no
---     próximo verify, sem trancar o CEO. E só acontece UMA vez por usuário (`mfa_first_activations`,
---     F-64): depois do primeiro fator, um fator novo (de quem apagou o antigo no Auth) é recusado
---     com `factor_reenrolled`.
--- A prova da ativação não depende de o Auth guardar linhas (F-71): o instante da verificação é
--- copiado para o registro do backend aqui.
+--   * ativação: um fator que o backend cadastrou só é "ativado pelo backend" se a PROVA que o gatilho
+--     `on_mfa_factor_verified` gravou no registro do fator (F-73) diz que foi: um challenge dele,
+--     registrado quando o fator ainda não estava verificado, o verificou, e nenhum challenge
+--     verificado de fora do backend existia. O atestado lê só as tabelas do backend para isso (F-71),
+--     então um atestado que falhou por indisponibilidade depois de o Auth já ter ativado o fator se
+--     recupera no próximo verify, sem trancar o CEO. E só acontece UMA vez por usuário
+--     (`mfa_first_activations`, F-64): depois do primeiro fator, um fator novo (de quem apagou o
+--     antigo no Auth) é recusado com `factor_reenrolled`. O atestado que ativa apaga as outras sessões
+--     do usuário na própria transação (F-20, F-74).
 -- Toda recusa audita (`auth.mfa_attestation_refused`) e as de sinal de ataque apagam todas as
 -- sessões do usuário (ver `refuse_mfa_attestation`). Não dá para transformar isto em negação de
 -- serviço contra um CEO sem um código TOTP verificado direto no Auth: código errado não deixa
@@ -664,8 +769,9 @@ DECLARE
   v_challenge_factor uuid;
   v_verified_at   timestamptz;
   v_activated_at  timestamptz;
-  v_activation_challenge uuid;
-  v_activation_verified_at timestamptz;
+  v_proof_challenge uuid;
+  v_proof_by_backend boolean;
+  v_mark_factor   uuid;
   v_activated     boolean := false;
 BEGIN
   IF p_user_id IS NULL OR p_session_id IS NULL OR p_factor_id IS NULL OR p_challenge_id IS NULL THEN
@@ -716,8 +822,8 @@ BEGIN
 
   -- fator do backend (F-61: um fator verificado plantado direto no Auth nunca é atestado). A linha é
   -- travada: duas ativações concorrentes do mesmo fator se serializam.
-  SELECT bf.activated_at
-    INTO v_activated_at
+  SELECT bf.activated_at, bf.proof_challenge_id, bf.proof_by_backend
+    INTO v_activated_at, v_proof_challenge, v_proof_by_backend
     FROM private.mfa_backend_factors bf
    WHERE bf.factor_id = p_factor_id
      AND bf.user_id = p_user_id
@@ -778,64 +884,52 @@ BEGIN
 
   -- ativação pelo backend, na primeira vez do fator
   IF v_activated_at IS NULL THEN
-    -- F-64: o usuário já teve um primeiro fator ativado; este é um fator novo (o anterior foi apagado)
-    IF EXISTS (SELECT 1 FROM private.mfa_first_activations a WHERE a.user_id = p_user_id) THEN
-      RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_reenrolled');
-    END IF;
+    -- Trava o perfil: duas ativações do mesmo usuário (de fatores diferentes) se serializam, e a marca
+    -- abaixo é decidida por uma só.
+    PERFORM 1
+       FROM public.profiles p
+      WHERE p.id = p_user_id
+        FOR NO KEY UPDATE;
 
-    -- um challenge verificado que o backend não criou, em qualquer época, pode ter ativado o fator
-    IF EXISTS (
-      SELECT 1
-        FROM auth.mfa_challenges c
-       WHERE c.factor_id = p_factor_id
-         AND c.verified_at IS NOT NULL
-         AND NOT EXISTS (
-           SELECT 1
-             FROM private.mfa_backend_challenges b
-            WHERE b.challenge_id = c.id
-         )
-    ) THEN
+    -- Só a prova que o gatilho gravou no registro vale (F-73): o fator foi ativado por um challenge do
+    -- backend, registrado com o fator ainda não verificado, e nenhum challenge verificado de fora do
+    -- backend existia. Sem prova (NULL: um caminho que o gatilho não viu) ou com prova de fora: recusa.
+    IF v_proof_by_backend IS NOT TRUE THEN
       RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_not_activated_by_backend');
     END IF;
 
-    -- o challenge do backend, registrado com o fator ainda não verificado, que foi verificado (o
-    -- instante vem da cópia do registro, ou do Auth se a cópia ainda não existe)
-    SELECT b.challenge_id, coalesce(b.verified_at, c.verified_at)
-      INTO v_activation_challenge, v_activation_verified_at
-      FROM private.mfa_backend_challenges b
-      LEFT JOIN auth.mfa_challenges c ON c.id = b.challenge_id
-     WHERE b.factor_id = p_factor_id
-       AND b.user_id = p_user_id
-       AND NOT b.factor_was_verified
-       AND coalesce(b.verified_at, c.verified_at) IS NOT NULL
-     ORDER BY coalesce(b.verified_at, c.verified_at), b.challenge_id
-     LIMIT 1;
-    IF NOT FOUND THEN
-      RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_not_activated_by_backend');
+    -- F-64: a marca do usuário é deste fator (o gatilho a gravou na ativação) ou não existe ainda; de
+    -- outro fator, este é um fator NOVO (o antigo foi apagado) e é recusado. Nada inserido e marca de
+    -- outro fator = recusa, nunca um silencioso "já existe".
+    INSERT INTO private.mfa_first_activations (user_id, factor_id)
+    VALUES (p_user_id, p_factor_id)
+    ON CONFLICT (user_id) DO NOTHING
+    RETURNING factor_id INTO v_mark_factor;
+    IF v_mark_factor IS NULL THEN
+      SELECT m.factor_id
+        INTO v_mark_factor
+        FROM private.mfa_first_activations m
+       WHERE m.user_id = p_user_id;
+      IF v_mark_factor IS DISTINCT FROM p_factor_id THEN
+        RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_reenrolled');
+      END IF;
     END IF;
-
-    UPDATE private.mfa_backend_challenges b
-       SET verified_at = v_activation_verified_at
-     WHERE b.challenge_id = v_activation_challenge
-       AND b.verified_at IS NULL;
 
     UPDATE private.mfa_backend_factors bf
        SET activated_at = now(),
-           activation_challenge_id = v_activation_challenge
+           activation_challenge_id = v_proof_challenge
      WHERE bf.factor_id = p_factor_id;
 
-    INSERT INTO private.mfa_first_activations (user_id)
-    VALUES (p_user_id)
-    ON CONFLICT (user_id) DO NOTHING;
+    -- F-20, F-74: a conta ganhou o segundo fator; uma sessão aberta só com a senha (ou um cookie
+    -- roubado) não sobrevive a este momento. Dentro do atestado, na mesma transação, como o
+    -- `mark_password_changed()` faz: o `signOut` do app era melhor esforço, fora da transação, e se
+    -- falhasse nada o repetia.
+    DELETE FROM auth.sessions s
+     WHERE s.user_id = p_user_id
+       AND s.id <> p_session_id;
 
     v_activated := true;
   END IF;
-
-  -- a cópia do instante da verificação deste challenge: a prova não depende de o Auth guardar a linha
-  UPDATE private.mfa_backend_challenges b
-     SET verified_at = v_verified_at
-   WHERE b.challenge_id = p_challenge_id
-     AND b.verified_at IS NULL;
 
   INSERT INTO private.mfa_session_attestations AS a (session_id, user_id, factor_id, challenge_id)
   VALUES (p_session_id, p_user_id, p_factor_id, p_challenge_id)

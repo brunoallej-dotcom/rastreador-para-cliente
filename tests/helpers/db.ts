@@ -103,3 +103,57 @@ export async function resetFirstActivation(userId: string): Promise<boolean> {
   );
   return rows.length === 1;
 }
+
+/** The factor whose activation created the user's first-activation mark, or `undefined` if none (F-73). */
+export async function firstActivationFactorOf(userId: string): Promise<string | undefined> {
+  assertUuid(userId, 'firstActivationFactorOf');
+  const rows = await queryLocal(
+    `SELECT factor_id FROM private.mfa_first_activations WHERE user_id = '${userId}'`,
+  );
+  const row = z.array(z.object({ factor_id: z.string() })).parse(rows)[0];
+  return row?.factor_id;
+}
+
+/** What the activation trigger wrote into the registry for a factor (F-73): the proof of the activation. */
+export async function activationProofOf(
+  factorId: string,
+): Promise<{ byBackend: boolean | null; hasChallenge: boolean; hasInstant: boolean } | undefined> {
+  assertUuid(factorId, 'activationProofOf');
+  const rows = await queryLocal(
+    `SELECT proof_by_backend, proof_challenge_id IS NOT NULL AS has_challenge, ` +
+      `proof_verified_at IS NOT NULL AS has_instant ` +
+      `FROM private.mfa_backend_factors WHERE factor_id = '${factorId}'`,
+  );
+  const row = z
+    .array(
+      z.object({
+        proof_by_backend: z.boolean().nullable(),
+        has_challenge: z.boolean(),
+        has_instant: z.boolean(),
+      }),
+    )
+    .parse(rows)[0];
+  return row === undefined
+    ? undefined
+    : {
+        byBackend: row.proof_by_backend,
+        hasChallenge: row.has_challenge,
+        hasInstant: row.has_instant,
+      };
+}
+
+/**
+ * The ids of the challenges the backend recorded for a user. They stay on the server: the oracle check
+ * tells the backend's challenges from the ones made at Auth by them, so a test uses this to prove that no
+ * response and no log line carries one (F-63).
+ */
+export async function backendChallengeIdsOf(userId: string): Promise<string[]> {
+  assertUuid(userId, 'backendChallengeIdsOf');
+  const rows = await queryLocal(
+    `SELECT challenge_id FROM private.mfa_backend_challenges WHERE user_id = '${userId}'`,
+  );
+  return z
+    .array(z.object({ challenge_id: z.string() }))
+    .parse(rows)
+    .map((row) => row.challenge_id);
+}

@@ -785,7 +785,6 @@ describe('hardening of the verification (F-20 to F-23)', () => {
     expect(await getSession(own).then(bodyOf)).toMatchObject({ aal: 'aal2', pendingActions: [] });
     expect((await callAdmin(own)).status).toBe(200);
     expect(events('auth.mfa.verified')).toEqual([expect.objectContaining({ activated: true })]);
-    expect(events('auth.mfa.followup_failed')).toEqual([]);
   });
 
   it("F-20: a later login that only verifies the same factor leaves the CEO's other sessions alone (with the deprecated factorId, which is still accepted)", async () => {

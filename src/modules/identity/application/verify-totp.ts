@@ -47,13 +47,11 @@ export type VerifyTotpOutcome = {
   readonly candidateCount: number | undefined;
   /** How many of them the backend did not enroll (F-60, F-61); `undefined` when the request named the factor. */
   readonly foreignFactorCount: number | undefined;
-  /** This verification activated the FIRST factor of the CEO (it was unverified until now). */
-  readonly activated: boolean;
   /**
-   * `null`: nothing was asked (only the first activation revokes). `true`: the other sessions of
-   * the CEO were signed out. `false`: it was asked and failed (F-20); the verification stands.
+   * This verification ACTIVATED the first factor of the CEO (the database says so, F-72). The database
+   * then deleted every other session of the CEO inside the attestation (F-20, F-74).
    */
-  readonly otherSessionsRevoked: boolean | null;
+  readonly activated: boolean;
 };
 
 /**
@@ -82,10 +80,11 @@ export type VerifyTotpOutcome = {
  *    session stays unattested: pending `VERIFY_MFA`, a 503 (fail closed) whose `detail` says to wait
  *    for the next code, because this one is burned (`NEXT_CODE_HINT`, E-37).
  * 6. When THIS attestation ACTIVATED the first factor of the CEO (the database says so: it derives the
- *    activation, so it is also the retry after an attestation that failed), the other sessions of the
- *    CEO are signed out, so a session opened with the password alone does not outlive the moment the
- *    account gets its second factor (F-20, F-72). It is best effort: a failure never turns a good
- *    verification into an error, and the caller logs it.
+ *    activation from the proof the activation trigger wrote, so it is also the retry after an
+ *    attestation that failed), the DATABASE deletes the other sessions of the CEO inside the same
+ *    transaction, so a session opened with the password alone does not outlive the moment the account
+ *    gets its second factor (F-20, F-72, F-74). The use case calls nothing for it: the app's
+ *    `signOut({ scope: 'others' })` was best effort, outside the transaction, and nothing retried it.
  *
  * What this does NOT do (F-23): the refresh token a browser held BEFORE the verification keeps
  * working for the Auth server's reuse interval (`refresh_token_reuse_interval`, 10 s locally) and
@@ -152,9 +151,6 @@ export async function verifyTotp(
   }
 
   const { activated } = attestation;
-  const otherSessionsRevoked = activated
-    ? await attempt(() => deps.mfa.revokeOtherSessions())
-    : null;
 
   // The principal read above predates the attestation (it says `aal1`): read it again.
   const attested = await deps.principals.current();
@@ -175,7 +171,6 @@ export async function verifyTotp(
     candidateCount,
     foreignFactorCount,
     activated,
-    otherSessionsRevoked,
   });
 }
 
@@ -264,15 +259,5 @@ async function withNextCodeHint<T>(run: () => Promise<T>): Promise<T> {
       throw new ServiceUnavailableError(error.message, { cause: error, detail: NEXT_CODE_HINT });
     }
     throw error;
-  }
-}
-
-/** Runs a best-effort step: `true` when it worked, `false` when it threw (the caller logs it). */
-async function attempt(step: () => Promise<void>): Promise<boolean> {
-  try {
-    await step();
-    return true;
-  } catch {
-    return false;
   }
 }

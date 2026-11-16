@@ -11,7 +11,7 @@
 --   tests.attest_session(user_id, session_id DEFAULT NULL) devolve boolean
 --       atesta a sessão (session_id; por padrão a do próprio usuário) como o backend faria: eleva a
 --       sessão a aal2, registra o fator TOTP verificado do CEO como cadastrado e ativado pelo
---       backend, registra e verifica um challenge do backend e chama a função REAL
+--       backend (com a prova que o gatilho gravaria), registra e verifica um challenge do backend e chama a função REAL
 --       public.attest_mfa_session (levanta erro se ela recusar). false, sem fazer nada, quando não há
 --       o que atestar: usuário que não é CEO ou está desativado, sem fator TOTP verificado ou sem a sessão.
 --   tests.reset_first_activation(user_id)
@@ -135,6 +135,14 @@ BEGIN
   VALUES (v_challenge_id, v_factor_id, now(), now(), '127.0.0.1');
   INSERT INTO private.mfa_backend_challenges (challenge_id, factor_id, user_id, factor_was_verified)
   VALUES (v_challenge_id, v_factor_id, p_user_id, v_activated);
+  -- a PROVA da ativação que o gatilho on_mfa_factor_verified gravaria quando o Auth ativa o fator (a
+  -- ativação deste helper é pelo backend); fator já ativado mantém a prova que tem
+  UPDATE private.mfa_backend_factors
+     SET proof_challenge_id = v_challenge_id,
+         proof_verified_at = now(),
+         proof_by_backend = true
+   WHERE factor_id = v_factor_id
+     AND proof_by_backend IS NULL;
 
   v_result := public.attest_mfa_session(p_user_id, v_session_id, v_factor_id, v_challenge_id);
   IF v_result NOT IN ('attested', 'attested_activated') THEN
