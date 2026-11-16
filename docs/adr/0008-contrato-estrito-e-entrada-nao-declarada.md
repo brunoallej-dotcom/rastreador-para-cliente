@@ -1,6 +1,6 @@
 # ADR 0008 — Contrato como teto de respostas: entrada não declarada é ignorada
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto

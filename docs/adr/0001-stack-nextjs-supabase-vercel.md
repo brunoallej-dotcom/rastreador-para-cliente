@@ -1,6 +1,6 @@
 # ADR 0001 — Stack: Next.js + TypeScript na Vercel, Supabase (Postgres + Auth)
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-15
 - **Spec:** [`docs/specs/client-delivery-tracker.md`](../specs/client-delivery-tracker.md)
 

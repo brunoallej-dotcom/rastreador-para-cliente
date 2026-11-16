@@ -1,6 +1,6 @@
 # ADR 0003 — Autorização em três camadas: pipeline, funções `SECURITY DEFINER` e RLS
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-15
 
 ## Contexto

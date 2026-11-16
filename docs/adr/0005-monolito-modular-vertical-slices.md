@@ -1,6 +1,6 @@
 # ADR 0005 — Monolito modular com vertical slices e camadas DDD
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-15
 
 ## Contexto

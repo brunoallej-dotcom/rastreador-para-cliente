@@ -1,6 +1,6 @@
 # ADR 0007 — Prova de troca de senha por linha de base do hash
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto

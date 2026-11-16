@@ -13,20 +13,25 @@
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
-| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
-| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6 | 8 | ⬜ |
-| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6 | 7 | ⬜ |
+| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | 🟡 |
+| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
+| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
+| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10 | — | ⬜ |
 
 ```
 0 ─┬─ 1 ─┐
-   └─ 2 ─┴─ 3 ─┬─ 4 ───────────┐
-               └─ 5 ─ 6 ─┬─────┴─ 7 ─┐
-                         └─ 8 ─┬─ 9 ─┤
-                               └─ 10 ┴─ 11
+   └─ 2 ─┴─ 3 ─┬─ 4 ─────────────────┐
+               └─ 5 ─ 6 ─ 6.1 ─┬─────┴─ 7 ─┐
+                               └─ 8 ─┬─ 9 ─┤
+                                     └─ 10 ┴─ 11
 ```
+
+A Onda 6.1 entrou em 2026-11-16, por decisão do usuário sobre os achados F-50 e F-41 (threat model
+§8). Ela muda `private.is_ceo()` e `private.current_active_user_id()`, de que todas as ondas
+seguintes dependem. Feita depois, obrigaria a refazer os testes das ondas 7 a 10.
 
 **Por que os pares paralelos são seguros** (critérios: sem dependência, arquivos disjuntos, sem
 interface pública compartilhada alterada e, na execução, sem usar o Supabase local ao mesmo
@@ -42,7 +47,7 @@ tempo):
 
 ### Sequência de execução
 
-12 ondas em 8 passos. Caminho crítico: 0 → 2 → 3 → 5 → 6 → 8 → 9 → 11.
+13 ondas em 9 passos. Caminho crítico: 0 → 2 → 3 → 5 → 6 → 6.1 → 8 → 9 → 11.
 
 | Passo | Ondas | Quem executa |
 |-------|-------|--------------|
@@ -50,10 +55,11 @@ tempo):
 | 2 | 1 ∥ 2 | 2 na sessão principal; 1 em subagente |
 | 3 | 3 | sessão principal |
 | 4 | 4 ∥ 5 | 5 na sessão principal; 4 em subagente |
-| 5 | 6 (a 4 pode continuar rodando) | subagente; a sessão principal coordena a fila de gates de banco |
-| 6 | 7 ∥ 8 | um subagente para cada; a sessão principal coordena a fila de gates de banco |
-| 7 | 9 ∥ 10 | 9 na sessão principal; 10 em subagente |
-| 8 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
+| 5 | 6, em paralelo com o PR do contrato `1.0.0-draft.2` e com o da troca do CodeQL pelo Semgrep | subagentes; a sessão principal coordena a fila de gates de banco |
+| 6 | 6.1 (depois do merge da 6 e do contrato, que mexe no mesmo verify de TOTP) | subagente, com revisão reforçada na sessão principal |
+| 7 | 7 ∥ 8 | um subagente para cada; a sessão principal coordena a fila de gates de banco |
+| 8 | 9 ∥ 10 | 9 na sessão principal; 10 em subagente |
+| 9 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
 
 ### Pré-requisitos do paralelismo com subagentes
 
@@ -234,6 +240,45 @@ tempo):
   adulterado).
 - **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "AC-11|E-29" executa pelo menos 2 testes, todos verdes, stop after 10 tries`
 
+## Onda 6.1 — Identidade: elevação de CEO atestada pelo backend e validade da senha temporária
+
+- **Origem**: decisões do usuário em 2026-11-16, sobre os achados F-50 (b) e F-41 do threat model
+  (§8).
+- **Objetivo**:
+  1. Uma sessão `aal2` só vale como CEO se o verify de TOTP passou pelo backend, que aplica os
+     limites de força bruta (5 / 5 min e 20 / dia) e queima o código usado. Uma `aal2` obtida
+     direto no Auth, com a senha e a publishable key, não dá poder de CEO nem pelo backend nem
+     pelo PostgREST.
+  2. A senha temporária, gerada na criação ou num reset, vale 72 h. Vencida, a conta perde o
+     principal até receber um reset.
+- **Escopo (slices/arquivos)**:
+  - ADR 0013, mais a spec: SEC-11, RF-04, SEC-10, §3.5 e casos E-xx novos.
+  - Threat model: F-50, F-41 e T-22.
+  - Migration com:
+    - a tabela de atestados por `session_id`, com FK para `auth.sessions` e `ON DELETE CASCADE`;
+    - a função de atestado, executável só pelo `service_role`, chamada pelo cliente admin da
+      infraestrutura de identidade (ADR 0006);
+    - `private.is_ceo()` passando a exigir o atestado;
+    - `private.current_active_user_id()` aplicando a validade, com base no registro da senha
+      temporária que a Onda 2 já mantém.
+  - O handler do verify grava o atestado.
+  - `GET /auth/session` trata `aal2` sem atestado como pendência `VERIFY_MFA`.
+  - Ajuste dos helpers pgTAP e de API (`loginAsCeoWithMfa` passa pelo backend e recebe o
+    atestado).
+- **Brecha a fechar (oráculo)**: quem tem a senha e a publishable key pode chutar o TOTP direto
+  no Auth, descobrir um código válido e reapresentá-lo pelo backend ainda dentro da janela, porque
+  o Auth não tem proteção contra replay. O atestado é recusado quando o fator tem, na janela do
+  TOTP, um challenge verificado que não foi criado pelo backend. A recusa gera auditoria e alerta.
+- **Depende de / paralela com**: 5, 6 e o PR do contrato `1.0.0-draft.2`, que mexe no mesmo
+  verify / —.
+- **Critérios de aceite**: os IDs novos da spec, a partir de E-31:
+  - `aal2` obtida direto no Auth não executa função de CEO (pgTAP e API);
+  - código descoberto fora do backend e reapresentado por ele é recusado com 422;
+  - senha temporária com mais de 72 h fica sem principal, e o login é recusado com o erro
+    genérico;
+  - um reset renova o prazo.
+- **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "E-3[1-9]" executa pelo menos 4 testes, todos verdes, stop after 10 tries`
+
 ## Onda 7 — Identidade: logins de cliente
 
 - **Objetivo**: CEOs provisionam, listam, desativam e resetam logins de clientes.
@@ -243,8 +288,10 @@ tempo):
   `identity/presentation/*client-user*`, rotas `admin/clients/[clientId]/users/**`,
   `tests/helpers/client-users.ts`, `tests/api/admin-client-users.api.test.ts`. **Sem migration**
   (funções criadas na Onda 2).
-- **Depende de / paralela com**: 4 (gerador de senha temporária), 6 (`getClientStatus`) / **8**.
-- **Critérios de aceite**: AC-12, AC-13, AC-14; E-16, E-17, E-18, E-19, E-23, E-24.
+- **Depende de / paralela com**: 4 (gerador de senha temporária), 6 (`getClientStatus`), 6.1
+  (validade da senha temporária) / **8**.
+- **Critérios de aceite**: AC-12, AC-13, AC-14; E-16, E-17, E-18, E-19, E-23, E-24. O reset de
+  senha de cliente renova o prazo de 72 h da senha temporária (F-41, Onda 6.1).
 - **Goal command**: `/goal pnpm verify && pnpm test:api terminam com exit 0 e pnpm test:api -t "AC-1[234]|E-(1[6789]|2[34])" executa pelo menos 9 testes, todos verdes, stop after 12 tries`
 
 ## Onda 8 — Rastreamento: processos e fases
@@ -259,7 +306,7 @@ tempo):
   `admin/stage-templates/default`, migration com `create_process` e `update_process`,
   `supabase/tests/tracking_processes.test.sql`, `tests/helpers/processes.ts`,
   `tests/api/admin-processes.api.test.ts`.
-- **Depende de / paralela com**: 6 / **7**.
+- **Depende de / paralela com**: 6.1 (os testes de CEO usam o atestado) / **7**.
 - **Critérios de aceite**: AC-15, AC-19; testes unitários cobrindo I1–I6 (cobertura ≥ 80% em
   `tracking/domain` e `tracking/application`); E-16, E-20.
 - **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0, pnpm test:api -t "AC-1[59]|E-(16|20)" executa pelo menos 4 testes verdes, e a cobertura de src/modules/tracking/{domain,application} é ≥ 80%, stop after 12 tries`
@@ -315,11 +362,26 @@ tempo):
     - `token_refresh` dimensionado;
     - assinatura assimétrica, com o segredo HS256 legado revogado.
   - p95 da recusa de conta desativada medido. Se passar de 400 ms, subir `REFUSED_LOGIN_FLOOR_MS`.
-  - Candidatos de implementação:
-    - `pg_cron` que apaga as sessões que `session_is_alive()` já nega;
-    - trigger que detecta troca de senha feita direto no Auth;
-    - enroll de TOTP amarrado à sessão que limpou `CHANGE_PASSWORD` (F-20);
-    - script de reset de MFA de CEO (E-25).
+  - **F-50 (c), decidido em 2026-11-16:**
+    - a publishable key é tratada como segredo: só no servidor, nunca em log, e rotacionada a
+      qualquer exposição;
+    - proteção de senha vazada (HIBP) ligada;
+    - alerta sobre falhas de login e de MFA nos logs do Auth.
+  - **F-20, decidido em 2026-11-16:** o cadastro do TOTP fica amarrado à sessão que limpou
+    `CHANGE_PASSWORD`.
+  - **Scripts operacionais de CEO**, sem os quais um CEO pode ficar trancado:
+    - reset de senha (F-41: a senha temporária vence em 72 h);
+    - reset de MFA (E-25).
+  - **F-23:** `refresh_token_reuse_interval` mais baixo no projeto hospedado.
+- **Também na Onda 11, decididos em 2026-11-16**:
+  - **F-03 (c):** cookie de dispositivo, na linha da recomendação da OWASP. O navegador que já
+    entrou com sucesso não fica bloqueado pelo ataque à conta. Muda o §3.9 da spec.
+  - BAIXOs do security-scan:
+    - OTP de e-mail mais curto no `config.toml` (`max_frequency` e `otp_expiry`);
+    - headers `Cross-Origin-Opener-Policy` e `Cross-Origin-Resource-Policy`.
+- Candidatos de implementação:
+  - `pg_cron` que apaga as sessões que `session_is_alive()` já nega;
+  - trigger que detecta troca de senha feita direto no Auth.
 - **Depende de / paralela com**: 7, 9, 10 / —.
 - **Critérios de aceite**: AC-30 completo; k6 dentro do RNF-02; ZAP sem alertas High;
   `GET https://<domínio>/api/v1/health` → 200; `security-scan` sem achados críticos ou altos;

@@ -1,6 +1,6 @@
 # ADR 0010 — Troca de senha: a senha atual é provada por re-autenticação
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto

@@ -8,7 +8,8 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 6 (clientes), depois 7 ∥ 8.
+- **Próximas ondas:** 6 (clientes), com o PR do contrato `1.0.0-draft.2` e o da troca do CodeQL
+  pelo Semgrep em paralelo; depois 6.1 (F-50 e F-41, decidida em 2026-11-16), 7 ∥ 8 e 9 ∥ 10.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -20,9 +21,10 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
-| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
-| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6 | 8 | ⬜ |
-| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6 | 7 | ⬜ |
+| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | 🟡 |
+| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
+| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
+| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10 | — | ⬜ |
@@ -33,16 +35,12 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 | Pendência | Bloqueia |
 |-----------|----------|
-| Revisar e aceitar os ADRs 0001–0009 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
-| F-03: bloqueio direcionado de conta (threat model T-04, §8): escolher a mudança no §3.9 da spec | risco aberto até a decisão |
-| **`factorId` depois do enroll** (threat model §8): o contrato não oferece como obtê-lo, então um CEO num dispositivo novo (`VERIFY_MFA`) não consegue verificar. Opções: `TotpVerifyRequest.factorId` opcional resolvido no servidor (recomendado) ou o fator no DTO `Session` | **frontend e go-live** (mudança de contrato) |
-| F-23: o refresh token anterior ao verify ainda rende `aal2` durante o `refresh_token_reuse_interval` (10 s); a decisão é reduzir o intervalo (threat model §7) | Onda 11 |
-| F-41: prazo de validade da senha temporária (threat model §8) | decisão de spec; exige caminho de reset de CEO |
-| Proposta de mudança de contrato (threat model §8): limites de `newPassword` × 422, `currentPassword` em bytes, `Set-Cookie` no 204 e 503 de `changePassword`, orçamentos programáticos fora do `x-rate-limit` | OK do usuário (bump minor) |
 | Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
 | Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
-| Ativar branch protection na `main` (o repositório remoto já existe) e restringir o merge a squash | CI da Onda 0 |
+| Deixar o repositório privado (decidido em 2026-11-16) **depois** do merge do PR do Semgrep, que substitui o CodeQL (code scanning não existe em repositório privado de conta pessoal no GitHub Free) | exposição do threat model com achados abertos |
+| Branch protection na `main` e merge só por squash: em repositório privado, exige GitHub Pro (no Free, só repositório público tem branch protection e rulesets) | CI da Onda 0 |
+| Corrigir no código-fonte do `@aisac/cli` o falso positivo do `secrets-guard` (identificador terminado em `.key` em comando Bash; ver CLAUDE.md) | conforto dos agentes |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
 | Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
@@ -281,3 +279,49 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   `pnpm verify` → 1642 unit + 530 pgTAP (522 + 8 do rls-auditor); `pnpm db:lint` ok; `pnpm db:types` sem diff;
   `pnpm test:api` → 162/162 duas vezes; `pnpm test:api -t "AC-07|E-2[678]"` → 11 verdes;
   `pnpm test:int` → 22/22; `build`, `format:check` e `test:hooks` (179) ok.
+
+### 2026-11-16 — Decisões do usuário sobre as pendências da noite
+
+- O usuário aprovou todas as recomendações do método AISAC para as pendências acumuladas
+  ("ok para todos, siga as recomendações do AISAC"). Registro:
+  - **Contrato `1.0.0-draft.2`**, num PR próprio feito por subagente:
+    - `TotpVerifyRequest.factorId` opcional e obsoleto, com o servidor resolvendo o fator pela
+      sessão. Era o bloqueio do frontend.
+    - `changePassword` descrevendo o comportamento real.
+    - Orçamentos programáticos no `x-rate-limit`.
+    - 503 nas operações autenticadas.
+  - **F-03:** opção (c), cookie de dispositivo, na Onda 11. Muda o §3.9 da spec.
+  - **F-41:** senha temporária válida por 72 h. Entra na **Onda 6.1, nova**, e não na 7 como foi
+    dito ao usuário. Motivo: a validade muda `current_active_user_id()`, e o F-50 (b) muda
+    `is_ceo()`. As duas mexem nas mesmas funções de identidade, e assim a Onda 7 continua sem
+    migration, o que mantém o par 7 ∥ 8 com uma migration só.
+  - **F-20:** o cadastro do TOTP fica amarrado à sessão, como gate de go-live da Onda 11, junto
+    com os scripts de reset de senha e de MFA de CEO.
+  - **F-50:**
+    - (c), a publishable key tratada como segredo, é o controle principal e gate da Onda 11;
+    - (b), o atestado do backend por `session_id`, entra na Onda 6.1 como defesa em
+      profundidade, fechando o oráculo "chutar o TOTP no Auth e reapresentar pelo backend";
+    - (a), o plano Teams, fica fora.
+  - **BAIXOs:**
+    - o limite por usuário depois do principal: aceito;
+    - o minimatch: aceito por ora, porque não há versão compatível corrigida
+      (`typescript-estree` 8.72.2 exige `^10`, e a correção está na 11);
+    - o OTP de e-mail e os headers CORP/COOP: Onda 11.
+  - **Repositório privado até o go-live.** Antes, o CodeQL dá lugar ao Semgrep CE, num PR
+    próprio, porque code scanning não existe em repositório privado de conta pessoal no GitHub
+    Free. A visibilidade só muda depois desse merge. No Free, branch protection em repositório
+    privado exige GitHub Pro (pendência do usuário).
+  - **Claude Code:**
+    - `.claude/settings.json` voltou a pedir confirmação para push, PR e merge (revert da
+      liberação da noite);
+    - os allows de push em `feat/*` saíram do `settings.local.json`;
+    - deny dos arquivos de ambiente reais em qualquer profundidade, e de
+      `git diff|log|show --output`;
+    - tabela de hooks do CLAUDE.md corrigida (`SubagentStop`, matchers e o `secrets-guard` do
+      plugin AISAC);
+    - `.claude/agent-memory/` passa a ser versionado;
+    - ADRs 0001–0010 `accepted`.
+- Numeração reservada de ADRs:
+  - 0011: contrato `draft.2`, se precisar;
+  - 0012: repositório privado e Semgrep;
+  - 0013: atestado da Onda 6.1.

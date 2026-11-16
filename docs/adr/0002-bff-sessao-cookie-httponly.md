@@ -1,6 +1,6 @@
 # ADR 0002 — Next.js como BFF, com sessão em cookie HttpOnly
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-15
 
 ## Contexto

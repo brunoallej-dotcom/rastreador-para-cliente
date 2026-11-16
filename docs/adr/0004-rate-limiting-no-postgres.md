@@ -1,6 +1,6 @@
 # ADR 0004 — Rate limiting com contadores no Postgres
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-15
 
 ## Contexto

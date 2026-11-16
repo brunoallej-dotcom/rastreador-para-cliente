@@ -1,6 +1,6 @@
 # ADR 0006 — Privilégios mínimos do `service_role` no banco
 
-- **Status:** proposed
+- **Status:** accepted
 - **Data:** 2026-11-16
 
 ## Contexto
