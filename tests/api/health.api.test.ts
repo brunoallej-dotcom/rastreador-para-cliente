@@ -1,0 +1,78 @@
+// API test of GET /api/v1/health (operationId getHealth): the real route module, invoked with a
+// NextRequest, the real pipeline and wiring, and the response validated against the OpenAPI
+// contract including its headers. The env comes from the `api` project setup (local Supabase).
+import { NextRequest } from 'next/server';
+import { describe, expect, it } from 'vitest';
+import { GET } from '@/app/api/v1/health/route';
+import { expectToMatchContract } from '../helpers/contract';
+
+const HEALTH_URL = 'http://localhost:3000/api/v1/health';
+/** `x-rate-limit` of getHealth: ip, 60 requests per 60 s. */
+const HEALTH_LIMIT = 60;
+
+let nextClient = 0;
+/** Each test is its own client IP, so the process-wide limiter never couples two tests. */
+const freshClient = () => {
+  nextClient += 1;
+  return { 'x-real-ip': `198.51.100.${nextClient}` };
+};
+
+const getHealth = (headers: Record<string, string> = freshClient()) =>
+  GET(new NextRequest(HEALTH_URL, { headers }), { params: Promise.resolve({}) });
+
+describe('GET /api/v1/health', () => {
+  it('AC-29: answers 200 { "status": "ok" } without a session, and the Response matches the contract', async () => {
+    const response = await getHealth();
+    const body: unknown = await response.clone().json();
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ status: 'ok' });
+    // body, Content-Type and the declared headers (X-Request-Id pattern)
+    expectToMatchContract('getHealth', 200, body, response);
+  });
+
+  it('AC-22: carries the security headers and echoes a valid X-Request-Id', async () => {
+    const response = await getHealth({ ...freshClient(), 'x-request-id': 'api-test-health-01' });
+
+    expect(response.headers.get('x-request-id')).toBe('api-test-health-01');
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('strict-transport-security')).toContain('includeSubDomains');
+    expect(response.headers.get('content-security-policy')).toBe(
+      "default-src 'none'; frame-ancestors 'none'",
+    );
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('x-frame-options')).toBe('DENY');
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('permissions-policy')).toBeTruthy();
+    expect(response.headers.get('x-powered-by')).toBeNull();
+    expectToMatchContract('getHealth', 200, await response.clone().json(), response);
+  });
+
+  it('ignores query parameters it does not declare: getHealth documents no 400', async () => {
+    const response = await GET(
+      new NextRequest(`${HEALTH_URL}?utm_source=probe&cache=1`, { headers: freshClient() }),
+      { params: Promise.resolve({}) },
+    );
+    expect(response.status).toBe(200);
+    expectToMatchContract('getHealth', 200, await response.clone().json(), response);
+  });
+
+  it('the 61st request from one client in a minute is 429 with Retry-After, per the contract', async () => {
+    const client = freshClient();
+    for (let request = 1; request <= HEALTH_LIMIT; request += 1) {
+      const response = await getHealth(client);
+      expect(response.status, `request ${request}`).toBe(200);
+    }
+
+    const throttled = await getHealth(client);
+    const body: unknown = await throttled.clone().json();
+    expect(throttled.status).toBe(429);
+    expect(body).toMatchObject({ code: 'RATE_LIMITED', status: 429 });
+    expect(Number(throttled.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    // problem+json body, Content-Type, X-Request-Id and Retry-After (an integer >= 1) per contract
+    expectToMatchContract('getHealth', 429, body, throttled);
+
+    // the limit is per client: somebody else is unaffected
+    expect((await getHealth(freshClient())).status).toBe(200);
+  });
+});

@@ -54,29 +54,91 @@ export async function approveCurrentStage(
 
 ## 4. Presentation (`src/modules/<mod>/presentation/`)
 
+Arquivo `approve-current-stage.handler.ts`. O handler **monta as próprias dependências, dentro do
+próprio arquivo**: não existe container de DI nem fábrica compartilhada por módulo, para duas ondas
+paralelas nunca editarem o mesmo arquivo.
+
 ```ts
+import { z } from 'zod';
+import { systemClock } from '@/shared/kernel';
+import { json, withRoute } from '@/shared/http';
+import { approveCurrentStage } from '../application/approve-current-stage';
+import { createSupabaseProcessRepository } from '../infrastructure/supabase-process-repository';
+import { toProcessDetailDto } from './process-dto';
+
 export const approveCurrentStageHandler = withRoute(
   {
     access: 'authenticated',
-    roles: ['ceo'],
-    allowPending: [],
-    rateLimit: { scope: 'user', limit: 60, windowSeconds: 60 }, // = x-rate-limit
-    params: z.object({ processId: z.string().uuid() }).strict(),
-    body: z.object({ expectedStageId: z.string().uuid() }).strict(),
+    roles: ['ceo'], // = x-auth-policy.roles (lista não vazia)
+    allowPending: [], // = x-auth-policy.allowPending (obrigatório; [] = nenhuma)
+    // = x-rate-limit; group = nome do contador (ver abaixo); sempre array, nunca vazio
+    rateLimit: [{ scope: 'user', group: 'writes', limit: 60, windowSeconds: 60 }],
+    params: z.object({ processId: z.uuid() }).strict(),
+    body: z.object({ expectedStageId: z.uuid() }).strict(),
   },
-  async ({ principal, params, body, deps }) => {
-    const result = await approveCurrentStage(deps.tracking(), principal, {
+  async ({ principal, params, body, requestId, cookies }) => {
+    // Dependências montadas aqui, por requisição. A infraestrutura do módulo recebe o que precisa
+    // do contexto (cookies da sessão e requestId, que vai no header x-request-id para o banco).
+    const processes = createSupabaseProcessRepository({ cookies, requestId });
+
+    const result = await approveCurrentStage({ processes, clock: systemClock }, principal, {
       processId: params.processId,
       expectedStageId: body.expectedStageId,
     });
-    return result.ok ? json(200, toProcessDetailDto(result.value)) : result.error; // erro → problem+json
+    // Erro de domínio: devolva (ou lance) o DomainError; o pipeline responde problem+json.
+    return result.ok ? json(200, toProcessDetailDto(result.value)) : result.error;
   },
 );
 ```
 
+API do `withRoute(policy, handler)` (`@/shared/http`):
+
+- **Política sem default.** `{ access: 'public' }` precisa ser escrito. `{ access: 'authenticated' }`
+  exige `roles` (não vazio) e `allowPending`. `withRoute` sem política, ou com política incompleta,
+  não compila. O tipo de `principal` no handler é `Principal` (nunca `null`) em rota autenticada e
+  `null` em rota pública.
+- **`rateLimit` é obrigatório e não vazio em toda rota** (o contrato declara `x-rate-limit` em todas
+  as operações; sem ele a rota seria ilimitada, e `withRoute` não compila nem carrega). É um array de
+  `{ scope: 'ip' | 'account' | 'user', group, limit, windowSeconds }`, com `limit` e `windowSeconds`
+  iguais ao `x-rate-limit` do contrato. Rota pública exige ao menos uma regra `ip`. `ip` roda antes
+  da autenticação, `user` logo depois dela. `account` só existe em rota pública, exige `body` e
+  `accountKey: (body) => string` (login: o e-mail normalizado) e roda depois da validação.
+- **`group`** é o nome do contador (spec §3.9), declarado por quem escreve a rota; o contador é
+  `scope:group` (ex.: `user:writes`) por sujeito. Duas rotas dividem o mesmo contador só se tiverem
+  o mesmo `scope` e o mesmo `group`, e todas as regras de um grupo têm os mesmos `limit` e
+  `windowSeconds`. Os grupos (`RATE_LIMIT_GROUPS`):
+
+  | `group` | Rotas |
+  |---------|-------|
+  | `login` | `POST /auth/login` (regras `ip` 20/15 min e `account` 10/15 min) |
+  | `totp-enroll` | `POST /auth/mfa/totp/enroll` (user 10/15 min, vem do contrato) |
+  | `totp-verify` | `POST /auth/mfa/totp/verify` (user 5/5 min) |
+  | `password-change` | `POST /auth/password` (user 5/15 min) |
+  | `client-user-admin` | provisionar e resetar senha de login de cliente, juntos (user 20/h) |
+  | `writes` | as demais escritas autenticadas (user 60/min), `logout` inclusive |
+  | `reads` | as leituras autenticadas (user 300/min), `GET /auth/session` inclusive |
+  | `health` | `GET /health` (ip 60/min) |
+
+- **Corpo e query.** Rota sem schema de `body` **ignora o corpo**: não o lê nem checa Content-Type
+  ou tamanho (o contrato não documenta 400, 413 nem 415 para ela); o Origin de métodos não seguros
+  vale sempre. Rota com schema de `body` leva todas as checagens (415, 413, 400). Rota sem schema de
+  `query` ignora parâmetros desconhecidos; com schema, `.strict()` rejeita.
+- **`params`, `query`, `body`**: objetos Zod `.strict()` opcionais (um schema que não seja `.strict()`
+  faz o módulo falhar ao carregar). Para listas paginadas, use `pageQuerySchema`/`pageQueryShape` e
+  `encodeCursor(kind, payload)`/`decodeCursor(cursor, kind, schema)` de `@/shared/http` (o `kind`
+  amarra o cursor ao endpoint: um cursor de outro `kind` vira 400); para texto digitado pelo
+  usuário, `visibleText({ min, max })`.
+- **Contexto do handler**: `{ request, requestId, principal, params, query, body, cookies, logger }`.
+  `cookies` grava na resposta final, inclusive nas respostas de erro, e é o **único** caminho para
+  cookies: um `Set-Cookie` escrito direto no `Response` do handler é erro de programação (500).
+  `logger` já carrega o `requestId`; o que ele escreve passa pelo redator de logs.
+- **Retorno**: um `Response` (`json(status, dto)`, `noContent()`) ou um `DomainError` (devolvido ou
+  lançado). Qualquer outra exceção vira 500 `INTERNAL_ERROR` sem detalhes.
 - Os limites do Zod são **iguais** aos do contrato (`maxLength`, `minItems`, enums).
 - O mapper de DTO lista os campos explicitamente; nada de spread de linha do banco.
-- O handler monta as próprias dependências (sem container compartilhado).
+- O limiter e o resolver de principal reais são ligados em um único arquivo,
+  `src/shared/http/pipeline-deps.ts`; um handler nunca os cria. (Testes do próprio pipeline usam
+  `createWithRoute` com fakes, ver `src/shared/http/testing.ts`.)
 
 ## 5. Route (`src/app/api/v1/<path>/route.ts`)
 

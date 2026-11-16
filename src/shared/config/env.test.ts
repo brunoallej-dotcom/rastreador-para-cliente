@@ -100,6 +100,37 @@ describe('parseEnv', () => {
     const error = failureOf({ ...validSource, RATE_LIMIT_KEY_SECRET: 'x'.repeat(31) });
     expect(error.message).toContain('RATE_LIMIT_KEY_SECRET');
   });
+
+  it('leaves the Vercel variables unset when they are absent or empty', () => {
+    const env = parseEnv({ ...validSource, VERCEL_ENV: '', VERCEL_URL: '', VERCEL_BRANCH_URL: '' });
+    expect(env.VERCEL_ENV).toBeUndefined();
+    expect(env.VERCEL_URL).toBeUndefined();
+    expect(env.VERCEL_BRANCH_URL).toBeUndefined();
+    expect(parseEnv(validSource).VERCEL_URL).toBeUndefined();
+  });
+
+  it('accepts the Vercel preview variables', () => {
+    const env = parseEnv({
+      ...validSource,
+      VERCEL_ENV: 'preview',
+      VERCEL_URL: 'app-abc123-team.vercel.app',
+      VERCEL_BRANCH_URL: 'app-git-feature-team.vercel.app',
+    });
+    expect(env.VERCEL_ENV).toBe('preview');
+    expect(env.VERCEL_URL).toBe('app-abc123-team.vercel.app');
+    expect(env.VERCEL_BRANCH_URL).toBe('app-git-feature-team.vercel.app');
+  });
+
+  it.each([
+    ['VERCEL_ENV', 'staging'],
+    ['VERCEL_URL', 'https://app.vercel.app'],
+    ['VERCEL_URL', 'app.vercel.app/path'],
+    ['VERCEL_BRANCH_URL', 'evil.test, other.test'],
+  ])('rejects %s=%s without echoing the value', (name, value) => {
+    const error = failureOf({ ...validSource, [name]: value });
+    expect(error.message).toContain(name);
+    expect(error.message).not.toContain(value);
+  });
 });
 
 describe('getEnv', () => {

@@ -3,7 +3,15 @@ import { z } from 'zod';
 const MIN_RATE_LIMIT_KEY_SECRET_LENGTH = 32;
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'] as const;
 
+const VERCEL_ENVIRONMENTS = ['production', 'preview', 'development'] as const;
+/** Host with optional port, no scheme and no path: what Vercel puts in `VERCEL_URL`. */
+const HOST_PATTERN = /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:\d{1,5})?$/;
+
 const httpUrl = z.url({ protocol: /^https?$/ });
+
+/** Vercel sets these on deployments; an empty value (local .env) counts as unset. */
+const optionalVercel = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === '' ? undefined : value), schema.optional());
 
 /** Variables the app exposes to the rest of the code. No `NEXT_PUBLIC_*` anywhere. */
 const envSchema = z.object({
@@ -14,6 +22,10 @@ const envSchema = z.object({
   SUPABASE_PUBLISHABLE_KEY: z.string().min(1),
   RATE_LIMIT_KEY_SECRET: z.string().min(MIN_RATE_LIMIT_KEY_SECRET_LENGTH),
   LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
+  // Only used by the preview-origin rule of the Origin check (spec SEC-08).
+  VERCEL_ENV: optionalVercel(z.enum(VERCEL_ENVIRONMENTS)),
+  VERCEL_URL: optionalVercel(z.string().regex(HOST_PATTERN)),
+  VERCEL_BRANCH_URL: optionalVercel(z.string().regex(HOST_PATTERN)),
 });
 
 /**
