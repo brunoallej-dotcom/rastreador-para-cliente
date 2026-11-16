@@ -119,6 +119,32 @@ describe('visibleText (E-30)', () => {
     expect(name.safeParse(filler.repeat(3)).success).toBe(false);
   });
 
+  it.each([
+    ['a lone high surrogate (the JSON text "\\ud800")', 0xd800],
+    ['a lone low surrogate', 0xdc00],
+  ])('F-54: rejects %s, which Postgres would refuse with a 500', (_label, unit) => {
+    const lone = String.fromCharCode(unit);
+    expect(lone.length).toBe(1);
+
+    for (const text of [`A${lone}`, `${lone}A`, `Ac${lone}me`]) {
+      expect(name.safeParse(text).success, JSON.stringify(text)).toBe(false);
+    }
+    const schema = z.object({ name }).strict();
+    const issues = issuesOf(() =>
+      validateInput({ body: schema }, { params: {}, query: {}, body: { name: `A${lone}` } }),
+    );
+    expect(issues).toEqual([{ path: 'body.name', message: 'Must be valid Unicode text' }]);
+  });
+
+  it('F-54: accepts a well-formed surrogate PAIR (an emoji, a rare ideograph)', () => {
+    const pair = String.fromCodePoint(0x1f600);
+    const ideograph = String.fromCodePoint(0x20bb7);
+    expect(pair.length).toBe(2);
+
+    expect(name.parse(`Acme ${pair}`)).toBe(`Acme ${pair}`);
+    expect(name.parse(ideograph)).toBe(ideograph);
+  });
+
   it('E-30: a name of only fillers looks blank and is rejected', () => {
     const blank = [0x3164, 0x2800, 0x115f, 0x1160, 0x17b4, 0x17b5, 0xffa0].map(ch).join('');
     expect(name.safeParse(blank).success).toBe(false);

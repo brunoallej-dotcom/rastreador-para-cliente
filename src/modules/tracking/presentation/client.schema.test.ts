@@ -67,6 +67,7 @@ describe('createClientBodySchema', () => {
     ['a zero-width space', 'Zero\u200Bwidth'],
     ['a bidi override', 'Bidi\u202Eoverride'],
     ['only symbols', '***'],
+    ['a lone surrogate (F-54)', `A${String.fromCharCode(0xd800)}`],
     ['not a string', 42],
     ['null', null],
   ])('E-30: refuses a name that is %s', (_label, name) => {

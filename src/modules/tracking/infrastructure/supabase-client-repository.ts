@@ -4,7 +4,6 @@ import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
 import {
   err,
-  ConflictError,
   ForbiddenError,
   NotFoundError,
   ok,
@@ -15,6 +14,7 @@ import {
 import type { Logger } from '@/shared/observability/logger';
 import type { Client, ClientListPosition, ClientPage, ClientPatch } from '../domain/client';
 import type { ClientRepository } from '../domain/client-repository';
+import { timestampSchema } from './timestamp-schema';
 
 /** Postgres: `insufficient_privilege`, what the database functions raise for a denied caller. */
 const INSUFFICIENT_PRIVILEGE = '42501';
@@ -22,7 +22,8 @@ const INSUFFICIENT_PRIVILEGE = '42501';
 const RAISE_EXCEPTION = 'P0001';
 const CHECK_VIOLATION = '23514';
 const STRING_DATA_RIGHT_TRUNCATION = '22001';
-const UNIQUE_VIOLATION = '23505';
+/** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
+const DATA_EXCEPTION_CLASS = '22';
 const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
 
@@ -37,10 +38,7 @@ const CLIENT_SELECT =
 /** The embedded filter that makes `active_processes` count only processes with status `active`. */
 const ACTIVE_PROCESSES_STATUS_COLUMN = 'active_processes.status';
 
-/** PostgREST sends timestamps as `2026-11-16T11:30:24.984084+00:00`: any precision, with an offset. */
-const timestampSchema = z.iso.datetime({ offset: true });
-
-/** A client as the database function returns it: no counters (a new or changed client is re-read). */
+/** A client as the database function returns it: no counters (a new client has none). */
 const clientRowSchema = z.object({
   id: z.guid(),
   name: z.string(),
@@ -87,11 +85,32 @@ function parseRows(data: unknown): ClientWithCountsRow[] {
 
 const NEW_CLIENT_COUNTERS: ClientCounters = { activeProcessCount: 0, processCount: 0 };
 
-const invalidInput = (cause: unknown) =>
+/**
+ * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message or
+ * the details of the database error. Those can carry the row ("Failing row contains (..., <name>)")
+ * and the logger writes the `cause` chain of every 5xx error, so a client name would end up in the
+ * logs (SEC-16 keeps names out of the trail; the logs follow the same rule).
+ */
+const safeCause = (error: { code?: string }, status: number) => ({
+  code: error.code ?? '',
+  status,
+});
+
+const invalidInput = (code: string | undefined) =>
   new ValidationError(
     'the database refused the input',
     [{ path: 'body', message: 'Invalid input' }],
-    { cause },
+    {
+      cause: { code: code ?? '' },
+    },
+  );
+
+/** The refusal of a list position (the cursor) that the database could not read as a timestamp. */
+const invalidPosition = (code: string) =>
+  new ValidationError(
+    'the database refused the list position',
+    [{ path: 'query.cursor', message: 'Invalid cursor' }],
+    { cause: { code } },
   );
 
 export type ClientRepositoryOptions = {
@@ -144,12 +163,26 @@ export function createSupabaseClientRepository(
       error.code === CHECK_VIOLATION ||
       error.code === STRING_DATA_RIGHT_TRUNCATION
     ) {
-      return invalidInput(error);
+      return invalidInput(error.code);
     }
-    if (error.code === UNIQUE_VIOLATION) {
-      return new ConflictError(`${operation} hit a unique constraint`);
+    throw upstreamFailure(operation, safeCause(error, status), status);
+  }
+
+  /**
+   * What a failed list query becomes. A position the database cannot read (class 22: a timestamp out
+   * of range, an offset it refuses) is the caller's cursor, so it is a 400 on `query.cursor`; the
+   * cursor schema already bounds what it accepts, this is the backstop for what slips through.
+   * Anything else is unexpected (500) or an outage (503).
+   */
+  function listFailure(
+    error: { code?: string },
+    status: number,
+    after: ClientListPosition | undefined,
+  ): Error {
+    if (after !== undefined && error.code?.startsWith(DATA_EXCEPTION_CLASS) === true) {
+      return invalidPosition(error.code);
     }
-    throw upstreamFailure(operation, error, status);
+    return upstreamFailure('list the clients', safeCause(error, status), status);
   }
 
   async function find(clientId: string): Promise<Client | null> {
@@ -160,7 +193,7 @@ export function createSupabaseClientRepository(
       .eq(ACTIVE_PROCESSES_STATUS_COLUMN, 'active')
       .retry(false)
       .maybeSingle();
-    if (error) throw upstreamFailure('read the client', error, status);
+    if (error) throw upstreamFailure('read the client', safeCause(error, status), status);
     if (data === null) return null;
 
     const [row] = parseRows([data]);
@@ -187,10 +220,17 @@ export function createSupabaseClientRepository(
       });
       if (error) return err(refusalOf('update_client', error, status));
 
-      // The function returns the row without counters: read the client again for them.
+      // The function returns the row without the counters, and PostgREST cannot narrow an embed on a
+      // function result to the active processes, so the client is read again. The write is already
+      // committed (an identical PATCH is a no-op, so a retry is safe); a client that cannot be read
+      // now, because the row is gone or the session ended between the two calls, is answered as not
+      // found.
       const updated = await find(clientId);
-      if (updated === null)
-        throw new Error('update_client succeeded but the client cannot be read');
+      if (updated === null) {
+        return err(
+          new NotFoundError('client not found after update', { detail: 'Client not found.' }),
+        );
+      }
       return ok(updated);
     },
 
@@ -209,9 +249,7 @@ export function createSupabaseClientRepository(
           .gt('id', after.id)
           .order('id', { ascending: true })
           .limit(wanted);
-        if (sameInstant.error) {
-          throw upstreamFailure('list the clients', sameInstant.error, sameInstant.status);
-        }
+        if (sameInstant.error) throw listFailure(sameInstant.error, sameInstant.status, after);
         rows.push(...parseRows(sameInstant.data));
       }
 
@@ -222,7 +260,7 @@ export function createSupabaseClientRepository(
           .limit(wanted - rows.length);
         if (after !== undefined) older = older.lt('created_at', after.createdAt);
         const result = await older;
-        if (result.error) throw upstreamFailure('list the clients', result.error, result.status);
+        if (result.error) throw listFailure(result.error, result.status, after);
         rows.push(...parseRows(result.data));
       }
 

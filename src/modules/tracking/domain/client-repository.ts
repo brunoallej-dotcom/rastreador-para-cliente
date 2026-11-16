@@ -7,8 +7,9 @@ import type { Client, ClientListQuery, ClientPage, ClientPatch } from './client'
  *
  * Every method throws `ServiceUnavailableError` when the database is slow or down (E-21). A refusal
  * by the database comes back as an `err` of the matching domain error (spec §3.7):
- * `ForbiddenError` (42501: the pipeline should have stopped this caller), `NotFoundError`,
- * `ValidationError` (invalid input) or `ConflictError`.
+ * `ForbiddenError` (42501: the pipeline should have stopped this caller), `NotFoundError` or
+ * `ValidationError` (invalid input). `list` throws a `ValidationError` on `query.cursor` when the
+ * database cannot read the position it was given.
  */
 export interface ClientRepository {
   /** Creates an active client with no processes. `name` is already validated and normalized. */

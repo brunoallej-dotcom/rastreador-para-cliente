@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
+import { timestampSchema } from './timestamp-schema';
 
 /** What other modules may know about a client (tenant): its id and its name. */
 export type ClientSummary = { readonly id: string; readonly name: string };
@@ -15,7 +16,7 @@ export type ClientStatus = ClientSummary & { readonly archived: boolean };
 const clientStatusRowSchema = z.object({
   id: z.guid(),
   name: z.string(),
-  archived_at: z.string().nullable(),
+  archived_at: timestampSchema.nullable(),
 });
 
 /**

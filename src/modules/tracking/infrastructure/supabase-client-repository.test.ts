@@ -2,7 +2,6 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { describe, expect, it, vi } from 'vitest';
 import type { Database } from '@/shared/db/database.types';
 import {
-  ConflictError,
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
@@ -90,7 +89,7 @@ function fakeSupabase(outcomes: Outcome[]) {
     rpc: (name: string, args: unknown) => {
       const calls: unknown[][] = [['rpc', name, args]];
       queries.push(calls);
-      return Promise.resolve(next());
+      return chain(calls);
     },
   } as unknown as SupabaseClient<Database>;
   return { supabase, queries };
@@ -353,16 +352,6 @@ describe('create', () => {
     }
   });
 
-  it('spec §3.7: 23505 is a ConflictError', async () => {
-    const { supabase } = fakeSupabase([failure('23505', 'duplicate key value', 409)]);
-    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
-
-    const result = await repository.create('Acme');
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBeInstanceOf(ConflictError);
-  });
-
   it('spec §3.7: what is not mapped is thrown (a 500), not shown', async () => {
     const { supabase } = fakeSupabase([failure('P0001', 'STALE_STAGE', 400)]);
     const repository = createSupabaseClientRepository(supabase, { logger: logger() });
@@ -388,7 +377,7 @@ describe('create', () => {
 });
 
 describe('update', () => {
-  it('AC-11: sends only the fields of the patch, then re-reads the client for its counters', async () => {
+  it('AC-11: sends only the fields of the patch, then reads the client again for its counters', async () => {
     const { supabase, queries } = fakeSupabase([
       answer(writeRowOf(A, 'Novo')),
       answer(rowOf(A, '2026-11-16T11:30:24.984084+00:00', { name: 'Novo', all: 2, active: 1 })),
@@ -417,7 +406,7 @@ describe('update', () => {
     expect(queries[0]).toEqual([['rpc', 'update_client', { p_client_id: A, p_archived: false }]]);
   });
 
-  it('spec §3.7: NOT_FOUND is a NotFoundError (404) and nothing is re-read', async () => {
+  it('spec §3.7: NOT_FOUND is a NotFoundError (404) and nothing is read again', async () => {
     const { supabase, queries } = fakeSupabase([failure('P0001', 'NOT_FOUND')]);
     const repository = createSupabaseClientRepository(supabase, { logger: logger() });
 
@@ -429,6 +418,19 @@ describe('update', () => {
       expect(result.error.detail).toBe('Client not found.');
     }
     expect(queries).toHaveLength(1);
+  });
+
+  it('F-57: a client that cannot be read right after a good update is a 404, not a 500', async () => {
+    const { supabase } = fakeSupabase([answer(writeRowOf(A, 'Novo')), answer(null)]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const result = await repository.update(A, { name: 'Novo' });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(NotFoundError);
+      expect(result.error.detail).toBe('Client not found.');
+    }
   });
 
   it('spec §3.7: 42501 is a ForbiddenError and a warning', async () => {
@@ -456,13 +458,6 @@ describe('update', () => {
     if (!result.ok) expect(result.error).toBeInstanceOf(ValidationError);
   });
 
-  it('a client that cannot be read right after a good update is an unexpected error', async () => {
-    const { supabase } = fakeSupabase([answer(writeRowOf(A, 'Novo')), answer(null)]);
-    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
-
-    await expect(repository.update(A, { name: 'Novo' })).rejects.toThrow('cannot be read');
-  });
-
   it('E-21: Supabase being down is ServiceUnavailableError', async () => {
     const { supabase } = fakeSupabase([
       { data: null, error: { message: 'TypeError: fetch failed', code: '' }, status: 0 },
@@ -472,5 +467,128 @@ describe('update', () => {
     await expect(repository.update(A, { name: 'Novo' })).rejects.toBeInstanceOf(
       ServiceUnavailableError,
     );
+  });
+});
+
+describe('a cursor the database cannot read (F-53)', () => {
+  const stamp = '2026-11-16T11:00:00.123456+00:00';
+  const after = { createdAt: stamp, id: A };
+
+  it.each(['22007', '22008', '22009', '22P02'])(
+    'SQLSTATE %s on the first query is a 400 on query.cursor, not a 500',
+    async (code) => {
+      const { supabase } = fakeSupabase([failure(code, 'time zone displacement out of range')]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const rejection = repository.list({ limit: 5, includeArchived: false, after });
+
+      await expect(rejection).rejects.toBeInstanceOf(ValidationError);
+      await expect(rejection).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        issues: [{ path: 'query.cursor', message: 'Invalid cursor' }],
+      });
+    },
+  );
+
+  it('the same on the second query (the older rows)', async () => {
+    const { supabase } = fakeSupabase([
+      answer([]),
+      failure('22008', 'date/time field value out of range'),
+    ]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    await expect(
+      repository.list({ limit: 5, includeArchived: false, after }),
+    ).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it("a class-22 error with no position (the first page) is not the caller's fault: 500", async () => {
+    const { supabase } = fakeSupabase([failure('22008', 'date/time field value out of range')]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const rejection = repository.list({ limit: 5, includeArchived: false });
+
+    await expect(rejection).rejects.not.toBeInstanceOf(ValidationError);
+    await expect(rejection).rejects.toThrow('list the clients failed unexpectedly');
+  });
+
+  it('another database error with a position stays a 500', async () => {
+    const { supabase } = fakeSupabase([failure('XX000', 'internal detail', 400)]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const rejection = repository.list({ limit: 5, includeArchived: false, after });
+
+    await expect(rejection).rejects.not.toBeInstanceOf(ValidationError);
+    await expect(rejection).rejects.toThrow('list the clients failed unexpectedly');
+  });
+
+  it('keeps no message in the cause of the error it throws', async () => {
+    const { supabase } = fakeSupabase([failure('22008', 'detail with the cursor 2026-11-16')]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const error: unknown = await repository
+      .list({ limit: 5, includeArchived: false, after })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ValidationError);
+    expect((error as ValidationError).cause).toEqual({ code: '22008' });
+  });
+});
+
+describe('what the database says about a row never travels in a cause', () => {
+  // The logger writes the `cause` chain of every 5xx error: a name in it would reach the logs.
+  const ROW_MESSAGE = 'null value in column "x"; Failing row contains (11, Cliente Secreto Ltda)';
+
+  const causeOf = (error: unknown) => (error as { cause?: unknown }).cause;
+
+  it('an unmapped write error keeps only the SQLSTATE and the status', async () => {
+    const { supabase } = fakeSupabase([
+      {
+        data: null,
+        error: { code: '23502', message: ROW_MESSAGE, details: ROW_MESSAGE },
+        status: 400,
+      },
+    ]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const error: unknown = await repository.create('Acme').catch((caught: unknown) => caught);
+
+    expect(causeOf(error)).toEqual({ code: '23502', status: 400 });
+    expect(JSON.stringify(causeOf(error))).not.toContain('Secreto');
+  });
+
+  it('a refused write (a ValidationError) keeps only the SQLSTATE', async () => {
+    const { supabase } = fakeSupabase([
+      { data: null, error: { code: '23514', message: ROW_MESSAGE }, status: 400 },
+    ]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const result = await repository.create('Acme');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(ValidationError);
+      expect(causeOf(result.error)).toEqual({ code: '23514' });
+    }
+  });
+
+  it('an unmapped read error keeps only the SQLSTATE and the status', async () => {
+    const { supabase } = fakeSupabase([
+      { data: null, error: { code: 'XX000', message: ROW_MESSAGE }, status: 400 },
+    ]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const error: unknown = await repository.find(A).catch((caught: unknown) => caught);
+
+    expect(causeOf(error)).toEqual({ code: 'XX000', status: 400 });
+  });
+
+  it('an outage is still told apart (503) after the cause was reduced', async () => {
+    const { supabase } = fakeSupabase([
+      { data: null, error: { code: '', message: 'TypeError: fetch failed' }, status: 0 },
+    ]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    await expect(repository.create('Acme')).rejects.toBeInstanceOf(ServiceUnavailableError);
   });
 });

@@ -245,13 +245,14 @@ describe('the pipeline in front of the client routes (spec §3.5)', () => {
         post({ name: '' }),
         post({ name: '   ' }),
         post({ name: 'a'.repeat(161) }),
+        post({ name: `A${String.fromCharCode(0xd800)}` }),
         post({}),
         patch({}),
         patch({ archived: 'yes' }),
         patch({ name: 'Acme', id: CLIENT_ID }),
       ]);
 
-      expect(responses.map((response) => response.status)).toEqual(Array(8).fill(400));
+      expect(responses.map((response) => response.status)).toEqual(Array(9).fill(400));
       expect(outbound).not.toHaveBeenCalled();
     });
 
@@ -270,6 +271,9 @@ describe('the pipeline in front of the client routes (spec §3.5)', () => {
         encodeCursor('admin-clients', { ...payload, extra: 1 }),
         encodeCursor('admin-clients', { c: 'yesterday', i: CLIENT_ID }),
         encodeCursor('admin-clients', { c: payload.c, i: 'nope' }),
+        // well formed, but a timestamp the database cannot read (F-53)
+        encodeCursor('admin-clients', { c: '0000-01-01T00:00:00.000000+00:00', i: CLIENT_ID }),
+        encodeCursor('admin-clients', { c: '2026-01-01T00:00:00.000000+23:59', i: CLIENT_ID }),
         'A'.repeat(201),
       ];
 

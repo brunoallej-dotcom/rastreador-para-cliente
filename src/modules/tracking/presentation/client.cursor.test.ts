@@ -55,6 +55,30 @@ describe('the cursor of GET /admin/clients', () => {
     refusal(encodeCursor(CLIENT_CURSOR_KIND, [at, POSITION.id]));
   });
 
+  it.each([
+    ['year 0000 (Postgres: 22008)', '0000-01-01T00:00:00.000000+00:00'],
+    ['a year before 2000', '1999-12-31T23:59:59.999999+00:00'],
+    ['an offset past 15:59 (Postgres: 22009)', '2026-01-01T00:00:00.000000+16:00'],
+    ['the largest offset the format allows', '2026-01-01T00:00:00.000000-23:59'],
+  ])(
+    'F-53: refuses a well-formed timestamp with %s, which the database cannot read',
+    (_label, c) => {
+      refusal(encodeCursor(CLIENT_CURSOR_KIND, { c, i: POSITION.id }));
+    },
+  );
+
+  it.each([
+    ['the first instant of 2000', '2000-01-01T00:00:00.000000+00:00'],
+    ['UTC written with Z', '2026-11-16T11:30:24.984084Z'],
+    ['an offset of 15:59', '2026-01-01T00:00:00.000000+15:59'],
+    ['a negative offset', '2026-01-01T00:00:00.000000-03:00'],
+    ['no fractional seconds', '2026-11-16T11:30:24+00:00'],
+  ])('F-53: accepts %s', (_label, c) => {
+    const decoded = decodeClientCursor(encodeCursor(CLIENT_CURSOR_KIND, { c, i: POSITION.id }));
+
+    expect(decoded).toEqual({ ok: true, value: { createdAt: c, id: POSITION.id } });
+  });
+
   it('refuses a timestamp without an offset (it would be read in the server time zone)', () => {
     refusal(encodeCursor(CLIENT_CURSOR_KIND, { c: '2026-11-16T11:30:24.984084', i: POSITION.id }));
   });
