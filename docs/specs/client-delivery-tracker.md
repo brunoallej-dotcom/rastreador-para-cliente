@@ -394,8 +394,8 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
 | `current_principal()` | authenticated | Retorna o principal (ou nenhuma linha): sessão viva, perfil ativo, papel, cliente, nome de exibição, `aal`, `has_verified_totp`, `must_change_password` |
-| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente. Evento `client.created` |
-| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva. Eventos `client.updated` / `client.archived` / `client.unarchived` |
+| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente e devolve a linha. Evento `client.created` (§3.7.1) |
+| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva; `NULL` = não mexe. Eventos `client.updated` / `client.archived` / `client.unarchived`, só quando algo muda (§3.7.1) |
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
 | `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`) |
 | `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
@@ -421,6 +421,37 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` |
 | `23505` | `ConflictError` | 409 `CONFLICT` |
+
+#### 3.7.1 Clientes (Onda 6)
+
+- **Escrita.** `create_client` e `update_client` checam `private.is_ceo()` antes de tudo (papel `ceo`,
+  `aal2`, fator TOTP verificado, sessão viva, perfil ativo: senão 42501) e repetem as regras do nome do
+  Zod (`visibleText`): NFC, sem espaços nas pontas, 1 a 160 caracteres e nenhum caractere de controle
+  ou de formatação Unicode (E-30), senão `INVALID_INPUT`. As duas devolvem a linha de `clients`, sem os
+  contadores: a criação responde com contadores zero e a atualização lê o cliente de novo.
+  `update_client` com `p_name` e `p_archived` nulos é `INVALID_INPUT`, cliente inexistente é
+  `NOT_FOUND`, e uma chamada que não muda nada devolve a linha como está, sem auditar e sem mexer em
+  `updated_at` (arquivar quem já está arquivado mantém o `archived_at` original). Renomear e arquivar
+  na mesma chamada grava dois eventos, nessa ordem.
+- **Auditoria sem PII.** Os metadados não levam o nome do cliente: `client.updated` guarda só
+  `{"fields":["name"]}`, e os demais eventos não têm metadados. Recurso e `client_id` são o próprio
+  cliente.
+- **Leitura.** O app lê `clients` com o client do usuário (RLS), nunca com a secret key. Os contadores
+  da API (`activeProcessCount`, `processCount`) vêm de dois `count` embutidos do PostgREST sobre
+  `processes`, o segundo restrito a `status = 'active'` por filtro embutido; o RLS vale para as
+  linhas embutidas também.
+- **Paginação.** A lista segue `created_at DESC, id ASC` (índice `clients (created_at DESC, id)`) e
+  usa keyset. O PostgREST não compara tuplas e `.or()` não pode levar valor (§3.8), então a página
+  seguinte são duas consultas simples: as linhas com o **mesmo** `created_at` e `id` maior, e, se a
+  página não encheu, as mais antigas (`created_at <` posição). O cursor é opaco, do `kind`
+  `admin-clients`, e leva `{ c, i }`: o `created_at` exatamente como o banco o devolveu (com
+  microssegundos, que um `Date` perderia) e o `id`. Cursor adulterado, truncado, de outro endpoint ou
+  com payload fora do formato é 400 `VALIDATION_ERROR` em `query.cursor` (E-29); um cursor bem formado
+  só move a posição dentro do que o CEO já pode ler.
+- **Para outros módulos.** `tracking/index.ts` exporta `getClientStatus(supabase, clientId)`: `{ id,
+  name, archived }` ou `null` (o RLS esconde o que a sessão não vê). `getClientSummary` é a mesma
+  leitura sem o `archived`. A Onda 7 usa o status para recusar login novo de cliente arquivado
+  (E-16).
 
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
