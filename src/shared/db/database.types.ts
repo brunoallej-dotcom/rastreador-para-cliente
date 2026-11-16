@@ -145,7 +145,25 @@ isOneToOne: false
             [_ in never]: never
           }
           Functions: {
-            "attest_mfa_session":
+            "approve_current_stage":
+{ Args: { "p_expected_stage_id": string,"p_process_id": string }; Returns: {
+              "cancelled_at": string | null,
+"client_id": string,
+"completed_at": string | null,
+"created_at": string,
+"id": string,
+"status": Database["public"]['Enums']["process_status"],
+"title": string,
+"updated_at": string,
+"version": number
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "processes"
+        isOneToOne: true
+        isSetofReturn: false
+      } },
+"attest_mfa_session":
 { Args: { "p_challenge_id": string,"p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: string
                            },
 "consume_totp_code":
