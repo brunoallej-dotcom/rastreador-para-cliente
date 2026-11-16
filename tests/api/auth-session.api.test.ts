@@ -48,6 +48,9 @@ const maxAgeOf = (setCookie: string): number =>
  */
 const floorSleeps: number[] = [];
 
+/** Room for the pipeline's own work before the login handler starts its floor (F-05 test). */
+const PIPELINE_BEFORE_HANDLER_SLACK_MS = 150;
+
 beforeEach(() => {
   floorSleeps.length = 0;
   vi.spyOn(timing, 'sleep').mockImplementation((ms) => {
@@ -370,10 +373,13 @@ describe('POST /api/v1/auth/login', () => {
       // the work fits under the floor, so the handler had to wait for the rest of it...
       expect(workMs, `${label}: the work took ${Math.round(workMs)} ms`).toBeLessThan(400);
       expect(floorSleeps, label).toHaveLength(1);
-      // ...and work plus wait is the floor (400 ms) plus at most its jitter (100 ms)
+      // ...and work plus wait is the floor (400 ms) plus at most its jitter (100 ms). `workMs` is
+      // measured from before the request, so it also holds the pipeline's work BEFORE the handler
+      // starts the floor (three rate-limit calls to Postgres); that part is real time, and on a busy
+      // machine it alone has exceeded 20 ms, so the upper bound leaves it explicit room.
       const totalMs = workMs + (floorSleeps[0] ?? 0);
       expect(totalMs, label).toBeGreaterThanOrEqual(400);
-      expect(totalMs, label).toBeLessThan(520);
+      expect(totalMs, label).toBeLessThan(400 + 100 + PIPELINE_BEFORE_HANDLER_SLACK_MS);
     }
   });
 

@@ -6,7 +6,7 @@
 --
 -- `tests.create_user` executa o gatilho adiado na hora (SET CONSTRAINTS ALL IMMEDIATE), como o COMMIT faria.
 BEGIN;
-SELECT plan(19);
+SELECT plan(21);
 
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-0000000000c1', 'Cliente Auditoria');
 
@@ -22,11 +22,29 @@ SELECT is(
   'RF-14: criar um CEO grava exatamente 1 evento de auditoria'
 );
 SELECT results_eq(
-  $$ SELECT action, resource_type, actor_id, actor_role::text, client_id, process_id, request_id, metadata
+  $$ SELECT action, resource_type, actor_id, actor_role::text, client_id, process_id, request_id, metadata - 'db_user'
        FROM public.audit_events WHERE resource_id = '00000000-0000-4000-8000-0000000000a1' $$,
   $$ VALUES ('account.provisioned', 'account', NULL::uuid, NULL::text, NULL::uuid, NULL::uuid, NULL::text,
              '{"role":"ceo","channel":"auth_admin"}'::jsonb) $$,
   'RF-14: o evento é account.provisioned sobre a conta, sem ator, cliente, processo nem request_id, com role e canal nos metadados'
+);
+
+SELECT is(
+  (SELECT metadata ->> 'db_user' FROM public.audit_events WHERE resource_id = '00000000-0000-4000-8000-0000000000a1'),
+  session_user::text,
+  'T-13: o evento guarda o papel da conexão que criou o CEO (separa o Auth de SQL direto)'
+);
+
+-- T-13: papel em user_metadata não conta; só app_metadata decide ------------------------------------------------
+SELECT tests.insert_auth_user(
+  '00000000-0000-4000-8000-0000000000b2',
+  '{"role":"client","client_id":"00000000-0000-4000-8000-0000000000c1","display_name":"Cliente Forjado"}'::jsonb,
+  '{"role":"ceo"}'::jsonb
+);
+SELECT is(
+  (SELECT count(*)::int FROM public.audit_events WHERE resource_id = '00000000-0000-4000-8000-0000000000b2'),
+  0,
+  'T-13: role ceo só em user_metadata (app_metadata client) não grava o evento de CEO'
 );
 
 -- Login de cliente: o gatilho não grava ----------------------------------------------------------------------

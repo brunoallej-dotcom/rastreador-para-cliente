@@ -88,7 +88,9 @@ describe('createCeoAccount against the local stack', () => {
         client_id: null,
         process_id: null,
         request_id: null,
-        metadata: { role: 'ceo', channel: 'auth_admin' },
+        // db_user: the connection role that created the account; through the Auth Admin API it is
+        // GoTrue's own role, which tells it apart from a CEO inserted by direct SQL (T-13)
+        metadata: { role: 'ceo', channel: 'auth_admin', db_user: 'supabase_auth_admin' },
       },
     ]);
   });

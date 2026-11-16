@@ -88,7 +88,8 @@ BEGIN
       NEW.id,
       NULL::uuid,
       NULL::uuid,
-      jsonb_build_object('role', 'ceo', 'channel', 'auth_admin')
+      -- db_user: o papel da conexão que criou (supabase_auth_admin pelo Auth; outro valor = SQL direto)
+      jsonb_build_object('role', 'ceo', 'channel', 'auth_admin', 'db_user', session_user)
     );
   END IF;
 
