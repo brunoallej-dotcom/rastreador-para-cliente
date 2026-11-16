@@ -36,6 +36,7 @@ import {
   canSignIn,
   changePassword,
   hasLivePrincipal,
+  LOSE_ANSWER,
   jarOf,
   mustChangePassword,
   roleOf,
@@ -360,7 +361,10 @@ describe('AC-06: the change of password', () => {
     );
 
     expect(response.status).toBe(503);
-    expect(await bodyOf(response)).toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+    const problem = (await bodyOf(response)) as { code: string; detail: string };
+    expect(problem.code).toBe('SERVICE_UNAVAILABLE');
+    // M4: an update that got no usable answer might have been applied, and the guidance says so
+    expect(problem.detail).toContain('may already have been changed');
     // the proof was opened, then closed (scope local), before the update was even tried
     expect(signedInTokens).toHaveLength(1);
     const logoutCall = calls.findIndex((call) =>
@@ -437,6 +441,86 @@ describe('AC-06: the change of password', () => {
     // second layer: the database function itself denies this session (42501)
     const { error } = await supabase.rpc('mark_password_changed');
     expect(error).toMatchObject({ code: '42501' });
+  });
+
+  it('M4: an update that WAS applied but whose answer was lost is 503 with the guidance of both states, and following it works', async () => {
+    const user = await clientUser();
+    const jar = await sessionJarFor(user);
+
+    const response = await whileWatching(
+      (method, path) =>
+        method === 'PUT' && path.startsWith('/auth/v1/user') ? LOSE_ANSWER : undefined,
+      () => changePassword(jar, { currentPassword: user.password, newPassword: FRESH }),
+    );
+
+    expect(response.status).toBe(503);
+    const problem = (await bodyOf(response)) as { code: string; detail: string };
+    expect(problem.code).toBe('SERVICE_UNAVAILABLE');
+    expect(problem.detail).toContain('may already have been changed');
+    expect(problem.detail).toContain('new password as the current password');
+    expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    // the Auth server DID change it, and the account still says "change it"
+    expect(await canSignIn(user.email, FRESH)).toBe(true);
+    expect(await mustChangePassword(user.id)).toBe(true);
+
+    // the guidance, step one: repeat the request. The old password is no longer the current one
+    const repeated = await changePassword(jar, {
+      currentPassword: user.password,
+      newPassword: FRESH,
+    });
+    expect(repeated.status).toBe(422);
+    expect(await bodyOf(repeated)).toMatchObject({ code: 'INVALID_CURRENT_PASSWORD' });
+    // step two: the new password is the current one
+    const finished = await changePassword(jar, { currentPassword: FRESH, newPassword: SECOND });
+    expect(finished.status).toBe(204);
+    expect(await mustChangePassword(user.id)).toBe(false);
+    expect(await canSignIn(user.email, SECOND)).toBe(true);
+  });
+
+  it('M4: an update that was NOT applied (the request never arrived) is the same 503, and repeating it with the old password works', async () => {
+    const user = await clientUser();
+    const jar = await sessionJarFor(user);
+
+    const response = await whileWatching(
+      (method, path) =>
+        method === 'PUT' && path.startsWith('/auth/v1/user')
+          ? new TypeError('fetch failed')
+          : undefined,
+      () => changePassword(jar, { currentPassword: user.password, newPassword: FRESH }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(await canSignIn(user.email, user.password)).toBe(true);
+    const repeated = await changePassword(jar, {
+      currentPassword: user.password,
+      newPassword: FRESH,
+    });
+    expect(repeated.status).toBe(204);
+    expect(await canSignIn(user.email, FRESH)).toBe(true);
+  });
+
+  it('F-44: the first mark committed and only its answer was lost: the retry gets PASSWORD_UNCHANGED and the change is a 204', async () => {
+    const user = await clientUser();
+    const jar = await sessionJarFor(user);
+    let marks = 0;
+
+    const response = await whileWatching(
+      (method, path) => {
+        if (method !== 'POST' || !path.startsWith('/rest/v1/rpc/mark_password_changed')) {
+          return undefined;
+        }
+        marks += 1;
+        return marks === 1 ? LOSE_ANSWER : undefined;
+      },
+      () => changePassword(jar, { currentPassword: user.password, newPassword: FRESH }),
+    );
+
+    // two calls: the first did the work, the second found nothing left to prove
+    expect(marks).toBe(2);
+    expect(response.status).toBe(204);
+    expect(await mustChangePassword(user.id)).toBe(false);
+    expect(((await bodyOf(await getSession(jar))) as SessionBody).pendingActions).toEqual([]);
+    expect(await canSignIn(user.email, FRESH)).toBe(true);
   });
 
   it('a half-done change (the database fails after the Auth server stored the password) is 503, says how to finish, and finishing works', async () => {

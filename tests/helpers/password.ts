@@ -11,8 +11,10 @@ import { createClient as createSupabaseClient, type Session } from '@supabase/su
 import { vi } from 'vitest';
 import { POST as passwordRoute } from '@/app/api/v1/auth/password/route';
 import type { Database } from '@/shared/db/database.types';
+import { expectToMatchContract } from './contract';
 import { adminClient, publishableClient, type FixtureUser } from './fixtures';
 import {
+  bodyOf,
   createCookieStore,
   invoke,
   writeSessionCookie,
@@ -46,20 +48,34 @@ export type PasswordBody = {
   readonly newPassword?: unknown;
 } & Record<string, unknown>;
 
-/** `POST /auth/password` through the real route, with a fresh client IP per call. */
-export function changePassword(
+/**
+ * `POST /auth/password` through the real route, with a fresh client IP per call.
+ *
+ * Every answer the contract documents for the operation is checked against it right here (ADR 0008),
+ * so no test can forget: a 204 has no body, the rest are `problem+json` of the documented codes. The
+ * one answer left out is 503: the contract documents none for this operation (E-21 can still cause it).
+ */
+export async function changePassword(
   cookies: CookieStore | undefined,
   body: PasswordBody,
   options: { origin?: string | null } = {},
 ): Promise<Response> {
-  return invoke(passwordRoute, {
+  const response = await invoke(passwordRoute, {
     method: 'POST',
     path: '/auth/password',
     body,
     ...(cookies === undefined ? {} : { cookies }),
     ...options,
   });
+  if (response.status !== SERVICE_UNAVAILABLE) {
+    const answered = response.status === NO_CONTENT ? undefined : await bodyOf(response);
+    expectToMatchContract('changePassword', response.status, answered, response);
+  }
+  return response;
 }
+
+const NO_CONTENT = 204;
+const SERVICE_UNAVAILABLE = 503;
 
 /** Does the database see a live principal behind this access token? (`current_principal()`, no pipeline.) */
 export async function hasLivePrincipal(accessToken: string): Promise<boolean> {
@@ -120,11 +136,15 @@ export type AuthTraffic = {
 /**
  * Passes every outbound call through to the local Supabase, records it, keeps the access token of
  * each password sign-in it sees (so a test can ask the database about that very session), and lets
- * a test answer chosen calls itself with a `Response` or by failing with an `Error`.
+ * a test answer chosen calls itself with a `Response` or by failing with an `Error`, or LOSE the
+ * answer of a call that really happened (`LOSE_ANSWER`): the server does the work, the caller sees a
+ * transport failure, which is what a timeout after a commit looks like.
  * Always `restore()` it (try/finally): it replaces the global `fetch`.
  */
+export const LOSE_ANSWER = Symbol('apply the call, then fail with a transport error');
+
 export function watchAuthTraffic(
-  intercept?: (method: string, path: string) => Response | Error | undefined,
+  intercept?: (method: string, path: string) => Response | Error | typeof LOSE_ANSWER | undefined,
 ): AuthTraffic {
   const realFetch = globalThis.fetch;
   const calls: string[] = [];
@@ -139,9 +159,10 @@ export function watchAuthTraffic(
 
     const answer = intercept?.(method, path);
     if (answer instanceof Error) throw answer;
-    if (answer !== undefined) return answer;
+    if (answer instanceof Response) return answer;
 
     const response = await realFetch(input, init);
+    if (answer === LOSE_ANSWER) throw new TypeError('fetch failed');
     if (method === 'POST' && path.startsWith('/auth/v1/token?grant_type=password')) {
       const body = (await response
         .clone()
