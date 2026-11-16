@@ -3,10 +3,12 @@ import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
 import {
+  ConflictError,
   err,
   ForbiddenError,
   NotFoundError,
   ok,
+  ServiceUnavailableError,
   ValidationError,
   type DomainError,
   type Result,
@@ -26,6 +28,21 @@ const STRING_DATA_RIGHT_TRUNCATION = '22001';
 const DATA_EXCEPTION_CLASS = '22';
 const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
+/**
+ * What `create_client` and `update_client` raise (`P0001`) when the name is already an active
+ * client's: the database turns the violation of its unique index into this business error (spec
+ * §3.7.1, F-51), so a raw `23505` is never expected here.
+ */
+const NAME_TAKEN_MESSAGE = 'CLIENT_NAME_TAKEN';
+/**
+ * Postgres rolled the whole transaction back and nothing of it persisted (no row, no audit event), so
+ * repeating the call is safe: `deadlock_detected` (two renames that cross wait on each other's
+ * name, F-51) and `serialization_failure`. PostgREST answers both with HTTP 500 (probed on the local
+ * stack; 23505 gets 409), which `upstreamFailure` would already turn into a 503; the SQLSTATE is
+ * matched on its own, whatever the status, so a PostgREST that changes it does not turn a retry
+ * into a 500.
+ */
+const ROLLED_BACK_TRANSIENTLY: ReadonlySet<string> = new Set(['40P01', '40001']);
 
 /**
  * Columns of the read, explicit (no `select *`): the client plus two counters taken from the
@@ -123,7 +140,8 @@ export type ClientRepositoryOptions = {
  * `create_client` and `update_client` functions, which check the CEO role, `aal2` and the TOTP
  * factor by themselves and write the audit event in the same transaction.
  *
- * Whatever comes back is validated with Zod. Database errors are mapped by the table of spec §3.7;
+ * Whatever comes back is validated with Zod. Database errors are mapped by the table of spec §3.7
+ * (a name already taken by an active client, `CLIENT_NAME_TAKEN`, is a `ConflictError`: 409, F-51);
  * an unmapped one is an unexpected error (500) and a slow or dead database is a 503 (E-21).
  */
 export function createSupabaseClientRepository(
@@ -158,12 +176,27 @@ export function createSupabaseClientRepository(
         detail: 'Client not found.',
       });
     }
+    if (error.code === RAISE_EXCEPTION && error.message === NAME_TAKEN_MESSAGE) {
+      // 409 CONFLICT. The detail names no client (not its id, not its name): the database error did
+      // not carry them and the answer must not either.
+      return new ConflictError(`${operation}: the name is already an active client's`, {
+        detail: 'A client with this name already exists.',
+        cause: { code: error.code },
+      });
+    }
     if (
       (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) ||
       error.code === CHECK_VIOLATION ||
       error.code === STRING_DATA_RIGHT_TRUNCATION
     ) {
       return invalidInput(error.code);
+    }
+    if (error.code !== undefined && ROLLED_BACK_TRANSIENTLY.has(error.code)) {
+      // 503 with Retry-After, like any transient failure: the caller repeats and gets the 409 or
+      // the 200 the first call would have had.
+      throw new ServiceUnavailableError(`${operation}: the transaction was rolled back`, {
+        cause: safeCause(error, status),
+      });
     }
     throw upstreamFailure(operation, safeCause(error, status), status);
   }

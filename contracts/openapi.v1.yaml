@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Rastreador para Cliente API
-  version: 1.0.0-draft.2
+  version: 1.0.0-draft.3
   summary: Backend do rastreador de entregas (painel do cliente e painel dos CEOs).
   description: |
     Contrato normativo da API v1. Spec de origem: `docs/specs/client-delivery-tracker.md`.
@@ -46,6 +46,18 @@ info:
     requisição é negada, nunca liberada.
 
     ## Compatibilidade
+    - `1.0.0-draft.3` (minor, **sem mudança de schema**). Aditivo: `createClient` e `updateClient`
+      passam a documentar 409 `CONFLICT`, quando o nome já é de outro cliente **não arquivado**. A
+      comparação trata como o mesmo nome: um acento decomposto e o composto ("Cafe" + U+0301 vale
+      "Café", mas "Cafe" e "Café" seguem distintos); as formas de compatibilidade do Unicode, NFKC
+      ("Acme™" e "AcmeTM", "①" e "1", letras de largura total como "Ａｃｍｅ"); e as diferenças só de
+      caixa, de sequências de espaços e de marcas de variação invisíveis (U+034F, seletores de
+      variação). A regra é nova e vale para entrada que antes dava 201: dois `POST` com o mesmo nome, que criavam dois
+      clientes, agora dão 201 e 409. Um `POST` repetido depois de um 503, cuja primeira chamada já
+      tinha sido gravada, também dá 409 e não duplica o cliente. Arquivar libera o nome, e desarquivar
+      um cliente cujo nome foi tomado por um ativo dá 409. A descrição da resposta compartilhada
+      `ServiceUnavailable` deixa de afirmar que repetir uma escrita é sempre seguro. Letras de outro
+      alfabeto que se parecem com as latinas (o "А" cirílico) continuam passando.
     - `1.0.0-draft.2` (minor, **sem mudança incompatível**). Aditivo: `factorId` deixa de ser
       obrigatório em `verifyTotp` (o servidor resolve o fator da sessão); 503 documentado em toda
       operação autenticada; `x-rate-limit` passa a listar os orçamentos programáticos
@@ -538,6 +550,14 @@ paths:
     post:
       operationId: createClient
       summary: Criar cliente
+      description: |
+        O nome é único entre os clientes não arquivados: um nome que já é de outro cliente não
+        arquivado responde 409 `CONFLICT`, sem dizer qual é o outro cliente. Valem como o mesmo nome
+        o acento decomposto e o composto ("Cafe" + U+0301 e "Café", mas "Cafe" e "Café" são
+        distintos), as formas de compatibilidade do Unicode, NFKC ("Acme™" e "AcmeTM", "①" e "1",
+        letras de largura total) e as diferenças só de caixa, de sequências de espaços e de marcas de
+        variação invisíveis. Repetir a chamada depois de um 503 pode dar 409 se a primeira já tinha sido gravada: o
+        cliente existe, uma vez só; confira a lista.
       tags: [Admin Clients]
       x-auth-policy:
         access: authenticated
@@ -571,6 +591,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -624,7 +646,13 @@ paths:
     patch:
       operationId: updateClient
       summary: Renomear, arquivar ou desarquivar cliente
-      description: Arquivar impede novos processos e novos logins; não desativa os logins existentes.
+      description: |
+        Arquivar impede novos processos e novos logins; não desativa os logins existentes. Arquivar
+        libera o nome. O nome é único entre os clientes não arquivados (como em `createClient`):
+        renomear para o nome de outro cliente não arquivado, ou desarquivar um cliente cujo nome foi
+        tomado por um ativo, responde 409 `CONFLICT`, sem dizer qual é o outro cliente, e não muda
+        nada. Renomear e arquivar na mesma chamada vale pelo estado final: o cliente que acaba
+        arquivado não disputa o nome.
       tags: [Admin Clients]
       x-auth-policy:
         access: authenticated
@@ -660,6 +688,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -1348,7 +1378,9 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Conflict:
-      description: '`EMAIL_ALREADY_REGISTERED`, `MFA_ALREADY_ENROLLED` ou `CONFLICT`.'
+      description: |
+        `EMAIL_ALREADY_REGISTERED`, `MFA_ALREADY_ENROLLED` ou `CONFLICT`. Em `createClient` e
+        `updateClient`, `CONFLICT` é o nome de cliente que já é de outro cliente não arquivado.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
@@ -1408,8 +1440,12 @@ components:
     ServiceUnavailable:
       description: |
         Dependência indisponível ou lenta (`SERVICE_UNAVAILABLE`): limitador de taxa, banco ou Auth.
-        A operação falha fechada, ou seja, nada é liberado por causa da falha. Escritas são atômicas,
-        então repetir é seguro; a exceção, `changePassword`, está na descrição da operação.
+        A operação falha fechada, ou seja, nada é liberado por causa da falha. Escritas são atômicas
+        (nada fica pela metade), mas um 503 não diz se a escrita chegou a ser gravada. Repetir uma
+        escrita idempotente (`PATCH`, desativar, arquivar) é seguro, e repetir `createClient` nunca
+        duplica o cliente: se a primeira chamada tinha sido gravada, a repetição responde 409
+        `CONFLICT`. Nas demais escritas, a descrição da própria operação diz o que a repetição
+        devolve. A exceção, `changePassword`, está na descrição da operação.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'

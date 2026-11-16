@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { describe, expect, it, vi } from 'vitest';
 import type { Database } from '@/shared/db/database.types';
 import {
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
@@ -359,6 +360,79 @@ describe('create', () => {
     await expect(repository.create('Acme')).rejects.toThrow('create_client failed unexpectedly');
   });
 
+  it('E-40: CLIENT_NAME_TAKEN is a ConflictError (409) whose detail names no client', async () => {
+    const log = logger();
+    const { supabase, queries } = fakeSupabase([failure('P0001', 'CLIENT_NAME_TAKEN', 400)]);
+    const repository = createSupabaseClientRepository(supabase, { logger: log });
+
+    const result = await repository.create('Acme');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(ConflictError);
+      expect(result.error.code).toBe('CONFLICT');
+      expect(result.error.detail).toBe('A client with this name already exists.');
+      expect(result.error.cause).toEqual({ code: 'P0001' });
+    }
+    expect(queries).toHaveLength(1);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('E-40: the answer to a taken name carries neither the id nor the name of the other client', async () => {
+    const database = {
+      code: 'P0001',
+      message: 'CLIENT_NAME_TAKEN',
+      details: `Key (name)=(Cliente Secreto Ltda) of ${A}`,
+      hint: B,
+    };
+    const { supabase } = fakeSupabase([{ data: null, error: database, status: 400 }]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const result = await repository.create('Cliente Secreto Ltda');
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const shown = JSON.stringify({ detail: result.error.detail, cause: result.error.cause });
+      expect(shown).not.toContain('Secreto');
+      expect(shown).not.toContain(A);
+      expect(shown).not.toContain(B);
+    }
+  });
+
+  it.each([
+    ['40P01', 500],
+    ['40001', 500],
+    ['40P01', 400],
+    ['40001', 409],
+  ])(
+    'F-51: %s (HTTP %i) on create is a ServiceUnavailableError (503), with the SQLSTATE only in the cause',
+    async (code, status) => {
+      const message = 'deadlock detected Process 1 waits for ... Key (name)=(Cliente Secreto)';
+      const { supabase } = fakeSupabase([failure(code, message, status)]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const error: unknown = await repository.create('Acme').catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      expect((error as { cause?: unknown }).cause).toEqual({ code, status });
+    },
+  );
+
+  it('F-51: a raw 23505 is not the documented path: it is unexpected (500), with the SQLSTATE only', async () => {
+    // The database functions turn the violation of the name index into CLIENT_NAME_TAKEN; a bare
+    // unique violation would be any other index, so it must not become a 409.
+    const message =
+      'duplicate key value violates unique constraint "x" Key (name)=(Cliente Secreto)';
+    const { supabase } = fakeSupabase([failure('23505', message, 409)]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const error: unknown = await repository.create('Acme').catch((caught: unknown) => caught);
+
+    expect(error).not.toBeInstanceOf(ConflictError);
+    expect((error as Error).message).toBe('create_client failed unexpectedly');
+    expect((error as { cause?: unknown }).cause).toEqual({ code: '23505', status: 409 });
+  });
+
   it('E-21: Supabase being down is ServiceUnavailableError', async () => {
     const { supabase } = fakeSupabase([
       { data: null, error: { message: 'TypeError: fetch failed', code: '' }, status: 0 },
@@ -456,6 +530,58 @@ describe('update', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(ValidationError);
+  });
+
+  it.each([
+    ['a rename', { name: 'Novo' }],
+    ['an unarchive', { archived: false }],
+    ['a rename with an unarchive', { name: 'Novo', archived: false }],
+  ])(
+    'E-41, E-42: CLIENT_NAME_TAKEN on %s is a ConflictError (409) and nothing is read again',
+    async (_label, patch) => {
+      const { supabase, queries } = fakeSupabase([failure('P0001', 'CLIENT_NAME_TAKEN', 400)]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const result = await repository.update(A, patch);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBeInstanceOf(ConflictError);
+        expect(result.error.detail).toBe('A client with this name already exists.');
+      }
+      expect(queries).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['40P01', 500],
+    ['40001', 500],
+    ['40P01', 400],
+    ['40001', 409],
+  ])(
+    'F-51: %s (HTTP %i) is a ServiceUnavailableError (503): the transaction rolled back, repeating is safe',
+    async (code, status) => {
+      const { supabase, queries } = fakeSupabase([failure(code, 'deadlock detected', status)]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const error: unknown = await repository
+        .update(A, { name: 'Novo' })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      expect((error as { cause?: unknown }).cause).toEqual({ code, status });
+      expect(queries).toHaveLength(1);
+    },
+  );
+
+  it('F-51: a raw 23505 on update is unexpected (500) too, not a 409', async () => {
+    const { supabase } = fakeSupabase([failure('23505', 'duplicate key value', 409)]);
+    const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+    const rejection = repository.update(A, { name: 'Novo' });
+
+    await expect(rejection).rejects.not.toBeInstanceOf(ConflictError);
+    await expect(rejection).rejects.toThrow('update_client failed unexpectedly');
   });
 
   it('E-21: Supabase being down is ServiceUnavailableError', async () => {

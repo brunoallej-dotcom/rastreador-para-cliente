@@ -239,6 +239,9 @@ tempo):
 - **Critérios de aceite**: AC-11; AC-21 (parte de cliente em `/admin/clients`); E-29 (cursor
   adulterado).
 - **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "AC-11|E-29" executa pelo menos 2 testes, todos verdes, stop after 10 tries`
+- **Complemento F-51** (decidido pelo usuário em 2026-11-16, opção (a)): nome de cliente único
+  entre os não arquivados, com 409 `CONFLICT` em `createClient` e `updateClient` (contrato
+  `1.0.0-draft.3`), índice único parcial sobre o nome normalizado e casos E-40 a E-47.
 
 ## Onda 6.1 — Identidade: elevação de CEO atestada pelo backend e validade da senha temporária
 

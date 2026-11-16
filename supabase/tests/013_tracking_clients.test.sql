@@ -421,9 +421,10 @@ SELECT results_eq(
   $$ VALUES ('Caf' || chr(233), true) $$,
   'AC-11: update_client renomeia (em NFC) e arquiva numa chamada só'
 );
+-- (o nome "日本" já é de um cliente ativo criado acima: o japonês daqui é outro, por causa de E-41)
 SELECT results_eq(
-  $$ SELECT name FROM public.update_client('00000000-0000-4000-8000-00000000000e', chr(26085) || chr(26412), NULL) $$,
-  $$ VALUES (chr(26085) || chr(26412)) $$,
+  $$ SELECT name FROM public.update_client('00000000-0000-4000-8000-00000000000e', chr(26085) || chr(26412) || chr(35486), NULL) $$,
+  $$ VALUES (chr(26085) || chr(26412) || chr(35486)) $$,
   'E-30: update_client aceita um nome em japonês (o [[:alnum:]] é Unicode)'
 );
 SELECT throws_ok(
