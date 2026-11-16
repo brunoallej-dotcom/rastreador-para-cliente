@@ -65,6 +65,8 @@ const GROUP_NUMBERS: Record<RateLimitGroup, readonly Omit<RateLimitRule, 'group'
   login: [
     { scope: 'ip', limit: 20, windowSeconds: 900 },
     { scope: 'account', limit: 10, windowSeconds: 900 },
+    // not a route rule: the aggregate budget of every password sign-in (F-02), `programmatic` in the contract
+    { scope: 'global', limit: 300, windowSeconds: 300 },
   ],
   'totp-enroll': [{ scope: 'user', limit: 10, windowSeconds: 900 }],
   'totp-verify': [{ scope: 'user', limit: 5, windowSeconds: 300 }],
@@ -140,33 +142,53 @@ describe('rate-limit groups (spec §3.9)', () => {
   });
 
   it('every x-rate-limit entry of the contract belongs to exactly one named group', () => {
+    type ContractRule = Omit<RateLimitRule, 'group'> & {
+      group?: RateLimitGroup;
+      programmatic?: boolean;
+    };
+    type Carrier = { 'x-rate-limit'?: ContractRule[] };
     const contract = parse(
       readFileSync(
         fileURLToPath(new URL('../../../contracts/openapi.v1.yaml', import.meta.url)),
         'utf8',
       ),
     ) as {
-      paths: Record<string, Record<string, { 'x-rate-limit'?: Omit<RateLimitRule, 'group'>[] }>>;
+      paths: Record<string, Record<string, Carrier>>;
+      components: { securitySchemes: Record<string, Carrier> };
     };
 
+    // the operations, and the security scheme: the session budget is charged to every operation
+    const carriers: Carrier[] = [
+      ...Object.values(contract.paths).flatMap((item) => Object.values(item)),
+      ...Object.values(contract.components.securitySchemes),
+    ];
+
     let checked = 0;
-    for (const item of Object.values(contract.paths)) {
-      for (const operation of Object.values(item)) {
-        for (const rule of operation['x-rate-limit'] ?? []) {
-          const owners = RATE_LIMIT_GROUPS.filter((group) =>
-            GROUP_NUMBERS[group].some(
-              (known) =>
-                known.scope === rule.scope &&
-                known.limit === rule.limit &&
-                known.windowSeconds === rule.windowSeconds,
-            ),
-          );
-          expect(owners, JSON.stringify(rule)).toHaveLength(1);
-          checked += 1;
+    let programmatic = 0;
+    for (const carrier of carriers) {
+      for (const rule of carrier['x-rate-limit'] ?? []) {
+        const owners = RATE_LIMIT_GROUPS.filter((group) =>
+          GROUP_NUMBERS[group].some(
+            (known) =>
+              known.scope === rule.scope &&
+              known.limit === rule.limit &&
+              known.windowSeconds === rule.windowSeconds,
+          ),
+        );
+        expect(owners, JSON.stringify(rule)).toHaveLength(1);
+        if (rule.programmatic === true) {
+          // a programmatic budget names its counter, and the name is the one that owns the numbers
+          expect(rule.group, JSON.stringify(rule)).toBe(owners[0]);
+          programmatic += 1;
+        } else {
+          // a route rule's group is declared in code, not in the contract
+          expect(rule.group, JSON.stringify(rule)).toBeUndefined();
         }
+        checked += 1;
       }
     }
     expect(checked).toBeGreaterThanOrEqual(20);
+    expect(programmatic).toBe(4);
   });
 
   it('routes in the same group share one counter per subject (e.g. all "writes")', async () => {

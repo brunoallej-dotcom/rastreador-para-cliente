@@ -201,7 +201,9 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       if (consumed.error) {
         const { code: sqlState, message } = consumed.error;
         if (sqlState === SQL_BUSINESS_RULE && message === SQL_NOT_FOUND) {
-          return err(new InvalidMfaCodeError('factor_not_found', { cause: consumed.error }));
+          return err(
+            new InvalidMfaCodeError('factor_not_found', { cause: consumed.error, factorId }),
+          );
         }
         // no active principal: the session ended after the pipeline accepted it
         if (sqlState === SQL_INSUFFICIENT_PRIVILEGE) {
@@ -212,7 +214,7 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         }
         throw upstreamFailure('burn a TOTP code', consumed.error, consumed.status);
       }
-      if (consumed.data === false) return err(new InvalidMfaCodeError('code_reused'));
+      if (consumed.data === false) return err(new InvalidMfaCodeError('code_reused', { factorId }));
       if (consumed.data !== true) {
         throw new Error('burn a TOTP code: an answer that is not understood');
       }
@@ -223,7 +225,9 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       );
       if (challenge.error) {
         if (errorCodeOf(challenge.error) === FACTOR_NOT_FOUND) {
-          return err(new InvalidMfaCodeError('factor_not_found', { cause: challenge.error }));
+          return err(
+            new InvalidMfaCodeError('factor_not_found', { cause: challenge.error, factorId }),
+          );
         }
         throw failure('challenge a factor', challenge.error);
       }
@@ -238,10 +242,12 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       if (verified.error) {
         const verifiedCode = errorCodeOf(verified.error);
         if (verifiedCode === FACTOR_NOT_FOUND) {
-          return err(new InvalidMfaCodeError('factor_not_found', { cause: verified.error }));
+          return err(
+            new InvalidMfaCodeError('factor_not_found', { cause: verified.error, factorId }),
+          );
         }
         if (verifiedCode === VERIFICATION_FAILED) {
-          return err(new InvalidMfaCodeError('invalid_code', { cause: verified.error }));
+          return err(new InvalidMfaCodeError('invalid_code', { cause: verified.error, factorId }));
         }
         throw failure('verify a factor', verified.error);
       }

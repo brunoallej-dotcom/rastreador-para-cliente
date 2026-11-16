@@ -99,13 +99,17 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
       calls.push(`verify:${factorId}`);
       unavailable('verify');
       if (!factors.some((factor) => factor.id === factorId)) {
-        return Promise.resolve(err(new InvalidMfaCodeError('factor_not_found')));
+        return Promise.resolve(err(new InvalidMfaCodeError('factor_not_found', { factorId })));
       }
       // like the database: a code is burned the first time it is sent, right or wrong
       const use = `${factorId}:${code}`;
-      if (burned.has(use)) return Promise.resolve(err(new InvalidMfaCodeError('code_reused')));
+      if (burned.has(use)) {
+        return Promise.resolve(err(new InvalidMfaCodeError('code_reused', { factorId })));
+      }
       burned.add(use);
-      if (code !== FAKE_VALID_CODE) return Promise.resolve(err(new InvalidMfaCodeError()));
+      if (code !== FAKE_VALID_CODE) {
+        return Promise.resolve(err(new InvalidMfaCodeError('invalid_code', { factorId })));
+      }
       factors = factors.map((factor) =>
         factor.id === factorId ? { ...factor, verified: true } : factor,
       );
