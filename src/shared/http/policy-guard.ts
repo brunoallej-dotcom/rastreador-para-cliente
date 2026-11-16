@@ -22,7 +22,7 @@ function assertRule(rule: RateLimitRule, policy: RuntimePolicy): void {
   if (rule.scope === 'global') {
     throw new Error(
       'withRoute: the "global" rate-limit scope is not allowed in a route policy; ' +
-        'a handler spends a global budget with `consumeGlobalBudget`',
+        'a handler spends a global budget with `consumeGlobalBudget` (or a per-user one with `consumeUserBudget`)',
     );
   }
   if (!RATE_LIMIT_SCOPES.includes(rule.scope)) {

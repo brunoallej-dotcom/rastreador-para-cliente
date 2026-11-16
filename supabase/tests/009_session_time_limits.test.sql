@@ -8,6 +8,7 @@ SELECT plan(27);
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000a', 'Cliente A');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 
 -- Posiciona a sessão do cliente (id = id do usuário) e diz se o banco ainda lhe dá um principal.
 CREATE FUNCTION pg_temp.has_principal(p_created interval, p_refreshed interval)

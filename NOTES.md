@@ -4,11 +4,11 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 4 concluídas.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 5 concluídas.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 5 (MFA TOTP, em revisão) e depois 6 (clientes).
+- **Próximas ondas:** 6 (clientes), depois 7 ∥ 8.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -19,7 +19,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
-| 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |
+| 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6 | 8 | ⬜ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6 | 7 | ⬜ |
@@ -35,6 +35,8 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 |-----------|----------|
 | Revisar e aceitar os ADRs 0001–0009 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
 | F-03: bloqueio direcionado de conta (threat model T-04, §8): escolher a mudança no §3.9 da spec | risco aberto até a decisão |
+| **`factorId` depois do enroll** (threat model §8): o contrato não oferece como obtê-lo, então um CEO num dispositivo novo (`VERIFY_MFA`) não consegue verificar. Opções: `TotpVerifyRequest.factorId` opcional resolvido no servidor (recomendado) ou o fator no DTO `Session` | **frontend e go-live** (mudança de contrato) |
+| F-23: o refresh token anterior ao verify ainda rende `aal2` durante o `refresh_token_reuse_interval` (10 s); a decisão é reduzir o intervalo (threat model §7) | Onda 11 |
 | F-41: prazo de validade da senha temporária (threat model §8) | decisão de spec; exige caminho de reset de CEO |
 | Proposta de mudança de contrato (threat model §8): limites de `newPassword` × 422, `currentPassword` em bytes, `Set-Cookie` no 204 e 503 de `changePassword`, orçamentos programáticos fora do `x-rate-limit` | OK do usuário (bump minor) |
 | Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
@@ -240,3 +242,42 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   + 481 pgTAP; `pnpm db:lint` ok; `pnpm db:types` sem diff; `pnpm test:api` → 121/121 duas vezes;
   `pnpm test:api -t "AC-0[56]|AC-31"` → 26 verdes; `pnpm test:int` → 22/22; `build`,
   `format:check` e `test:hooks` (179) ok. Falta só o `pnpm ceo:create` real, que é do usuário.
+
+### 2026-11-16 — Onda 5: MFA TOTP para CEOs
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 4. O plano previa a
+  Onda 5 na sessão principal; a compensação foi a mesma da Onda 3: revisores completos e gates
+  reexecutados pela sessão principal.
+- Entregue: `POST /auth/mfa/totp/enroll` e `POST /auth/mfa/totp/verify`, e `tests/helpers/mfa.ts`
+  (`loginAsCeoWithMfa` para as ondas 6 a 9).
+  - Enroll: troca o fator não verificado (E-26) e dá 409 se já há fator verificado (E-27).
+  - Verify: código errado dá 422 e conta no limite (E-28). Os cookies `aal2` saem pelo jar do
+    pipeline.
+- Nova migration (`totp_replay_protection_and_ceo_factor`):
+  - **Replay de TOTP (F-21, RFC 6238 §5.2):** o GoTrue local aceita o mesmo código duas vezes. O
+    app queima `SHA-256(factorId:code)` em `consume_totp_code()` antes de chamar o Auth, com janela
+    de 120 s.
+  - **`private.is_ceo()` (F-24):** passa a exigir também um fator TOTP verificado. Os pgTAP 001–006
+    e 009 ganharam `tests.verify_totp` para os CEOs.
+- Outras defesas:
+  - **Primeira ativação de fator (F-20):** derruba as outras sessões do usuário com
+    `signOut({ scope: 'others' })`.
+  - **Teto diário de verificação (F-22):** 20 por dia por usuário, pelo novo `consumeUserBudget` do
+    pipeline (grupo `totp-verify-daily`). A regra do contrato não mudou.
+  - **Redação de logs (F-25):** URIs `otpauth://` e a chave `qrcode`.
+- Revisões:
+  - threat-modeler: F-20..F-26.
+  - code-reviewer, duas passadas: 3 MÉDIOS corrigidos, nenhum novo na segunda.
+  - contract-guardian: conforme, com lacunas de `expectToMatchContract` corrigidas.
+  - rls-auditor na migration nova.
+- Decisões que ficam com o usuário:
+  - o `factorId` depois do enroll, que bloqueia o frontend;
+  - F-23, que é residual. Rotacionar de novo não resolve, e a correção é reduzir o
+    `refresh_token_reuse_interval`.
+- Possível flake não reproduzido: uma execução logo depois do `db:reset` teve 500s no verify
+  (suspeita de atraso no cache de schema do PostgREST). O teste agora imprime as linhas de erro do
+  servidor quando falha.
+- Verificado (sessão principal, sob o lock, a partir de `pnpm db:reset`, já com a Onda 4 na main):
+  `pnpm verify` → 1642 unit + 530 pgTAP (522 + 8 do rls-auditor); `pnpm db:lint` ok; `pnpm db:types` sem diff;
+  `pnpm test:api` → 162/162 duas vezes; `pnpm test:api -t "AC-07|E-2[678]"` → 11 verdes;
+  `pnpm test:int` → 22/22; `build`, `format:check` e `test:hooks` (179) ok.

@@ -188,6 +188,10 @@ describe('logger redaction (AC-27, case and separator insensitive)', () => {
     'x-csrf-token',
     'newPassword',
     'current_password',
+    'qrCode',
+    'qr_code',
+    'QRCODE',
+    'qr-code',
   ])('AC-27: redacts the key %s at the top level, nested and inside headers', (key) => {
     for (const shape of [
       { [key]: LEAK },
@@ -224,6 +228,49 @@ describe('logger redaction (AC-27, case and separator insensitive)', () => {
     const written = output({ headers });
     expect(written).not.toContain(LEAK);
     expect(JSON.parse(written)).toMatchObject({ headers: { accept: '*/*' } });
+  });
+
+  it('F-25: cuts an otpauth URI out of any string, secret and e-mail label included', () => {
+    const uri =
+      'otpauth://totp/Rastreador:ceo@cliente.test?secret=JBSWY3DPEHPK3PXP&issuer=Rastreador';
+    const written = output({
+      message: `enrollment ${uri} done`,
+      nested: { text: uri.toUpperCase() },
+    });
+
+    expect(written).not.toContain('JBSWY3DPEHPK3PXP');
+    expect(written.toLowerCase()).not.toContain('otpauth://');
+    expect(written.toLowerCase()).not.toContain('cliente.test');
+    // the text around it stays
+    expect(written).toContain('enrollment [REDACTED] done');
+  });
+
+  it('F-25: cuts an otpauth URI out of an error message and of the log message too', () => {
+    const { logger, lines } = capture();
+    // a low-entropy stand-in built at runtime: a real-looking base32 seed here trips secret scanners
+    const seed = 'A'.repeat(16);
+    const uri = `otpauth://totp/Rastreador:x?secret=${seed}`;
+
+    logger.error({ err: new Error(`bad enrollment ${uri}`) }, `failed for ${uri}`);
+
+    expect(lines.join('\n')).not.toContain(seed);
+  });
+
+  it('F-25: a key named uri is NOT redacted (legitimate URLs stay readable), only the otpauth values are', () => {
+    const { logger, records } = capture();
+
+    logger.info(
+      {
+        uri: 'https://app.example/api/v1/health',
+        other: { uri: 'otpauth://totp/x?secret=ABCDEFGH' },
+      },
+      'ok',
+    );
+
+    expect(records()[0]).toMatchObject({
+      uri: 'https://app.example/api/v1/health',
+      other: { uri: '[REDACTED]' },
+    });
   });
 
   it('AC-27: does not redact ordinary keys that merely contain a sensitive word', () => {

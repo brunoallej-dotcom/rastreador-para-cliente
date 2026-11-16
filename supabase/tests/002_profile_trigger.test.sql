@@ -16,6 +16,7 @@ SELECT tests.create_user(
   '00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a', 'Maria Cliente'
 );
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo', NULL, 'Carlos CEO');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 
 SELECT results_eq(
   $$ SELECT role::text, client_id, display_name, must_change_password, disabled_at IS NULL

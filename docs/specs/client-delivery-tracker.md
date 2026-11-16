@@ -226,6 +226,40 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
 - **Revogação efetiva:** `current_principal()` só retorna o principal se a `session_id` do JWT
   existir em `auth.sessions` e o perfil não estiver desativado. Logout, desativação e reset de
   senha apagam sessões, e a próxima requisição recebe 401 mesmo com um JWT ainda válido.
+- **MFA TOTP** (`POST /auth/mfa/totp/enroll` e `…/verify`, só CEO): usa o MFA do Supabase Auth no
+  client da requisição, o mesmo do resolvedor de principal. **Enroll:** com fator TOTP verificado,
+  409 `MFA_ALREADY_ENROLLED` e nada muda; fatores não verificados são removidos (E-26) e um novo é
+  criado sem `friendly_name` (o Auth então aceita um único fator por usuário, o que fecha a
+  corrida entre dois enrolls). URI, segredo e QR code vão na resposta, uma única vez; o log só leva
+  ids. **Verify:** primeiro **queima o código** (`consume_totp_code`, abaixo) e só então faz o
+  `challenge` + `verify` do Auth. O primeiro sucesso ativa o fator, e todo sucesso troca a sessão
+  por uma `aal2` (mesma `session_id`, tokens novos): os cookies novos saem na resposta, pelo jar do
+  pipeline, e o principal é lido de novo com a sessão nova. Código errado, código vencido, código
+  já usado e fator que não é do usuário respondem **igual** (422 `INVALID_MFA_CODE`), para não
+  sondar ids de fator nem códigos usados; o log distingue (§3.10). O limite de 5 / 5 min é da rota
+  e cobra toda requisição, a que acerta também, antes de olhar o código; sobre ele há um teto
+  diário de 20 por usuário (§3.9). O token `aal1` anterior continua valendo como `aal1`: toda rota
+  de CEO o recusa (pendência `VERIFY_MFA`) e as funções do banco exigem `aal2` no próprio JWT.
+- **Replay de código TOTP (F-21, RFC 6238 seção 5.2):** o Auth aceita o mesmo código mais de uma
+  vez dentro da janela de validade (período anterior, atual e próximo, até cerca de 90 s).
+  `public.consume_totp_code(p_factor_id, p_code_digest)` guarda o SHA-256 de `<factorId>:<código>`
+  (o código nunca chega ao banco) em `private.totp_code_uses` e devolve `false` para o mesmo código
+  do mesmo fator dentro de 120 s; só o dono do fator consome (fator alheio, inexistente ou que não
+  é TOTP: `NOT_FOUND`). Um código errado também é queimado, o que não custa nada.
+- **Ativação do primeiro fator derruba as outras sessões (F-20):** quando um verify **ativa** o
+  primeiro fator (o CEO tinha `ENROLL_MFA` pendente), o app chama `signOut({ scope: 'others' })`
+  no client da requisição: as outras sessões do CEO morrem e os cookies da sessão atual ficam como
+  estão. Assim uma sessão aberta só com a senha (ou um cookie `aal1` roubado) não sobrevive ao
+  momento em que a conta ganha o segundo fator. É melhor esforço: se falhar, o verify continua
+  valendo e o log registra `auth.mfa.followup_failed`. O cliente do Auth trata 401, 403 e 404 da
+  revogação como "já desconectado", então uma revogação que o Auth recusou por esses status não
+  aparece no app.
+- **Janela do refresh token antigo (F-23, resíduo):** o refresh token que o navegador tinha
+  **antes** do verify continua valendo pelo intervalo de reuso do Auth
+  (`refresh_token_reuse_interval`, 10 s) e responde com a sessão atual, já `aal2`. Rotacionar de
+  novo não encurta isso (testado: com uma rotação a mais, o resultado foi o mesmo). Depois
+  do intervalo, o mesmo token dá `refresh_token_already_used`. Reduzir o intervalo é decisão da
+  Onda 11, no projeto hospedado.
 - **Contas de CEO:** `pnpm -s ceo:create --target <host> --email … --name …` (o `-s` é parte do
   comando: sem ele o pnpm escreve o próprio cabeçalho no stdout) roda localmente, por uma pessoa, num
   terminal, com a secret key do ambiente alvo. Gera uma senha temporária e cria o usuário com
@@ -282,7 +316,9 @@ um CEO age sobre um login, o caso de uso confere que `userId` pertence ao `clien
 não pertencer, responde 404.
 
 **Camada 2, funções do banco (escrita):** toda função de escrita chama `private.is_ceo()`
-(papel `ceo`, `aal2`, sessão viva, perfil ativo) e valida o alvo. Exemplo: as funções de conta
+(papel `ceo`, `aal2`, **fator TOTP verificado**, sessão viva, perfil ativo) e valida o alvo.
+O fator importa porque o JWT `aal2` dura até 15 min: sem ele, remover o fator deixaria o acesso
+de CEO vivo até o token vencer (F-24). Exemplo: as funções de conta
 recusam alvo que não seja `role = 'client'`.
 
 **Camada 3, RLS (leitura):** clientes leem apenas linhas do próprio tenant; CEOs `aal2` leem tudo.
@@ -354,6 +390,7 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `set_account_display_name(p_user_id, p_display_name)` | idem; alvo precisa ser `client` | Renomeia o login (`PATCH …/users/{userId}` com `displayName`). `account.updated` |
 | `require_password_change(p_user_id)` | idem; alvo precisa ser `client` | `must_change_password = true`, apaga as sessões. `account.password_reset` |
 | `mark_password_changed()` | authenticated (o próprio usuário) | Exige prova da troca: o hash atual em `auth.users` difere da linha de base (`private.password_baselines`, gravada na criação e no reset), senão `PASSWORD_UNCHANGED`; CEO com TOTP verificado precisa de `aal2`. Então `must_change_password = false`, renova a linha de base e apaga as **demais** sessões do usuário (mantém a da requisição, AC-06). `account.password_changed` |
+| `consume_totp_code(p_factor_id, p_code_digest)` | authenticated (o dono do fator) | Queima um código TOTP: `true` na primeira vez, `false` se o mesmo digest do mesmo fator já foi consumido nos últimos 120 s (F-21). Fator que não é TOTP do usuário: `NOT_FOUND`. Sem principal ativo: `FORBIDDEN`. Não audita (é estado do fluxo de login, e eventos de auth vão para o log) |
 | `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. `process.created` |
 | `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia ou cancela. `process.updated` / `process.cancelled` |
 | `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. `stage.approved` (+ `process.completed`) |
@@ -402,12 +439,21 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
 | login | global (todos os logins juntos, uma única chave) | 300 / 5 min, sempre abaixo da cota `sign_in_sign_ups` do Auth |
 | sessão que faria o servidor chamar o Auth (cookie vencido ou que não se verifica localmente) | IP (HMAC) | 60 / 15 min |
 | verificação TOTP | usuário | 5 / 5 min |
+| verificação TOTP, teto diário (orçamento do handler, **além** da regra do contrato) | usuário | 20 / 24 h |
 | troca de senha | usuário | 5 / 15 min |
 | provisionar ou resetar senha de login de cliente | CEO | 20 / hora |
 | demais escritas autenticadas | usuário | 60 / min |
 | leituras autenticadas | usuário | 300 / min |
 | health | IP | 60 / min |
 
+- **Teto diário da verificação TOTP (F-22):** 5 / 5 min permite 1.440 tentativas por dia contra um
+  código de seis dígitos (três valem a qualquer momento: cerca de 8 meses até acertar, em média).
+  O handler de `verify` gasta também `totp-verify-daily`, 20 por 86.400 s por usuário, com
+  `consumeUserBudget` (o par do `consumeGlobalBudget`: escopo `user`, sujeito o `userId` da sessão,
+  429 com `Retry-After`, 503 se o limitador falhar). A regra declarada no contrato não muda. A
+  janela é fixa, então na virada do dia cabem até 40 tentativas seguidas. Quem tem a senha também
+  consegue esgotar os dois limites e impedir o CEO de verificar até a janela passar (a mesma classe
+  do T-04).
 - O IP vem do helper da plataforma (`ipAddress()` de `@vercel/functions`), nunca de um header
   arbitrário. As chaves são HMAC-SHA256 com `RATE_LIMIT_KEY_SECRET`: o banco não guarda IP nem
   e-mail em claro.
@@ -441,8 +487,11 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
 - **Eventos de auth em log:** `auth.login.succeeded` (userId, `sessionId`, `ipHash`),
   `auth.login.failed` (HMAC do e-mail, `ipHash` e uma categoria: `invalid_credentials`,
   `account_inactive`, `upstream_unavailable` ou `upstream_error`), `auth.logout` (userId,
-  `sessionId`, `ipHash`), `auth.mfa.enrolled`, `auth.mfa.verified`,
-  `auth.mfa.failed`, `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
+  `sessionId`, `ipHash`), `auth.mfa.enrolled` (`userId`, `factorId`, `replacedFactors`, `ipHash`),
+  `auth.mfa.verified` (`userId`, `factorId`, `sessionId`, `activated`, `ipHash`),
+  `auth.mfa.failed` (`userId`, `factorId`, `ipHash` e uma categoria: `invalid_code`, `code_reused` ou
+  `factor_not_found`; a resposta é a mesma nas três), `auth.mfa.followup_failed` (`userId`, `step`:
+  a revogação das outras sessões que falhou depois de um verify bom), `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
   `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
   `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).
   `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
@@ -601,6 +650,11 @@ papéis da aplicação.
 
 **`private.rate_limit_counters`** (schema não exposto): `bucket text`, `window_start timestamptz`,
 `count integer`; PK `(bucket, window_start)`. Limpeza diária via `pg_cron` (Onda 11).
+
+**`private.totp_code_uses`** (schema não exposto, RLS sem policy, sem grants): `factor_id uuid` (FK para
+`auth.mfa_factors`, `ON DELETE CASCADE`), `code_digest bytea` (SHA-256 de 32 bytes), `used_at timestamptz`;
+PK `(factor_id, code_digest)`. Cada chamada a `consume_totp_code` apaga as linhas do fator com mais
+de 120 s.
 
 ### 4.2 Matriz de acesso
 

@@ -6,6 +6,7 @@ SELECT plan(19);
 -- arrange (como postgres) --------------------------------------------------------------------------
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000a', 'Cliente A');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
 
 INSERT INTO public.audit_events (actor_id, actor_role, action, resource_type, resource_id, client_id) VALUES
