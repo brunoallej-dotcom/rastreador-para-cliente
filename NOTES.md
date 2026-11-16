@@ -9,7 +9,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 7 ∥ 8, depois 9 ∥ 10.
+- **Próximas ondas:** 7 (em revisão), depois 9 ∥ 10 e 10.1 (endurecimento do banco).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -24,10 +24,11 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
-| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
+| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
-| 11 | Hardening e go-live | 7, 9, 10 | — | ⬜ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, auditoria de intenção e reversão no provisionamento (F-81, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
@@ -429,3 +430,47 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   `pnpm sast` sem achados (subagente).
 - **GitHub Pro:** o usuário decidiu ficar sem por ora. Sem branch protection, o merge só com CI
   verde depende do fluxo, e é o que a sessão principal faz.
+
+### 2026-11-16 — Onda 8: processos e fases
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 7. A sessão caiu no
+  meio, e as duas ondas foram retomadas do ponto em que estavam. O scratchpad foi apagado no
+  restart, e o brief comum foi recriado com as lições das revisões embutidas.
+- **Entregue:**
+  - `GET/POST /admin/clients/{clientId}/processes`, `GET/PATCH /admin/processes/{processId}` e
+    `GET /admin/stage-templates/default`;
+  - o agregado `Process`, com os invariantes I1–I6 e a transição de aprovação pura, que a Onda 9
+    expõe;
+  - migration `tracking_processes`, com `create_process`, que trava o cliente (arquivar e criar se
+    serializam), e `update_process`, com a máquina de estados;
+  - pgTAP 016;
+  - cobertura de `tracking/{domain,application}` em 100% de linhas, agora exigida no CI
+    (`quality` roda `pnpm test:coverage`).
+- **Revisões** (threat-modeler F-80..F-89, code-reviewer, contract-guardian, rls-auditor): nenhum
+  CRÍTICO.
+  - Corrigidos:
+    - a leitura confere os invariantes, não só a forma;
+    - `23514`/`22001` viram 500;
+    - CHECKs do template alinhados ao `visible_text`;
+    - descrição em branco vira null no domínio;
+    - asserts de lock no pgTAP;
+    - a semântica do retry documentada (cancelar repetido → 422);
+    - teste de 429.
+  - **Orçamento global de login nos testes:** a suíte de API já usava cerca de 277 dos 300 por 5
+    min. O setup do projeto `api` agora zera esse contador antes de cada arquivo
+    (`resetGlobalLoginBudget` em `tests/helpers/db.ts`).
+- **Decisões que ficam com o usuário:**
+  - **F-80:** POST de processo repetido duplica (índice único de título ativo com 409, ou
+    `Idempotency-Key`; muda o contrato);
+  - **F-87:** alterações em processos de cliente arquivado (spec, Q-13);
+  - contrato `draft.4`, só de documentação: semântica de retry de `createProcess`,
+    `updateProcess`, `provisionClientUser` e `resetClientUserPassword`; contador compartilhado de
+    20/h; regras E-30 em `DisplayName`, `StageInput` e títulos; descrição de
+    `previousTitle`/`newTitle`.
+- **Para a Onda 9** (rls-auditor, F-82): `approve_current_stage` trava a linha do processo antes
+  das fases, e a linha do tempo não preenche `previousTitle`/`newTitle`.
+- **Onda 10.1 criada:** endurecimento do banco (F-81, F-92b, F-93), antes da 11.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`: `pnpm verify` → 2330 unit
+  + 1323 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` → 389/389 duas vezes;
+  `test:api -t "AC-1[59]|E-(16|20)"` → 49; `test:int` → 22/22; `test:coverage` ok; `build` e
+  `format:check` ok; `pnpm sast` sem achados (subagente).
