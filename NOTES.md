@@ -4,18 +4,18 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-15). Ondas 0 e 2 concluídas; Onda 1 em revisão.
+- **Fase:** implementação em andamento (2026-11-15). Ondas 0, 1 e 2 concluídas.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 3 — Identidade: autenticação (sessão principal), depois que a 1 for mergeada.
+- **Próxima onda:** 3 — Identidade: autenticação (sessão principal).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
 | Onda | Entrega | Depende de | Paralela com | Status |
 |------|---------|------------|--------------|--------|
 | 0 | Fundação: scaffold, tooling, CI, Supabase CLI, env, kernel | — | — | ✅ |
-| 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ⬜ |
+| 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ✅ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ⬜ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
@@ -129,3 +129,26 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   os 5 IDs (AC-08/09/10/24/25) e AC-31 presentes nos testes.
 - Pendente para as ondas de identidade: testar o trigger sob o papel real do GoTrue
   (`auth.admin.createUser`) na Onda 3/7; criar usuários já com a senha temporária (spec §3.4).
+
+### 2026-11-15 — Onda 1: plataforma HTTP
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 2.
+- `withRoute` com política obrigatória (sem default) e ordem fixa (SEC-02); catálogo `ErrorCode`
+  completo; problem+json; headers SEC-14 (pipeline e `next.config.ts`); request id; corpo com
+  limite de 16 KiB lido em streaming; Origin; paginação com cursor ligado ao endpoint; logger pino
+  com redação recursiva (chaves sem diferenciar caixa, `err.message`/`cause` sem e-mail ou token);
+  `visibleText` (E-30); health; `tests/helpers/contract.ts` (corpo e headers).
+- Rate limit: `rateLimit` obrigatório em toda rota, grupos nomeados (`login`, `totp-enroll`,
+  `totp-verify`, `password-change`, `client-user-admin`, `writes`, `reads`, `health`), IPv6
+  agregado em /64 e falha fechada (503) sem IP em produção.
+- Decisão do usuário: o contrato não muda. Rotas sem schema de corpo ignoram o corpo, e rotas sem
+  schema de query ignoram parâmetros desconhecidos, para o pipeline nunca produzir um status que
+  a operação não documenta.
+- A Onda 3 troca só `buildPipelineDeps()` em `src/shared/http/pipeline-deps.ts` (limitador do
+  Postgres com HMAC do sujeito e resolver do Supabase) e mantém o grupo `health` fora do
+  limitador do Postgres.
+- Revisões: `code-reviewer` (1 ALTO de redação de logs, corrigido, e MÉDIOS corrigidos) e
+  `contract-guardian` (teste do health movido para `tests/api`; BAIXOS corrigidos).
+- Verificado: `pnpm lint && pnpm typecheck && pnpm test` (959) → exit 0; `pnpm test -t
+  "AC-(22|23|26|27|29)"` → 115 verdes; `pnpm test:api` (health) → 4/4; `build`, `format:check`,
+  `contract:lint` e `test:hooks` ok; nenhum `deps.<módulo>()`.
