@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import { GET as getRoute, PATCH as updateRoute } from '@/app/api/v1/admin/clients/[clientId]/route';
 import { GET as listRoute, POST as createRoute } from '@/app/api/v1/admin/clients/route';
+import { expectToMatchContract } from './contract';
 import { adminClient } from './fixtures';
 import { bodyOf, invoke, type CookieStore, type InvokeInit } from './http';
 
@@ -104,6 +105,7 @@ export async function findInClientList(
       throw new Error(`list fixture failed with ${response.status}: ${await response.text()}`);
     }
     const body = (await bodyOf(response)) as ClientListBody;
+    expectToMatchContract('listClients', response.status, body, response);
     const found = body.items.find((item) => item.id === clientId);
     if (found !== undefined) return found;
     if (body.nextCursor === null) return undefined;

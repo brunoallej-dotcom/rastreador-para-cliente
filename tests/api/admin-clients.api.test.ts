@@ -25,6 +25,7 @@ import {
 } from '../helpers/clients';
 import {
   adminClient,
+  ceoAal2Client,
   createCeo,
   createClient,
   createClientUser,
@@ -42,6 +43,9 @@ import {
 
 const COMBINING_ACUTE = String.fromCodePoint(0x0301);
 const E_ACUTE = String.fromCodePoint(0x00e9);
+const NO_BREAK_SPACE = String.fromCodePoint(0x00a0);
+const IDEOGRAPHIC_SPACE = String.fromCodePoint(0x3000);
+const HANGUL_FILLER = String.fromCodePoint(0x3164);
 const ZERO_WIDTH_SPACE = String.fromCodePoint(0x200b);
 const BIDI_OVERRIDE = String.fromCodePoint(0x202e);
 const UNKNOWN_CLIENT_ID = '00000000-0000-4000-8000-00000000dead';
@@ -321,6 +325,17 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       await expectRefused('A'.repeat(201));
     });
 
+    it('F-53: a well-formed cursor with a timestamp the database cannot read is 400 on query.cursor, never 500', async () => {
+      // year 0000 (Postgres 22008) and an offset past 15:59 (22009): the cursor schema refuses both
+      // before the database sees them; the class-22 backstop of the repository is covered by its unit tests
+      await expectRefused(
+        encodeCursor('admin-clients', { c: '0000-01-01T00:00:00.000000+00:00', i: POSITION.i }),
+      );
+      await expectRefused(
+        encodeCursor('admin-clients', { c: '2026-01-01T00:00:00.000000+23:59', i: POSITION.i }),
+      );
+    });
+
     it('E-29: a cursor of another endpoint, or with a payload of the wrong shape, is 400', async () => {
       await expectRefused(encodeCursor('admin-processes', POSITION));
       await expectRefused(encodeCursor('admin-clients', { ...POSITION, extra: 1 }));
@@ -423,6 +438,14 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
   });
 
   describe('input', () => {
+    // Its own CEO: the writes of this group (every refused one counts too) would otherwise eat the
+    // 60 writes per minute of the CEO the other groups use.
+    let inputCeo: CeoWithMfa;
+
+    beforeAll(async () => {
+      inputCeo = await loginAsCeoWithMfa();
+    });
+
     const BAD_NAMES: [string, unknown][] = [
       ['empty', ''],
       ['only spaces', '   '],
@@ -431,6 +454,11 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       ['with a zero-width space', `Zero${ZERO_WIDTH_SPACE}width`],
       ['with a bidi override', `Bidi${BIDI_OVERRIDE}override`],
       ['only symbols', '***'],
+      ['only a no-break space', NO_BREAK_SPACE],
+      ['only an ideographic space', IDEOGRAPHIC_SPACE],
+      ['only a Hangul filler', HANGUL_FILLER],
+      ['a Hangul filler between letters', `A${HANGUL_FILLER}B`],
+      ['a lone surrogate', `A${String.fromCharCode(0xd800)}`],
       ['a number', 42],
       ['null', null],
     ];
@@ -438,7 +466,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
     it.each(BAD_NAMES)(
       'AC-11: a name that is %s is 400 and creates nothing',
       async (_label, name) => {
-        const response = await createClientViaApi(ceo.cookies, { name });
+        const response = await createClientViaApi(inputCeo.cookies, { name });
 
         const body = await expectContract<Problem>('createClient', response);
 
@@ -452,7 +480,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
     it('AC-11: 160 characters are fine', async () => {
       const name = `${uniqueClientName('x')}`.padEnd(MAX_NAME_LENGTH, 'a');
 
-      const response = await createClientViaApi(ceo.cookies, { name });
+      const response = await createClientViaApi(inputCeo.cookies, { name });
       const body = await expectContract<ClientDetailBody>('createClient', response);
 
       expect(response.status).toBe(201);
@@ -460,7 +488,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
     });
 
     it('AC-11: a missing name is 400', async () => {
-      const response = await createClientViaApi(ceo.cookies, {});
+      const response = await createClientViaApi(inputCeo.cookies, {});
 
       const body = await expectContract<Problem>('createClient', response);
 
@@ -470,11 +498,14 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
 
     it('AC-23: a clientId, an id or any other field in the body is 400 (mass assignment) and nothing is written', async () => {
       const name = uniqueClientName('Atribuicao');
-      const created = await createClientOrFail(ceo.cookies);
+      const created = await createClient();
 
-      const smuggled = await createClientViaApi(ceo.cookies, { name, clientId: UNKNOWN_CLIENT_ID });
-      const archivedAt = await createClientViaApi(ceo.cookies, { name, archivedAt: null });
-      const onUpdate = await updateClientViaApi(ceo.cookies, created.id, {
+      const smuggled = await createClientViaApi(inputCeo.cookies, {
+        name,
+        clientId: UNKNOWN_CLIENT_ID,
+      });
+      const archivedAt = await createClientViaApi(inputCeo.cookies, { name, archivedAt: null });
+      const onUpdate = await updateClientViaApi(inputCeo.cookies, created.id, {
         name: 'Outro',
         id: UNKNOWN_CLIENT_ID,
       });
@@ -496,9 +527,9 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       ['archived as null', { archived: null }],
       ['an empty name', { name: '' }],
     ])('AC-11: updating with %s is 400 and changes nothing', async (_label, body) => {
-      const created = await createClientOrFail(ceo.cookies);
+      const created = await createClient();
 
-      const response = await updateClientViaApi(ceo.cookies, created.id, body);
+      const response = await updateClientViaApi(inputCeo.cookies, created.id, body);
       const problem = await expectContract<Problem>('updateClient', response);
 
       expect(response.status).toBe(400);
@@ -506,10 +537,29 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       expect(await nameOfClient(created.id)).toBe(created.name);
     });
 
-    it('AC-11: an empty update points at the body, not at a field', async () => {
-      const created = await createClientOrFail(ceo.cookies);
+    it.each([
+      ['a no-break space', NO_BREAK_SPACE],
+      ['a Hangul filler', HANGUL_FILLER],
+      ['a lone surrogate', `A${String.fromCharCode(0xd800)}`],
+      ['only punctuation', '...'],
+    ])(
+      'AC-11: renaming to only %s is 400 on body.name and changes nothing',
+      async (_label, name) => {
+        const created = await createClient();
 
-      const response = await updateClientViaApi(ceo.cookies, created.id, {});
+        const response = await updateClientViaApi(inputCeo.cookies, created.id, { name });
+        const problem = await expectContract<Problem>('updateClient', response);
+
+        expect(response.status).toBe(400);
+        expect(problem.errors?.map((issue) => issue.path)).toEqual(['body.name']);
+        expect(await nameOfClient(created.id)).toBe(created.name);
+      },
+    );
+
+    it('AC-11: an empty update points at the body, not at a field', async () => {
+      const created = await createClient();
+
+      const response = await updateClientViaApi(inputCeo.cookies, created.id, {});
       const problem = await expectContract<Problem>('updateClient', response);
 
       expect(problem.errors?.map((issue) => issue.path)).toEqual(['body']);
@@ -519,16 +569,16 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       const name = uniqueClientName('Transporte');
 
       const origin = await createClientViaApi(
-        ceo.cookies,
+        inputCeo.cookies,
         { name },
         { origin: 'https://evil.test' },
       );
-      const noOrigin = await createClientViaApi(ceo.cookies, { name }, { origin: null });
-      const type = await createClientViaApi(ceo.cookies, undefined, {
+      const noOrigin = await createClientViaApi(inputCeo.cookies, { name }, { origin: null });
+      const type = await createClientViaApi(inputCeo.cookies, undefined, {
         rawBody: JSON.stringify({ name }),
         headers: { 'content-type': 'text/plain' },
       });
-      const large = await createClientViaApi(ceo.cookies, undefined, {
+      const large = await createClientViaApi(inputCeo.cookies, undefined, {
         rawBody: JSON.stringify({ name: 'a'.repeat(BODY_LIMIT_BYTES) }),
         headers: { 'content-type': 'application/json' },
       });
@@ -539,10 +589,62 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       expect(await bodyOf(origin)).toMatchObject({ code: 'ORIGIN_NOT_ALLOWED' });
       expect(await bodyOf(type)).toMatchObject({ code: 'UNSUPPORTED_MEDIA_TYPE' });
       expect(await bodyOf(large)).toMatchObject({ code: 'PAYLOAD_TOO_LARGE' });
-      for (const response of [origin, type, large]) {
+      expect(await bodyOf(noOrigin)).toMatchObject({ code: 'ORIGIN_NOT_ALLOWED' });
+      for (const response of [origin, noOrigin, type, large]) {
         await expectContract('createClient', response);
       }
       expect(await clientsNamed(name)).toBe(0);
+    });
+  });
+
+  describe('the database on its own (F-52)', () => {
+    // The API validates with Zod first; a CEO who calls the functions straight through PostgREST
+    // skips it, so the database holds the same rules (private.visible_text).
+    const REFUSED: [string, string][] = [
+      ['only a no-break space', NO_BREAK_SPACE],
+      ['only an ideographic space', IDEOGRAPHIC_SPACE],
+      ['only a Hangul filler', HANGUL_FILLER],
+      ['a filler between letters', `A${HANGUL_FILLER}B`],
+      ['only punctuation', '***'],
+      ['a zero-width space', `Zero${ZERO_WIDTH_SPACE}width`],
+    ];
+
+    it.each(REFUSED)('F-52: create_client refuses %s with INVALID_INPUT', async (_label, name) => {
+      const { supabase } = await ceoAal2Client();
+
+      const { data, error } = await supabase.rpc('create_client', { p_name: name });
+
+      expect(data).toBeNull();
+      expect(error).toMatchObject({ code: 'P0001', message: 'INVALID_INPUT' });
+    });
+
+    it('F-52: update_client refuses the same names and leaves the client alone', async () => {
+      const { supabase } = await ceoAal2Client();
+      const created = await createClientOrFail(ceo.cookies);
+
+      for (const [, name] of REFUSED) {
+        const { error } = await supabase.rpc('update_client', {
+          p_client_id: created.id,
+          p_name: name,
+        });
+        expect(error).toMatchObject({ code: 'P0001', message: 'INVALID_INPUT' });
+      }
+      expect(await nameOfClient(created.id)).toBe(created.name);
+    });
+
+    it('F-52: it accepts what the API accepts, trimmed like the API trims it (no-break spaces, NFC, Japanese)', async () => {
+      const { supabase } = await ceoAal2Client();
+      const unique = uniqueClientName('Direto');
+
+      const padded = await supabase.rpc('create_client', {
+        p_name: `${NO_BREAK_SPACE}${unique}${IDEOGRAPHIC_SPACE}`,
+      });
+      const japanese = await supabase.rpc('create_client', { p_name: '\u65e5\u672c' });
+
+      expect(padded.error).toBeNull();
+      expect(padded.data?.name).toBe(unique);
+      expect(japanese.error).toBeNull();
+      expect(japanese.data?.name).toBe(String.fromCodePoint(0x65e5, 0x672c));
     });
   });
 
@@ -591,7 +693,13 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       const archive = await updateClientViaApi(cookies, tenant.id, { archived: true });
       const read = await getClientViaApi(cookies, tenant.id);
 
+      const bodies = [
+        await expectContract<Problem>('updateClient', rename),
+        await expectContract<Problem>('updateClient', archive),
+        await expectContract<Problem>('getClient', read),
+      ];
       expect([rename.status, archive.status, read.status]).toEqual([403, 403, 403]);
+      expect(bodies.map((body) => body.code)).toEqual(['FORBIDDEN', 'FORBIDDEN', 'FORBIDDEN']);
       expect(await nameOfClient(tenant.id)).toBe(tenant.name);
       const { data } = await adminClient()
         .from('clients')
