@@ -57,6 +57,24 @@ rules:
       - pattern: 'const { ..., auth: { ..., admin: $ALIAS, ... }, ... } = $CLIENT'
       - pattern: const { ..., admin, ... } = auth
       - pattern: 'const { ..., admin: $ALIAS, ... } = auth'
+      # the forms above need `auth` and `admin` in one expression; these two catch the ones that do not
+      # (an alias of the auth client, `client['auth'].admin`, `client.auth?.['admin']`)
+      - pattern: $CLIENT['auth'].admin
+      - pattern: $CLIENT['auth']?.admin
+      - pattern: $CLIENT.auth?.['admin']
+      # an alias: `const a = client.auth; a.admin.createUser(...)`, `const { auth: a } = client; a.admin...`
+      # and the destructured `admin` used later. Only the Auth Admin API's own methods count, so an
+      # unrelated `settings.admin.isEnabled()` is not a finding.
+      - patterns:
+          - pattern-either:
+              - pattern: $X.admin.$M(...)
+              - pattern: $X?.admin.$M(...)
+              - pattern: $X.admin?.$M(...)
+              - pattern: $X['admin'].$M(...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(createUser|updateUserById|deleteUser|listUsers|getUserById|generateLink|inviteUserByEmail)$
+      - pattern: $X.admin.mfa.$N(...)
 
   - id: no-app-metadata-role-but-client
     languages: [typescript, javascript]
@@ -83,6 +101,15 @@ rules:
           - pattern-not: "{ ..., app_metadata: { ..., role: 'client', ... }, ... }"
       # a spread lets the caller bring its own `role` (the last key wins)
       - pattern: '{ ..., app_metadata: { ..., ...$SPREAD, ... }, ... }'
+      # the shorthand `{ app_metadata }` and the computed key `{ ['app_metadata']: ... }` carry a value
+      # nobody checked; so does any assignment to the property
+      - pattern: '{ ..., app_metadata, ... }'
+      - pattern: "{ ..., ['app_metadata']: $VALUE, ... }"
+      - pattern: $OBJ.app_metadata = $VALUE
+      - pattern: $OBJ['app_metadata'] = $VALUE
+      # a computed READ of the property is flagged too (read it with a dot: `user.app_metadata.role`),
+      # because a computed access is the form that slips past a search for the name
+      - pattern: $OBJ['app_metadata']
 
   - id: no-interpolated-postgrest-filter
     languages: [typescript, javascript]

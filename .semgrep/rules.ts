@@ -87,12 +87,55 @@ function authAdmin() {
   // ruleid: no-auth-admin-outside-facade
   const { admin: fromBare } = auth;
 
+  // the evasions: the admin API reached through an alias of the auth client, through a destructured
+  // `auth`, and through computed or optional property access
+  const aliased = supabase.auth;
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.createUser({});
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.updateUserById('id', {});
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.deleteUser('id');
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.listUsers();
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.getUserById('id');
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.generateLink({});
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.inviteUserByEmail('a@b.test');
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin.mfa.listFactors({});
+  // ruleid: no-auth-admin-outside-facade
+  aliased?.admin.createUser({});
+  // ruleid: no-auth-admin-outside-facade
+  aliased.admin?.createUser({});
+  // ruleid: no-auth-admin-outside-facade
+  aliased['admin'].createUser({});
+  const { auth: renamed } = supabase;
+  // ruleid: no-auth-admin-outside-facade
+  renamed.admin.createUser({});
+  // ruleid: no-auth-admin-outside-facade
+  supabase['auth'].admin;
+  // ruleid: no-auth-admin-outside-facade
+  supabase['auth']?.admin;
+  // ruleid: no-auth-admin-outside-facade
+  supabase.auth?.['admin'];
+
   // ok: no-auth-admin-outside-facade
   supabase.auth.getClaims();
   // ok: no-auth-admin-outside-facade
   supabase.auth.mfa.enroll({ factorType: 'totp' });
   // ok: no-auth-admin-outside-facade
   const administrator = { admin: true };
+  // ok: no-auth-admin-outside-facade
+  settings.admin.isEnabled();
+  // ok: no-auth-admin-outside-facade
+  aliased.getUser();
+  // ok: no-auth-admin-outside-facade
+  aliased.administrator.createUser({});
+  // ok: no-auth-admin-outside-facade
+  aliased.mfa.enroll({ factorType: 'totp' });
 }
 
 function appMetadata() {
@@ -109,10 +152,27 @@ function appMetadata() {
   // ruleid: no-app-metadata-role-but-client
   supabase.auth.updateUser({ app_metadata: { role: 'ceo' } });
 
+  // the evasions: the shorthand, a computed key, an assignment and a computed access
+  const app_metadata = userInput;
+  // ruleid: no-app-metadata-role-but-client
+  const shorthand = { email: 'a@b.test', app_metadata };
+  // ruleid: no-app-metadata-role-but-client
+  const computedKey = { ['app_metadata']: { role: 'ceo' } };
+  // ruleid: no-app-metadata-role-but-client
+  supabase.payload.app_metadata = userInput;
+  // ruleid: no-app-metadata-role-but-client
+  supabase.payload['app_metadata'] = userInput;
+  // ruleid: no-app-metadata-role-but-client
+  const computedRead = supabase.user['app_metadata'];
+
   // ok: no-app-metadata-role-but-client
   const client = { email: 'a@b.test', app_metadata: { role: 'client', client_id: userInput } };
   // ok: no-app-metadata-role-but-client
   const read = supabase.user.app_metadata.role;
   // ok: no-app-metadata-role-but-client
   const other = { metadata: { role: 'ceo' } };
+  // ok: no-app-metadata-role-but-client
+  const camel = { appMetadata: { role: 'ceo' } };
+  // ok: no-app-metadata-role-but-client
+  const similar = { app_metadata_version: 2 };
 }
