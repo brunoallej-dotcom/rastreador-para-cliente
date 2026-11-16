@@ -48,9 +48,11 @@ info:
     ## Compatibilidade
     - `1.0.0-draft.3` (minor, **sem mudança de schema**). Aditivo: `createClient` e `updateClient`
       passam a documentar 409 `CONFLICT`, quando o nome já é de outro cliente **não arquivado**. A
-      comparação ignora maiúsculas e minúsculas, acentos combinantes e variantes de largura (o
-      "Ａｃｍｅ" de largura total vale "acme") e conta uma sequência de espaços como um só. A regra é
-      nova e vale para entrada que antes dava 201: dois `POST` com o mesmo nome, que criavam dois
+      comparação trata como o mesmo nome: um acento decomposto e o composto ("Cafe" + U+0301 vale
+      "Café", mas "Cafe" e "Café" seguem distintos); as formas de compatibilidade do Unicode, NFKC
+      ("Acme™" e "AcmeTM", "①" e "1", letras de largura total como "Ａｃｍｅ"); e as diferenças só de
+      caixa, de sequências de espaços e de marcas de variação invisíveis (U+034F, seletores de
+      variação). A regra é nova e vale para entrada que antes dava 201: dois `POST` com o mesmo nome, que criavam dois
       clientes, agora dão 201 e 409. Um `POST` repetido depois de um 503, cuja primeira chamada já
       tinha sido gravada, também dá 409 e não duplica o cliente. Arquivar libera o nome, e desarquivar
       um cliente cujo nome foi tomado por um ativo dá 409. A descrição da resposta compartilhada
@@ -549,10 +551,12 @@ paths:
       operationId: createClient
       summary: Criar cliente
       description: |
-        O nome é único entre os clientes não arquivados: um nome que, normalizado (sem diferença de
-        maiúsculas, acento combinante ou largura, e com espaços repetidos contados como um), já é de
-        outro cliente não arquivado responde 409 `CONFLICT`, sem dizer qual é o outro cliente.
-        Repetir a chamada depois de um 503 pode dar 409 se a primeira já tinha sido gravada: o
+        O nome é único entre os clientes não arquivados: um nome que já é de outro cliente não
+        arquivado responde 409 `CONFLICT`, sem dizer qual é o outro cliente. Valem como o mesmo nome
+        o acento decomposto e o composto ("Cafe" + U+0301 e "Café", mas "Cafe" e "Café" são
+        distintos), as formas de compatibilidade do Unicode, NFKC ("Acme™" e "AcmeTM", "①" e "1",
+        letras de largura total) e as diferenças só de caixa, de sequências de espaços e de marcas de
+        variação invisíveis. Repetir a chamada depois de um 503 pode dar 409 se a primeira já tinha sido gravada: o
         cliente existe, uma vez só; confira a lista.
       tags: [Admin Clients]
       x-auth-policy:
@@ -1440,8 +1444,8 @@ components:
         (nada fica pela metade), mas um 503 não diz se a escrita chegou a ser gravada. Repetir uma
         escrita idempotente (`PATCH`, desativar, arquivar) é seguro, e repetir `createClient` nunca
         duplica o cliente: se a primeira chamada tinha sido gravada, a repetição responde 409
-        `CONFLICT`. Repetir `createProcess` pode duplicar o processo, então confira a lista antes. A
-        exceção, `changePassword`, está na descrição da operação.
+        `CONFLICT`. Nas demais escritas, a descrição da própria operação diz o que a repetição
+        devolve. A exceção, `changePassword`, está na descrição da operação.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
