@@ -21,3 +21,9 @@ assertions (a later 429, an "indistinguishable 422") check `status`/`code` witho
 
 Rate limit groups are named in `RATE_LIMIT_GROUPS` (rate-limiter.ts); every rule in a group must
 have the same limit and window as the contract's `x-rate-limit`. Check the group name as well as the numbers.
+
+Seen in Wave 6 (2026-11-16, admin clients): Supabase repositories map 23505 to `ConflictError`
+(409 CONFLICT) by copy-paste even when the operation documents no 409 (createClient, updateClient)
+and no unique constraint can fire. Grep the repository `refusalOf` for codes not in the operation's
+`responses`. Also: contract `1.0.0-draft.2` (separate PR) adds 503 to every authenticated
+operation; once merged, E-21 tests must call `expectToMatchContract` and the ADR 0008 skip ends.

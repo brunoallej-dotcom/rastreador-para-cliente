@@ -18,6 +18,12 @@ Recurring traps confirmed on the local Supabase (PG 17, CLI 2.122) during the Wa
 - `(auth.jwt() ->> 'session_id')::uuid` raises 22P02 on a malformed claim (fail closed, but 500
   instead of empty set). Prefer a CASE + regex guarded cast.
 - `[[:cntrl:]]` (ICU en_US) catches C0/C1 but NOT Cf chars (U+202E bidi override, U+200B ZWSP).
+- `btrim(x)` strips only U+0020; JS `.trim()` (Zod `visibleText`) strips all Unicode whitespace.
+  SQL name checks built on `btrim` accept NBSP/U+3000-only names, Hangul filler U+3164 and
+  punctuation-only names that Zod rejects (seen in Wave 6 `create_client`, 2026-11-16).
+- plpgsql `DECLARE v := f(p_input)` runs **before** the `IF NOT private.is_ceo()` guard; check
+  that no input processing happens in DECLARE. `IF NOT f()` is fail-open if f() ever returns NULL;
+  prefer `IF f() IS NOT TRUE`.
 - `DROP EXTENSION pg_graphql` leaves `graphql_public.graphql()` behind; exposure depends on
   `[api] schemas` (local) / dashboard "Exposed schemas" (hosted).
 
