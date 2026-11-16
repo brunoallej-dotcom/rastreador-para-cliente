@@ -98,7 +98,10 @@ SELECT throws_ok(
 SELECT tests.clear_authentication();
 
 SELECT is_empty(
-  $$ SELECT id FROM public.audit_events WHERE resource_id::text LIKE '00000000-0000-4000-8000-0000000000__' $$,
+  -- fora o evento que o gatilho de criação grava para cada CEO criado (RF-14, 011_ceo_creation_audit)
+  $$ SELECT id FROM public.audit_events
+      WHERE resource_id::text LIKE '00000000-0000-4000-8000-0000000000__'
+        AND metadata ->> 'channel' IS DISTINCT FROM 'auth_admin' $$,
   'AC-08: as chamadas negadas não gravaram evento de auditoria'
 );
 
@@ -741,7 +744,12 @@ SELECT throws_ok(
 );
 SELECT tests.clear_authentication();
 SELECT is_empty(
-  $$ SELECT id FROM public.audit_events WHERE action = 'account.provisioned' AND resource_id IN ('00000000-0000-4000-8000-0000000000c2', '00000000-0000-4000-8000-0000000000ee') $$,
+  -- `record_account_provisioned` não grava para CEO nem para usuário inexistente; o único evento de um
+  -- CEO é o do gatilho de criação (canal auth_admin, sem ator), que não vem desta função
+  $$ SELECT id FROM public.audit_events
+      WHERE action = 'account.provisioned'
+        AND resource_id IN ('00000000-0000-4000-8000-0000000000c2', '00000000-0000-4000-8000-0000000000ee')
+        AND metadata ->> 'channel' IS DISTINCT FROM 'auth_admin' $$,
   'E-19: nenhum evento account.provisioned foi gravado para CEO ou usuário inexistente'
 );
 
