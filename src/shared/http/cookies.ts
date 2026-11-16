@@ -51,8 +51,11 @@ export function createCookieJar(
       // NextResponse only serves as a correct Set-Cookie serializer.
       const serializer = new NextResponse(null);
       for (const [name, { value, options }] of pending) {
+        // An allow-list, not a spread: whatever else a caller (or a future `CookieOptions` field,
+        // or a JS caller past the types) put in `options`, e.g. a `domain`, never reaches the header.
         serializer.cookies.set(name, value, {
-          ...options,
+          ...(options.maxAge === undefined ? {} : { maxAge: options.maxAge }),
+          ...(options.expires === undefined ? {} : { expires: options.expires }),
           httpOnly: true,
           secure: true,
           sameSite: 'lax',

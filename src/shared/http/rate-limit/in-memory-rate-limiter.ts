@@ -14,9 +14,10 @@ export type InMemoryRateLimiterOptions = {
 };
 
 /**
- * Fixed-window limiter in process memory. It is the fake for unit tests and the default wiring
- * until Wave 3 plugs the Postgres limiter into `pipeline-deps.ts`. It is NOT shared across
- * serverless instances, so it is not a real limit in production.
+ * Fixed-window limiter in process memory. It is the fake for unit tests and, in production, the
+ * limiter of the `health` group only (`pipeline-deps.ts`: a database outage must not turn a
+ * liveness probe into a 503). It is NOT shared across serverless instances, so it is not a real
+ * limit: every other group uses the Postgres limiter.
  *
  * Memory is bounded: when the number of counters reaches `maxCounters`, expired ones are swept
  * and, if that is not enough, the oldest counters (first created) are evicted. Eviction forgets a

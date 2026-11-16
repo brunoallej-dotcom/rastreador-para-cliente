@@ -14,6 +14,8 @@ export {
   type PageQuery,
 } from './pagination';
 export { visibleText } from './validation';
+export { bufferCookies, type BufferedCookieJar } from './cookie-buffer';
+export { fingerprintSubject } from './rate-limit/subject-hmac';
 export type { CookieJar, CookieOptions } from './cookies';
 export type {
   AuthenticatedPolicy,

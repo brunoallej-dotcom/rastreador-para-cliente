@@ -49,6 +49,24 @@ describe('createCookieJar', () => {
     expect(cookie).not.toMatch(/Domain=/i);
   });
 
+  it('SEC-07: an option outside the allow-list (a Domain) never reaches the header', () => {
+    const jar = createCookieJar([]);
+    // a JavaScript caller (or a future field) past the types
+    jar.set(SESSION_COOKIE, 'token', {
+      maxAge: 60,
+      domain: 'evil.example',
+      path: '/admin',
+      sameSite: 'none',
+    } as never);
+    const headers = new Headers();
+    jar.applyTo(headers);
+    const [cookie] = headers.getSetCookie();
+    expect(cookie).not.toMatch(/Domain=/i);
+    expect(cookie).toMatch(/;\s*Path=\/(;|$)/i);
+    expect(cookie).toMatch(/;\s*SameSite=lax(;|$)/i);
+    expect(cookie).toMatch(/Max-Age=60/i);
+  });
+
   it('expires a deleted cookie', () => {
     const jar = createCookieJar([{ name: SESSION_COOKIE, value: 'old' }]);
     jar.delete(SESSION_COOKIE);
