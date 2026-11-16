@@ -15,8 +15,11 @@ Helpers da Onda 2 (`supabase/tests/000_helpers.sql`):
 - `tests.create_user(p_id uuid, p_role text, p_client_id uuid DEFAULT NULL)` cria o usuário em
   `auth.users` (com `raw_app_meta_data`), deixa o trigger criar o perfil e registra uma sessão
   em `auth.sessions`;
-- `tests.authenticate_as(p_user_id uuid, p_aal text DEFAULT 'aal1')` aplica
-  `role = authenticated` e `request.jwt.claims` com `sub`, `aal` e `session_id`;
+- `tests.authenticate_as(p_user_id uuid, p_aal text DEFAULT 'aal1', p_attested boolean DEFAULT true,
+  p_session_id uuid DEFAULT NULL)` aplica `role = authenticated` e `request.jwt.claims` com `sub`,
+  `aal` e `session_id`. Com `aal2` e `p_attested` (o padrão) ele ATESTA a sessão pelo caminho real
+  (`public.attest_mfa_session`, Onda 6.1): é o CEO que o backend elevou. Com `p_attested => false` o
+  claim `aal2` fica sem atestado, que é o que se obtém direto no Auth e **não vale como CEO**;
 - `tests.clear_authentication()` volta ao papel original.
 
 Use **UUIDs fixos** (determinismo) e nomeie cada assert com o ID de aceite.
@@ -85,7 +88,11 @@ Checklist do banco para cada objeto:
 - [ ] cliente A não lê B (conjunto vazio) e lê os próprios dados;
 - [ ] escrita direta por `authenticated` → `42501`;
 - [ ] função de CEO chamada por cliente → `42501` / `FORBIDDEN`;
-- [ ] CEO `aal1` → negado; CEO `aal2` → permitido;
+- [ ] CEO `aal1` → negado; CEO `aal2` atestado → permitido;
+- [ ] **CEO `aal2` SEM atestado (`tests.authenticate_as(…, 'aal2', false)`) → negado, para TODO objeto
+      de CEO novo** (função e policy): é o teste negativo que impede um objeto novo de aceitar um
+      `aal2` obtido direto no Auth (F-50 b, ADR 0013). Nenhuma função lê o claim `aal` do JWT: use
+      `private.is_ceo()` (o `001_privileges` reprova qualquer outra leitura);
 - [ ] `anon` → `42501`;
 - [ ] usuário desativado ou sessão apagada → negado;
 - [ ] para funções: `proconfig` com `search_path=""` e `has_function_privilege('anon', …)` falso.

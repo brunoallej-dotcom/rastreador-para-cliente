@@ -149,7 +149,7 @@ isOneToOne: false
 { Args: { "p_challenge_id": string,"p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: string
                            },
 "consume_totp_code":
-{ Args: { "p_code_digest": string,"p_factor_id": string }; Returns: boolean
+{ Args: { "p_code_digest": string,"p_factor_id": string,"p_user_id": string }; Returns: boolean
                            },
 "create_client":
 { Args: { "p_name": string }; Returns: {
@@ -195,7 +195,7 @@ isOneToOne: false
 { Args: { "p_challenge_id": string,"p_factor_id": string,"p_user_id": string }; Returns: undefined
                            },
 "register_backend_totp_factor":
-{ Args: { "p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: undefined
+{ Args: { "p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: string
                            },
 "require_password_change":
 { Args: { "p_user_id": string }; Returns: undefined

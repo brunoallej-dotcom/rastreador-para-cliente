@@ -272,7 +272,12 @@ describe('E-33: a code found straight at Auth is no use at the backend', () => {
         actor_role: null,
         resource_type: 'account',
         resource_id: legit.ceo.id,
-        metadata: { reason: 'oracle', factor_id: legit.factorId },
+        metadata: {
+          reason: 'oracle',
+          factor_id: legit.factorId,
+          severity: 'alert',
+          revoked: true,
+        },
       },
     ]);
   });
@@ -431,7 +436,12 @@ describe('F-60, F-61: factors the backend did not enroll', () => {
     }
     expect(await auditOf(ceo.id, 'auth.mfa_attestation_refused')).toEqual([
       expect.objectContaining({
-        metadata: { reason: 'factor_not_backend', factor_id: planted.id },
+        metadata: {
+          reason: 'factor_not_backend',
+          factor_id: planted.id,
+          severity: 'alert',
+          revoked: true,
+        },
       }),
     ]);
   });
@@ -575,8 +585,8 @@ describe('E-37: fail closed', () => {
 
 // --------------------------------------------------------------------------------- F-64 ----
 
-describe('F-64: deleting the CEO factor at Auth does not let anyone enroll a new one', () => {
-  it('the attacker deletes the verified factor with an aal2 he got at Auth, then enrolls through the backend: refused with a 409, an alert, every session gone; only the operator reset reopens the enrollment', async () => {
+describe('E-38 (F-64): deleting the CEO factor at Auth does not let anyone enroll a new one', () => {
+  it('E-38: the attacker deletes the verified factor with an aal2 he got at Auth, then enrolls through the backend: refused with a 409, an alert, every session gone; only the operator reset reopens the enrollment', async () => {
     const legit = await loginAsCeoWithMfa();
     // the attacker: password, the publishable key and a code he found at Auth. With the aal2 session
     // that gives him, Auth lets him delete the factor (it asks for aal2, which he has)
@@ -636,7 +646,7 @@ describe('F-64: deleting the CEO factor at Auth does not let anyone enroll a new
     expect(await listClientsStatus(fresh)).toBe(200);
   });
 
-  it('F-64: a CEO that never activated a factor is not affected: the enrollment can be repeated (E-26) and activated', async () => {
+  it('E-38: a CEO that never activated a factor is not affected: the enrollment can be repeated (E-26) and activated', async () => {
     const { cookies } = await loginAsCeoReadyToEnroll();
     await enrollTotp(cookies);
     const second = await enrollTotp(cookies); // replaces the first candidate (E-26)
@@ -650,8 +660,8 @@ describe('F-64: deleting the CEO factor at Auth does not let anyone enroll a new
 
 // --------------------------------------------------------------------------------- F-65 ----
 
-describe('F-65: the replay guard is not a code oracle at PostgREST', () => {
-  it('a session that is not even a CEO (an aal2 straight at Auth) cannot call consume_totp_code, in either signature', async () => {
+describe('E-39 (F-65): the replay guard is not a code oracle at PostgREST', () => {
+  it('E-39: a session that is not even a CEO (an aal2 straight at Auth) cannot call consume_totp_code, in either signature', async () => {
     const legit = await loginAsCeoWithMfa();
     const attacker = await directAal2Session(
       legit.ceo,
@@ -676,7 +686,7 @@ describe('F-65: the replay guard is not a code oracle at PostgREST', () => {
     expect(twoArguments.data).toBeNull();
   });
 
-  it('nor can the attested CEO session itself: the burn belongs to the admin path, behind the limits of the route', async () => {
+  it('E-39: nor can the attested CEO session itself: the burn belongs to the admin path, behind the limits of the route', async () => {
     const legit = await loginAsCeoWithMfa();
     const holder = createSupabaseClient<Database>(
       process.env.SUPABASE_URL ?? '',
