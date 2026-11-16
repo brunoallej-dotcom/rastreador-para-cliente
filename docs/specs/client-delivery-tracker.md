@@ -470,8 +470,8 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `register_backend_totp_factor(p_user_id, p_factor_id, p_session_id)` | **somente `service_role`** | Registra o fator que o enroll acabou de criar (CEO ativo, fator TOTP não verificado do usuário, sessão do usuário); idempotente. Devolve `registered` ou, se o usuário já teve um primeiro fator ativado, `factor_reenrolled` (audita e apaga as sessões, F-64) |
 | `record_backend_mfa_challenge(p_user_id, p_factor_id, p_challenge_id)` | **somente `service_role`** | Registra o challenge que o backend criou, antes de o Auth verificá-lo, com o estado do fator naquele instante; só aceita um challenge novo (menos de 60 s) e não verificado (F-67); idempotente |
 | `attest_mfa_session(p_user_id, p_session_id, p_factor_id, p_challenge_id)` | **somente `service_role`** | Atesta a sessão depois de um verify aceito pelo Auth (§3.4). Devolve `attested`, `attested_activated` (este atestado ativou o fator) ou o motivo da recusa; toda recusa audita `auth.mfa_attestation_refused` e os sinais de ataque apagam todas as sessões do usuário (F-66) |
-| `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. `process.created` |
-| `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia ou cancela. `process.updated` / `process.cancelled` |
+| `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. Cliente inexistente: `NOT_FOUND`; arquivado: `CLIENT_ARCHIVED`, sem evento (§3.7.2). `process.created` |
+| `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia e/ou cancela um processo **ativo**; concluído ou cancelado: `PROCESS_NOT_ACTIVE`. `process.updated` / `process.cancelled`, só quando algo muda (§3.7.2) |
 | `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. `stage.approved` (+ `process.completed`) |
 | `rate_limit_hit(p_bucket, p_window_seconds, p_max)` | **somente `service_role`** | Contador de janela fixa; retorna `allowed` e `retry_after_seconds` |
 
@@ -510,8 +510,9 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
   depois da normalização, estado de arquivamento igual) devolve a linha como está, sem auditar e sem
   mexer em `updated_at` (arquivar quem já está arquivado mantém o `archived_at` original). Renomear e
   arquivar na mesma chamada grava dois eventos, nessa ordem. A linha é travada com `FOR NO KEY UPDATE`:
-  as escritas do mesmo cliente se serializam (a última vence, sem controle otimista: T-37) e a criação
-  de processos e logins, que só referenciam o cliente, não espera.
+  as escritas do mesmo cliente se serializam (a última vence, sem controle otimista: T-37) e quem só
+  referencia o cliente por chave estrangeira não espera. A criação de processos trava o cliente do mesmo
+  modo, de propósito, para olhar se ele está arquivado (§3.7.2).
 - **Nome único (F-51; E-40 a E-47).** Entre os clientes **não arquivados** não há dois nomes com a
   mesma chave: `lower(normalize(name, NFKC))`, sem as marcas de variação invisíveis (U+034F, U+180B a
   U+180D, U+180F, U+FE00 a U+FE0F e U+E0100 a U+E01EF) e com cada sequência de espaços reduzida a um
@@ -562,6 +563,74 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
   name, archived }` ou `null` (o RLS esconde o que a sessão não vê). `getClientSummary` é a mesma
   leitura sem o `archived`. A Onda 7 usa o status para recusar login novo de cliente arquivado
   (E-16).
+
+#### 3.7.2 Processos e fases (Onda 8)
+
+- **Escrita.** `create_process` e `update_process` checam `private.is_ceo() IS NOT TRUE` antes de
+  qualquer trabalho com a entrada (papel `ceo`, sessão `aal2` **atestada**, fator verificado, sessão viva,
+  perfil ativo: senão 42501, F-55), e só o `authenticated` as executa (nem o `service_role`). O título passa
+  por `private.visible_text(texto, 160)`, e o nome e a descrição de cada fase, por `visible_text(texto, 120)`
+  e `visible_text(texto, 2000)`: as mesmas regras do `visibleText` do Zod (E-30, F-52), na criação e na
+  atualização. As duas devolvem a linha de `processes`; o app lê o processo de novo (com as fases, as
+  aprovações e o cliente, numa requisição só) e, se ele não aparece mais, responde 404.
+- **Fases informadas.** `p_stages` é um array JSON de 1 a 30 objetos (I1, E-20), conferido por tamanho
+  antes de tocar em qualquer elemento. Cada elemento é um objeto com `name` (texto) e, opcionalmente,
+  `description` (texto ou `null`), e **nada além disso**: uma chave desconhecida (`position`, `status`, `id`)
+  é recusada, como o `.strict()` do Zod. As posições são as do array, de 1 a n; a fase 1 nasce `in_progress`
+  com `started_at` igual ao `created_at` do processo, e as outras `pending`, sem datas (I2). Qualquer falha é
+  `INVALID_INPUT`, e o JSON `null` não vale como "sem fases": sem fases é o parâmetro ausente, que copia o
+  template. A descrição vazia ou em branco é "sem descrição" na API (o Zod a aceita e o app a guarda como
+  `NULL`, porque o contrato só limita o tamanho), mas o banco, que é mais estrito, a recusa: quem chama a
+  função direto manda `null` ou omite a chave.
+- **Template.** Sem `p_stages`, as fases vêm de `default_stage_template` em ordem de `position`, renumeradas de
+  1 a n (um template com buracos nas posições não gera um processo com buracos). Um template vazio é defeito
+  de migration, não entrada do CEO: a função levanta `P0001` com `TEMPLATE_EMPTY`, que não está no catálogo e
+  o app responde 500; nunca nasce um processo sem fases.
+- **Cliente.** A linha do cliente é travada com `FOR NO KEY UPDATE` (a mesma de `update_client`), então
+  criar um processo e arquivar o cliente se serializam: um processo nunca nasce num cliente que acabou de ser
+  arquivado (E-16). Duas criações para o mesmo cliente também se serializam, o que não custa nada na escala
+  do §2.2. Cliente inexistente é `NOT_FOUND` (404); arquivado, `CLIENT_ARCHIVED` (422), sem processo e sem
+  evento. A ordem é: papel, entrada, cliente.
+- **Atualização.** Só um processo `active` muda (I3, I4): concluído ou cancelado responde `PROCESS_NOT_ACTIVE`
+  (422) a qualquer coisa, até a um renome para o mesmo título (E-60). `p_title` nulo não renomeia; `p_cancel`
+  nulo não cancela; `true` cancela; `false`, ou nenhum dos dois, é `INVALID_INPUT` (não há caminho de volta).
+  Cancelar preenche `cancelled_at` e **congela as fases como estão**: a fase em andamento continua em
+  andamento. Uma chamada que não muda nada (o mesmo título depois da normalização) devolve a linha como está,
+  sem auditar e sem mexer em `version` nem em `updated_at`: repetir um `PATCH` é seguro. Uma que muda soma 1 à
+  `version`, **uma vez**, mesmo que renomeie e cancele juntos (dois eventos, nessa ordem, E-61). A linha do
+  processo é travada com `FOR NO KEY UPDATE`: as escritas do mesmo processo (e a aprovação, na Onda 9) se
+  serializam. Cancelar um processo já cancelado **não** é idempotente: é 422.
+- **Auditoria sem PII.** Os metadados não levam o título nem o nome de fase: `process.created` e
+  `process.cancelled` não têm metadados, e `process.updated` guarda só `{"fields":["title"]}`. O recurso e o
+  `process_id` são o próprio processo, e o `client_id` é o do cliente. Consequência para a linha do tempo da
+  Onda 9: o contrato lista `previousTitle` e `newTitle` em `ProcessEventDetails`, mas os dois são opcionais e a
+  trilha **não os guarda** (como T-36 para o nome do cliente), então um `process.updated` não os traz.
+- **Leitura.** O app lê com o client do usuário (RLS), nunca com a secret key. O detalhe é uma requisição com
+  o cliente, as fases em ordem e, em cada fase concluída, a aprovação e o CEO que a deu (`display_name`).
+  Linha que não é entendida (processo sem fase, status desconhecido, duas aprovações numa fase) é erro
+  inesperado (500): o banco não deixa isso nascer pelas funções. `currentStage` é a fase `in_progress`, seja
+  qual for o status do processo: no ativo é a atual, no cancelado é onde ele parou, e o concluído não tem
+  nenhuma (`null`). `completedStages` conta as fases `completed`.
+- **Lista.** `GET /admin/clients/{clientId}/processes` traz, por processo, os contadores das fases e a fase
+  atual com `count` embutido e lista embutida filtrados (`completed_stages.status`, `current_stage.status`),
+  sem trazer as fases. Segue `created_at DESC, id ASC` (índice `processes (client_id, created_at DESC, id)`) e
+  usa o mesmo keyset de duas consultas de §3.7.1; o cursor é do `kind` `admin-client-processes`, com `{ c, i }`
+  e os mesmos limites de `c` (de 2000 em diante, offset de até 15:59) e a mesma regra de classe 22 (F-53,
+  E-29). O cursor não leva o cliente: o path diz qual é, e uma posição só anda dentro do que o CEO já lê. Cliente
+  sem processo é uma página vazia; cliente inexistente é 404 (a leitura do cliente só roda quando a lista vem
+  vazia: uma linha já prova que ele existe). `status` filtra por `active`, `completed` ou `cancelled`.
+- **Template.** `GET /admin/stage-templates/default` lê `default_stage_template` em ordem de `position`.
+- **Retry de `createProcess`.** Um 503 não diz se o COMMIT aconteceu, e nada na requisição é chave natural:
+  repetir o `POST` depois de um 503 em que a primeira chamada foi gravada **cria um segundo processo** (dois
+  `process.created`). O CEO confere a lista do cliente antes de repetir (E-21). Isso vale também quando o
+  processo foi gravado e só a releitura que devolve o corpo falha. O `PATCH` repetido é seguro.
+  *Pendência do contrato:* a descrição da resposta compartilhada `ServiceUnavailable` manda ler, nas demais
+  escritas, "a descrição da própria operação", e a de `createProcess` ainda não diz isso; entra no próximo bump
+  de contrato.
+- **Erros do banco** (a tabela de §3.7 vale): `CLIENT_ARCHIVED` e `PROCESS_NOT_ACTIVE` viram 422, `NOT_FOUND`
+  vira 404 (o texto diz "Client not found." na criação e "Process not found." na atualização), `INVALID_INPUT`,
+  `23514` e `22001` viram 400, e `40P01` e `40001` viram 503 pelo SQLSTATE. O `cause` guarda só `{ code }`,
+  nunca a mensagem do banco, que pode trazer a linha (o título).
 
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
@@ -962,12 +1031,12 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-13 | Nova senha igual à atual | 422 `PASSWORD_UNCHANGED` |
 | E-14 | `Content-Type` diferente de JSON / corpo > 16 KiB / campo desconhecido | 415 / 413 / 400 |
 | E-15 | POST sem `Origin` ou com origem estranha | 403 `ORIGIN_NOT_ALLOWED` |
-| E-16 | Criar processo ou login para cliente arquivado | 422 `CLIENT_ARCHIVED` |
+| E-16 | Criar processo ou login para cliente arquivado | 422 `CLIENT_ARCHIVED`. No processo (Onda 8), nada é criado nem auditado, com o template ou com fases informadas, e arquivar e criar ao mesmo tempo se serializam pelo cliente (§3.7.2); os processos que o cliente já tem continuam na lista e no detalhe |
 | E-17 | Provisionar e-mail já cadastrado | 409 `EMAIL_ALREADY_REGISTERED` (visível só para CEO) |
 | E-18 | Limite de 10 logins por cliente atingido | 422 `USER_LIMIT_REACHED` |
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
-| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de um `POST` que cria sem chave natural (processo) **pode duplicar**, então o CEO confere a lista antes de repetir |
+| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes`, que cria sem chave natural, **pode duplicar**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 201 com um **segundo** processo e a auditoria tem dois `process.created` (§3.7.2), então o CEO confere a lista do cliente antes de repetir; o `PATCH` de processo repetido é seguro |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
@@ -994,6 +1063,10 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-45 | Retry de `POST /admin/clients` depois de um 503 | Primeira chamada gravada: 409 `CONFLICT` e um cliente só. Primeira não gravada: 201 |
 | E-46 | Nome que difere só por uma letra de outro alfabeto parecida com a latina (o "А" cirílico) | Aceito: é o residual do T-33, tratado no frontend (id do cliente ao provisionar login, Onda 7) |
 | E-47 | Dois `PATCH` que se cruzam ao mesmo tempo, o cliente A para o nome do B e o B para o nome do A | O Postgres detecta o deadlock dos dois índices e derruba uma das transações: 503 `SERVICE_UNAVAILABLE` com `Retry-After`, sem nada gravado nem auditado. A outra termina em 409 `CONFLICT` (o nome do outro cliente não saiu). Repetir a que caiu dá 409 ou 200, conforme o estado de então |
+| E-60 | `PATCH /admin/processes/{processId}` num processo `completed` ou `cancelled`: renomear, cancelar ou renomear para o mesmo título | 422 `PROCESS_NOT_ACTIVE` em todos os casos (I3, I4); o processo e as fases não mudam e nada é auditado. Cancelar um processo já cancelado **não** é idempotente |
+| E-61 | `PATCH` de processo ativo que renomeia para o mesmo título (depois da normalização), repetido ou não; ou que renomeia e cancela juntos | O mesmo título: 200 com o processo como está, sem auditoria, sem nova versão (o retry é seguro). Título novo e `status: "cancelled"` na mesma chamada: 200, uma versão a mais, dois eventos (`process.updated` e `process.cancelled`, nessa ordem). Cancelar não muda as fases: a que estava em andamento continua |
+| E-62 | Criar processo com o template, e o template tem buracos nas posições ou está vazio | Com buracos (1, 3, 5, 9), o processo tem as fases 1 a n, na ordem do template. Vazio: 500 (defeito de migration, `TEMPLATE_EMPTY` no banco), e nunca um processo sem fases |
+| E-63 | Fase com descrição vazia ou só de espaços, ou com chave que o contrato não tem (`position`, `status`, `id`) | Pela API, a descrição vazia ou em branco é "sem descrição" (`description: null` na resposta) e a chave desconhecida é 400 `VALIDATION_ERROR`. Direto na função do banco, a descrição vazia é `INVALID_INPUT` e a chave desconhecida também |
 
 ---
 
