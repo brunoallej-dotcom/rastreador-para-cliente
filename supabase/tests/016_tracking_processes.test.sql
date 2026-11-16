@@ -526,11 +526,11 @@ SELECT throws_ok(
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000000a', 'Titulo', '[{"name":"A","description":""}]'::jsonb) $$,
-  'P0001', 'INVALID_INPUT', 'E-20: o banco é mais estrito que a API e recusa a descrição vazia (a API a transforma em "sem descrição")'
+  'P0001', 'INVALID_INPUT', 'E-63, E-20: o banco é mais estrito que a API e recusa a descrição vazia (a API a transforma em "sem descrição")'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000000a', 'Titulo', '[{"name":"A","extra":1}]'::jsonb) $$,
-  'P0001', 'INVALID_INPUT', 'SEC-06: uma chave desconhecida na fase é recusada (como o .strict() do Zod)'
+  'P0001', 'INVALID_INPUT', 'E-63, SEC-06: uma chave desconhecida na fase é recusada (como o .strict() do Zod)'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000000a', 'Titulo', '[{"name":"A","position":3}]'::jsonb) $$,
@@ -721,7 +721,7 @@ SELECT results_eq(
        (SELECT p.id FROM proc p WHERE p.label = 'um'),
        chr(160) || 'Processo Um Renomeado' || chr(12288)) $$,
   $$ VALUES ('Processo Um Renomeado', 2, true) $$,
-  'AC-19: renomear para o mesmo título (depois da normalização) não muda nada nem soma versão'
+  'E-61, AC-19: renomear para o mesmo título (depois da normalização) não muda nada nem soma versão'
 );
 SELECT results_eq(
   $$ SELECT title, version FROM public.update_process(
@@ -762,7 +762,7 @@ SELECT is_empty(
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_process((SELECT p.id FROM proc p WHERE p.label = 'dois'), NULL, true) $$,
-  'P0001', 'PROCESS_NOT_ACTIVE', 'AC-19, I4: cancelar um processo já cancelado é PROCESS_NOT_ACTIVE (não é idempotente)'
+  'P0001', 'PROCESS_NOT_ACTIVE', 'E-60, AC-19, I4: cancelar um processo já cancelado é PROCESS_NOT_ACTIVE (não é idempotente)'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_process((SELECT p.id FROM proc p WHERE p.label = 'dois'), 'Renomeado depois de cancelado') $$,
@@ -770,7 +770,7 @@ SELECT throws_ok(
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_process((SELECT p.id FROM proc p WHERE p.label = 'dois'), 'Processo Dois') $$,
-  'P0001', 'PROCESS_NOT_ACTIVE', 'I4: até um renome para o mesmo título é PROCESS_NOT_ACTIVE num processo cancelado'
+  'P0001', 'PROCESS_NOT_ACTIVE', 'E-60, I4: até um renome para o mesmo título é PROCESS_NOT_ACTIVE num processo cancelado'
 );
 
 -- renomear e cancelar na mesma chamada
@@ -778,7 +778,7 @@ SELECT results_eq(
   $$ SELECT title, status::text, version
        FROM public.update_process((SELECT p.id FROM proc p WHERE p.label = 'uma'), 'Processo de 1 fase encerrado', true) $$,
   $$ VALUES ('Processo de 1 fase encerrado', 'cancelled', 2) $$,
-  'AC-19: renomear e cancelar na mesma chamada soma 1 à versão, uma vez só'
+  'E-61, AC-19: renomear e cancelar na mesma chamada soma 1 à versão, uma vez só'
 );
 
 -- I3, I4: processos que já terminaram (fixtures)
@@ -1009,7 +1009,7 @@ SELECT results_eq(
       ORDER BY s.position $$,
   $$ VALUES (1, 'Contrato assinado', 'in_progress'), (2, 'Planejamento', 'pending'),
             (3, 'Revisão', 'pending'), (4, 'Entrega final', 'pending') $$,
-  'I1: um template com buracos nas posições (1, 3, 5, 9) gera um processo de posições 1 a 4, na ordem do template'
+  'E-62, I1: um template com buracos nas posições (1, 3, 5, 9) gera um processo de posições 1 a 4, na ordem do template'
 );
 SELECT tests.clear_authentication();
 
@@ -1018,7 +1018,7 @@ DELETE FROM public.default_stage_template;
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT throws_ok(
   $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000000a', 'Processo do template vazio') $$,
-  'P0001', 'TEMPLATE_EMPTY', 'um template vazio é TEMPLATE_EMPTY, nunca um processo sem fases (I1)'
+  'P0001', 'TEMPLATE_EMPTY', 'E-62: um template vazio é TEMPLATE_EMPTY, nunca um processo sem fases (I1)'
 );
 SELECT lives_ok(
   $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000000a', 'Processo com fases e template vazio', '[{"name":"A"}]'::jsonb) $$,
