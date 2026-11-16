@@ -44,7 +44,7 @@ flowchart LR
 | # | Elemento | STRIDE | Ameaça | Mitigação | Controles |
 |---|----------|--------|--------|-----------|-----------|
 | T-01 | Login | S | Força bruta e credential stuffing | Rate limit por IP e por conta, senha forte, HIBP, MFA de CEO | SEC-09, SEC-10, SEC-11 |
-| T-02 | Login | I | Enumeração de e-mails | Resposta 401 idêntica, sem cadastro público | SEC-12, SEC-20 |
+| T-02 | Login | I | Enumeração de e-mails | Resposta 401 idêntica, sem cadastro público. Com o provider de e-mail ligado, `/otp` e `/recover` do GoTrue seguem acessíveis a quem tiver a publishable key, que só existe no servidor (o browser nunca fala com o Supabase, ADR 0002); `/otp` e `/magiclink` não criam usuário (teste de integração); **risco residual aceito**: `/otp` diferencia e-mail conhecido de desconhecido | SEC-12, SEC-20 |
 | T-03 | Login | D | Esgotar o limite por IP do Supabase Auth (todos chegam pelo IP da Vercel) e bloquear todo mundo | Nosso limitador na frente e mais restritivo que o do Supabase | SEC-09 |
 | T-04 | Login | D | Bloqueio direcionado: errar a senha de um CEO de propósito | Janela curta (15 min), sem bloqueio permanente, alerta; **risco residual aceito** | SEC-09 |
 | T-05 | Sessão | S | Roubo de cookie via XSS | `HttpOnly`, CSP, API só JSON; frontend futuro com CSP de nonce | SEC-07, SEC-14 |

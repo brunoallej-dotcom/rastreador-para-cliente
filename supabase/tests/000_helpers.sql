@@ -27,6 +27,10 @@ RETURNS uuid
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  -- O trigger de perfil é um CONSTRAINT TRIGGER adiado até o COMMIT (migration
+  -- profile_trigger_commit_time_check); como cada teste roda em BEGIN … ROLLBACK, o INSERT
+  -- precisa executá-lo na hora para o perfil existir e os dados inválidos falharem aqui.
+  SET CONSTRAINTS ALL IMMEDIATE;
   INSERT INTO auth.users (
     id, instance_id, aud, role, email, encrypted_password, email_confirmed_at,
     raw_app_meta_data, raw_user_meta_data, created_at, updated_at
