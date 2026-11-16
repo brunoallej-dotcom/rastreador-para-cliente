@@ -382,6 +382,38 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   gravada no Auth **antes** de chamar `require_password_change`. Só assim a linha de base de
   `mark_password_changed()` prova que o usuário trocou a senha (criar sem senha e definir depois
   deixaria a "troca" comprovada sem ação do usuário).
+- **Logins de cliente (Onda 7, `/admin/clients/{clientId}/users/**`):** só CEO. O cliente vem do
+  **path** (nunca do corpo, que é `.strict()`), e um `userId` que não é login desse cliente (outro
+  cliente, um CEO, id inexistente) é 404 igual ao de um cliente inexistente (E-19); o caso de uso prova
+  isso pela lista do cliente, porque as funções do banco só recebem o id do usuário. As escritas de conta
+  vão pelas funções de §3.7 **como o CEO** (client da requisição); a secret key só cria, apaga, troca
+  senha e bane pela Auth Admin API, na infraestrutura de `identity`, e a infraestrutura guarda das falhas
+  do Auth só o tipo, o status e o código (a mensagem pode ecoar o e-mail).
+  - **Provisionar:** confere cliente existente, não arquivado (E-16) e com vaga (E-18) para responder 422
+    limpo; cria a conta com a senha temporária na mesma chamada; chama `record_account_provisioned` e relê
+    a lista (o 201 mostra o login como a lista o mostra). O gatilho do perfil é quem decide a corrida: o
+    Auth devolve só um 500 sem nome quando ele recusa cliente arquivado ou cheio, então, diante dessa
+    falha, o caso de uso olha de novo e responde 422 `CLIENT_ARCHIVED` ou `USER_LIMIT_REACHED` em vez de
+    503 (E-52). Falha **depois** de `createUser` (o registro ou a releitura): a conta é apagada
+    (compensação, E-23) e a resposta é 503; se a exclusão também falha (duas tentativas), o log traz o
+    evento `identity.client_user.provision_orphaned` com o id da conta que sobrou, e a recuperação é achar o
+    login na lista e resetar a senha (E-53). Uma criação cuja **resposta** se perdeu (timeout) pode ter
+    criado a conta: repetir dá 409 `EMAIL_ALREADY_REGISTERED`, o login aparece na lista e um reset o
+    entrega (E-50).
+  - **Desativar e reativar:** desativar grava o banco primeiro (apaga as sessões e `current_principal()`
+    deixa de devolver o usuário: é o bloqueio que vale) e bane no Auth depois (`ban_duration` de um
+    século), como segunda trava; reativar tira o ban **antes** de reativar no banco, nunca o contrário (o
+    banco não pode dizer "ativo" enquanto o Auth ainda recusa o login). Tudo é idempotente, então um 503
+    se resolve repetindo o mesmo `PATCH`, e repetir `{ "disabled": true }` tenta o ban de novo (E-24). O
+    renomear vai antes de tudo, por não ser sobre acesso.
+  - **Resetar a senha:** grava a senha nova no Auth **antes** de `require_password_change` (§3.4), que
+    renova a linha de base das 72 h (F-41, E-35), exige a troca e apaga as sessões. O Auth também derruba
+    as sessões do usuário quando a senha é trocada (observado no Auth local). Se o passo do banco falha
+    duas vezes depois do Auth, a resposta é 503 com `identity.client_user.reset_incomplete` em `error`:
+    a senha antiga não vale mais, as sessões já caíram, e faltam `CHANGE_PASSWORD`, a linha de base nova e
+    a auditoria; a senha temporária **nunca** foi mostrada, e repetir o reset conclui (E-51).
+  - **Arquivar um cliente não toca nos logins** (F-58, Q-08): eles continuam entrando, e o CEO ainda os
+    lista, renomeia, desativa, reativa e reseta (E-54); só um login NOVO é recusado.
 
 ### 3.5 Autorização
 
@@ -743,6 +775,10 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   nome estável, para alerta (o app nunca cria esse estado, F-60). Ainda: `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
   `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
   `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).
+  Dos logins de cliente (Onda 7; `actorId`, `clientId` e `targetUserId`, nunca e-mail nem senha):
+  `identity.client_user.provisioned`, `.updated`, `.password_reset` (info) e, em `error`, para alerta,
+  `.provision_rolled_back`, `.provision_orphaned`, `.reset_incomplete` e `.ban_failed` (E-23, E-53, E-51,
+  E-24).
   `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
   diferentes dos valores gravados no banco: o log não guarda IP nem e-mail e não se liga às linhas
   de `rate_limit_counters`.
@@ -1056,6 +1092,11 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
+| E-50 | Provisionar: o Auth criou a conta mas a resposta se perdeu (timeout depois do commit) | 503. A conta pode existir (sem `account.provisioned` na auditoria): repetir dá 409 `EMAIL_ALREADY_REGISTERED`, o login aparece na lista e um reset da senha o entrega |
+| E-51 | Resetar: o Auth já guardou a senha nova e o passo do banco (`require_password_change`) falha, mesmo com a segunda tentativa | 503 e `identity.client_user.reset_incomplete` em `error`. A senha antiga e as sessões já não valem; faltam `CHANGE_PASSWORD`, a linha de base nova e a auditoria. A senha nova não é mostrada; repetir o reset conclui. Se a segunda tentativa funciona, o reset conclui na mesma chamada |
+| E-52 | Provisionar com várias chamadas disputando as últimas vagas do cliente, ou com o cliente arquivado entre a checagem e a criação | O gatilho do perfil decide (trava o cliente) e o caso de uso explica: as que cabem recebem 201 e as outras 422 `USER_LIMIT_REACHED` (ou 422 `CLIENT_ARCHIVED`), nunca 503 |
+| E-53 | Provisionar: o registro falha e a compensação (apagar a conta) também | 503, `identity.client_user.provision_orphaned` em `error` com o id da conta. O login está na lista, nascido com uma senha que ninguém recebeu; a recuperação é resetar a senha (ou desativar) |
+| E-54 | Cliente arquivado com logins que já existem | Eles continuam entrando; o CEO ainda lista, renomeia, desativa, reativa e reseta; só provisionar login novo é 422 `CLIENT_ARCHIVED` (E-16, F-58) |
 | E-25 | CEO perde o dispositivo do TOTP | Fora da API: runbook com script operacional (Onda 11) |
 | E-26 | Enroll com fator não verificado pendente | Remove o fator não verificado antigo e cria um novo |
 | E-27 | Enroll com fator já verificado | 409 `MFA_ALREADY_ENROLLED` |
