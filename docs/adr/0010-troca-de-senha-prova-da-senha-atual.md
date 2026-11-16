@@ -56,6 +56,16 @@ O Auth não tem um endpoint "verificar senha". O único jeito de testar uma senh
    usando a nova senha como senha atual" e o log registra `auth.password_change.incomplete`
    (nível `error`). A sessão da requisição continua viva, e repetir a troca com a senha nova como
    atual conclui o fluxo (teste de API).
+8. **Estado incerto depois de uma falha sem resposta.** O mesmo vale quando a resposta se perde:
+   (a) um `updateUser` que dá timeout, falha de transporte ou 5xx pode ter gravado a senha antes de a
+   resposta se perder; responde 503 (`PasswordChangeUncertainError`) com a orientação dos dois
+   estados, "repita; se a senha atual for recusada, repita usando a nova senha como atual", e o log
+   registra `auth.password_change.uncertain` (nível `error`). Uma resposta definitiva do Auth, mesmo
+   inesperada, não é incerteza e segue como é. (b) Se a primeira chamada de `mark_password_changed()`
+   gravou e só a resposta se perdeu, a segunda recebe `PASSWORD_UNCHANGED`; **no retry, e só nele**,
+   isso é sucesso: o `updateUser` já gravou a senha nova, então a linha de base só pode igualar o hash
+   atual se uma chamada anterior gravou (ela renova a linha de base, limpa a pendência e revoga as
+   outras sessões). Na primeira tentativa a mesma resposta continua sendo a recusa de sempre (E-13).
 
 ## Consequências
 
@@ -75,3 +85,12 @@ O Auth não tem um endpoint "verificar senha". O único jeito de testar uma senh
   - Adivinhação da senha atual: 5 por 15 minutos por usuário na troca, somados aos 10 por 15 minutos
     por conta do login (contadores separados).
   - A troca que falha no meio (item 7) deixa a senha nova e a pendência de pé até o usuário repetir.
+  - O estado incerto do `updateUser` (item 8) depende de o usuário seguir a orientação: ele pode
+    ter trocado a senha sem saber. Os 5 pedidos por 15 minutos bastam para repetir e concluir.
+  - Uma sessão de prova órfã: se o sign-in de prova deu certo no Auth mas a resposta se perdeu
+    (timeout), a sessão existe e ninguém tem o token dela. Também fica órfã se o `signOut` do item 1
+    falha. Ela some quando o `updateUser` e o `mark_password_changed()` apagam as outras sessões do
+    usuário (se a troca conclui), ou pelo `timebox` de 12 h e pelos 4 h de inatividade (o banco já a
+    nega em `session_is_alive()`); só o `pg_cron` da Onda 11 (F-40, candidato a) a removeria antes.
+  - Duas trocas concorrentes da mesma conta, a sessão clonada que sobrevive à troca e o ruído do
+    sign-in de prova no log do Auth: aceitos, ver F-45, F-46 e F-47 no threat model.
