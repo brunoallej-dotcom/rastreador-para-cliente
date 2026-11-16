@@ -322,4 +322,50 @@ describe('verifyTotp without a factor id (the factor of the session, E-31)', () 
     await expect(verifyTotp(d, enrolling, code)).rejects.toBeInstanceOf(ServiceUnavailableError);
     expect(mfa.calls).toEqual(['list']);
   });
+
+  it('F-60, F-61: the number of TOTP factors the account has travels with the outcome and with every refusal, so the log can see a planted factor', async () => {
+    const one = deps({ factors: [{ id: FACTOR, verified: true }] });
+    const ok = await verifyTotp(one.deps, returning, code);
+    expect(ok.ok && ok.value.candidateCount).toBe(1);
+
+    // a wrong code on an account that has two factors: the refusal says "two"
+    const two = deps({
+      factors: [
+        { id: FACTOR, verified: true },
+        { id: OTHER, verified: false },
+      ],
+    });
+    const wrong = await verifyTotp(two.deps, returning, { code: '000000' });
+    expect(reasonOf(wrong)).toBe('invalid_code');
+    if (!wrong.ok) {
+      const error = wrong.error as InvalidMfaCodeError;
+      expect(error.candidateCount).toBe(2);
+      expect(error.factorId).toBe(FACTOR);
+    }
+
+    // the refusals of the resolution itself
+    const none = await verifyTotp(deps({ factors: [] }).deps, enrolling, code);
+    const ambiguous = await verifyTotp(
+      deps({
+        factors: [
+          { id: FACTOR, verified: false },
+          { id: OTHER, verified: false },
+        ],
+      }).deps,
+      enrolling,
+      code,
+    );
+    expect(!none.ok && (none.error as InvalidMfaCodeError).candidateCount).toBe(0);
+    expect(!ambiguous.ok && (ambiguous.error as InvalidMfaCodeError).candidateCount).toBe(2);
+  });
+
+  it('a request that names the factor lists nothing, so it has no candidate count', async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+
+    const ok = await verifyTotp(d, returning, { factorId: FACTOR, ...code });
+    const refused = await verifyTotp(d, returning, { factorId: OTHER, ...code });
+
+    expect(ok.ok && ok.value.candidateCount).toBeUndefined();
+    expect(!refused.ok && (refused.error as InvalidMfaCodeError).candidateCount).toBeUndefined();
+  });
 });

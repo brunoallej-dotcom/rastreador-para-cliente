@@ -19,6 +19,11 @@ export type MfaRefusal = 'invalid_code' | 'code_reused' | 'factor_not_found' | '
 export type InvalidMfaCodeOptions = ErrorOptions & {
   /** The factor the code was meant for, when there is one. For the log only. */
   readonly factorId?: string;
+  /**
+   * How many TOTP factors the account has, when the request named none and they were listed. The
+   * app keeps exactly one, so more than one is anomalous (F-60, F-61). For the log only.
+   */
+  readonly candidateCount?: number;
 };
 
 /**
@@ -32,15 +37,18 @@ export class InvalidMfaCodeError extends DomainError {
   readonly reason: MfaRefusal;
   /** The factor the code was meant for (never part of the response), if one was resolved. */
   readonly factorId: string | undefined;
+  /** How many TOTP factors the account has, when they were listed (never part of the response). */
+  readonly candidateCount: number | undefined;
 
   constructor(reason: MfaRefusal = 'invalid_code', options: InvalidMfaCodeOptions = {}) {
-    const { factorId, ...errorOptions } = options;
+    const { factorId, candidateCount, ...errorOptions } = options;
     super('the TOTP code was refused', {
       ...errorOptions,
       detail: 'The code is invalid or has expired.',
     });
     this.reason = reason;
     this.factorId = factorId;
+    this.candidateCount = candidateCount;
   }
 }
 

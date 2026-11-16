@@ -34,6 +34,8 @@ export type VerifyTotpOutcome = {
   readonly session: SessionView;
   /** The factor the code was checked against: the one in the request or the one resolved. */
   readonly factorId: string;
+  /** How many TOTP factors the account has; `undefined` when the request named the factor. */
+  readonly candidateCount: number | undefined;
   /** This verification activated the FIRST factor of the CEO (it was unverified until now). */
   readonly activated: boolean;
   /**
@@ -79,10 +81,10 @@ export async function verifyTotp(
 
   const factor = await resolveFactor(deps.mfa, input.factorId);
   if (!factor.ok) return factor;
-  const factorId = factor.value;
+  const { factorId, candidateCount } = factor.value;
 
   const verified = await deps.mfa.verifyTotp({ factorId, code: input.code });
-  if (!verified.ok) return verified;
+  if (!verified.ok) return err(withCandidateCount(verified.error, candidateCount));
 
   const elevated = await deps.principals.current();
   if (elevated === null) {
@@ -103,6 +105,7 @@ export async function verifyTotp(
   return ok({
     session: await loadSessionView(deps.clients, elevated),
     factorId,
+    candidateCount,
     activated,
     otherSessionsRevoked,
   });
@@ -122,20 +125,42 @@ export async function verifyTotp(
  * - more than one in the same state → `factor_ambiguous`. The code is never tried on several
  *   factors: that would multiply the guesses a code gets and burn codes of factors nobody chose.
  *
- * Both refusals are the same 422 as a wrong code; only the log tells them apart.
+ * Both refusals are the same 422 as a wrong code; only the log tells them apart. When the factors
+ * were listed, every outcome carries how many the account has (`candidateCount`): the app keeps one,
+ * so a failure on an account with two is how a planted factor shows up in the log (F-60, F-61).
  */
 async function resolveFactor(
   mfa: MfaGateway,
   requested: string | undefined,
-): Promise<Result<string, InvalidMfaCodeError>> {
-  if (requested !== undefined) return ok(requested);
+): Promise<Result<ResolvedFactor, InvalidMfaCodeError>> {
+  if (requested !== undefined) return ok({ factorId: requested, candidateCount: undefined });
 
   const factors = await mfa.listTotpFactors();
+  const candidateCount = factors.length;
   const verified = factors.filter((factor) => factor.verified);
   const [only, ...others] = verified.length > 0 ? verified : factors;
-  if (only === undefined) return err(new InvalidMfaCodeError('factor_not_found'));
-  if (others.length > 0) return err(new InvalidMfaCodeError('factor_ambiguous'));
-  return ok(only.id);
+  if (only === undefined) {
+    return err(new InvalidMfaCodeError('factor_not_found', { candidateCount }));
+  }
+  if (others.length > 0) {
+    return err(new InvalidMfaCodeError('factor_ambiguous', { candidateCount }));
+  }
+  return ok({ factorId: only.id, candidateCount });
+}
+
+type ResolvedFactor = { readonly factorId: string; readonly candidateCount: number | undefined };
+
+/** The refusal of the gateway, with the number of factors the resolution saw (if it listed them). */
+function withCandidateCount(
+  error: InvalidMfaCodeError,
+  candidateCount: number | undefined,
+): InvalidMfaCodeError {
+  if (candidateCount === undefined) return error;
+  return new InvalidMfaCodeError(error.reason, {
+    cause: error,
+    ...(error.factorId === undefined ? {} : { factorId: error.factorId }),
+    candidateCount,
+  });
 }
 
 /** Runs a best-effort step: `true` when it worked, `false` when it threw (the caller logs it). */

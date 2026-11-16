@@ -82,17 +82,25 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
 
       if (!result.ok) {
         if (result.error instanceof InvalidMfaCodeError) {
+          const details = {
+            userId: principal.userId,
+            factorId: result.error.factorId,
+            factorSource: factorSourceOf(body),
+            candidateCount: result.error.candidateCount,
+            ipHash: clientIpFingerprint(request),
+          };
           logger.warn(
-            {
-              event: 'auth.mfa.failed',
-              userId: principal.userId,
-              factorId: result.error.factorId,
-              factorSource: factorSourceOf(body),
-              reason: result.error.reason,
-              ipHash: clientIpFingerprint(request),
-            },
+            { event: 'auth.mfa.failed', ...details, reason: result.error.reason },
             'auth.mfa.failed',
           );
+          // The app keeps ONE TOTP factor per CEO: a second one was planted straight at the Auth
+          // server (F-60). A stable event name, at error level, so an alert can be built on it.
+          if (result.error.reason === 'factor_ambiguous') {
+            logger.error(
+              { event: 'auth.mfa.factor_ambiguous', ...details },
+              'auth.mfa.factor_ambiguous',
+            );
+          }
         }
         return result.error;
       }
@@ -107,6 +115,7 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
           userId: principal.userId,
           factorId: result.value.factorId,
           factorSource: factorSourceOf(body),
+          candidateCount: result.value.candidateCount,
           sessionId: accessToken === undefined ? undefined : sessionIdOfToken(accessToken),
           activated,
           ipHash: clientIpFingerprint(request),

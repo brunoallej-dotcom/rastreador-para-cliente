@@ -46,14 +46,19 @@ const SQL_BUSINESS_RULE = 'P0001';
 const SQL_NOT_FOUND = 'NOT_FOUND';
 const SQL_INSUFFICIENT_PRIVILEGE = '42501';
 
-/** What the Auth server answers for a factor: only the fields the adapter reads. */
-const factorListSchema = z.array(
-  z.object({
-    id: z.guid(),
-    factor_type: z.string(),
-    status: z.enum(['verified', 'unverified']),
-  }),
-);
+/**
+ * What the Auth server answers for the factors of the user. Only the type is read from every entry:
+ * the TOTP ones are filtered FIRST and only then parsed strictly (`totpFactorSchema`), so a factor
+ * type that does not exist yet (`recovery_code` in a newer auth-js, say) can never turn the list
+ * of TOTP factors into a 500 on the login path (F-62).
+ */
+const factorEnvelopeSchema = z.array(z.looseObject({ factor_type: z.string() }));
+
+/** A TOTP factor, with the only fields the adapter reads. */
+const totpFactorSchema = z.object({
+  id: z.guid(),
+  status: z.enum(['verified', 'unverified']),
+});
 
 /**
  * What a new TOTP factor looks like. The shapes are the ones of the contract's `TotpEnrollment`:
@@ -135,11 +140,13 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       );
       if (error) throw failure('list the factors', error);
 
-      const factors = factorListSchema.safeParse(data.all);
-      if (!factors.success) throw new Error('list the factors: an answer that is not understood');
-      return factors.data
-        .filter((factor) => factor.factor_type === 'totp')
-        .map((factor) => ({ id: factor.id, verified: factor.status === 'verified' }));
+      const envelope = factorEnvelopeSchema.safeParse(data.all);
+      if (!envelope.success) throw new Error('list the factors: an answer that is not understood');
+      const totp = z
+        .array(totpFactorSchema)
+        .safeParse(envelope.data.filter((factor) => factor.factor_type === 'totp'));
+      if (!totp.success) throw new Error('list the factors: an answer that is not understood');
+      return totp.data.map((factor) => ({ id: factor.id, verified: factor.status === 'verified' }));
     },
 
     async removeUnverifiedTotp(factorId) {

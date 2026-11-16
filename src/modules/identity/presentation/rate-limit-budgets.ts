@@ -36,3 +36,35 @@ export const VERIFY_DAILY_BUDGET = {
   limit: 20,
   windowSeconds: SECONDS_PER_DAY,
 } as const satisfies UserBudget;
+
+/**
+ * Every programmatic budget of the identity module, keyed by the NAME of its constant, with the
+ * operations (`operationId` of the contract) that spend it. It is the one place that says "this
+ * budget exists and these handlers spend it", and three tests hold it against the rest:
+ * the contract (`tests/contract/contract-invariants.test.ts`: each entry is an `x-rate-limit`
+ * entry with `programmatic: true`, on exactly those operations, and none is missing), the handlers
+ * (`programmatic-budgets.test.ts`: each one really spends it, once) and the source (a scan: no
+ * `consumeGlobalBudget`/`consumeUserBudget` call spends anything that is not here).
+ *
+ * `SESSION_UPSTREAM_RULE` (the per-IP budget of session cookies that make the server call Auth) is
+ * not in it: it belongs to `src/shared/http` and is spent by the principal resolver, not a handler.
+ */
+export const PROGRAMMATIC_BUDGETS = {
+  LOGIN_GLOBAL_BUDGET: {
+    scope: 'global',
+    budget: LOGIN_GLOBAL_BUDGET,
+    spentBy: ['login', 'changePassword'],
+  },
+  VERIFY_DAILY_BUDGET: {
+    scope: 'user',
+    budget: VERIFY_DAILY_BUDGET,
+    spentBy: ['verifyTotp'],
+  },
+} as const satisfies Record<
+  string,
+  {
+    readonly scope: 'global' | 'user';
+    readonly budget: GlobalBudget | UserBudget;
+    readonly spentBy: readonly string[];
+  }
+>;
