@@ -5,8 +5,15 @@
 -- CEO. `approve_current_stage` chega na Onda 9.
 --
 -- Textos: título do processo e nome e descrição da fase passam por `private.visible_text` (Onda 6),
--- o mesmo validador do `visibleText` do Zod (E-30). Os CHECKs das tabelas continuam mais fracos de
--- propósito, como última barreira.
+-- o mesmo validador do `visibleText` do Zod (E-30). Os CHECKs de `processes` e `process_stages` continuam
+-- mais fracos de propósito, como última barreira; como a função é mais estrita do que eles, uma violação
+-- de CHECK dentro dessas funções só pode ser defeito, e o app a trata como 500 (F-86).
+--
+-- O template é a única entrada de texto que NÃO passa pela função: as fases dele são copiadas como estão.
+-- Por isso os CHECKs de `default_stage_template` agora exigem o mesmo que a função (F-86): o nome e a
+-- descrição precisam ser texto visível já normalizado (NFC, pontas aparadas), ou seja, `visible_text` os
+-- devolve iguais. Um template inválido não entra (a migration que o altera falha), em vez de a primeira
+-- criação de processo falhar no CHECK de `process_stages`. As linhas atuais (o seed de Q-01) passam.
 --
 -- Ambas as funções checam `private.is_ceo()` antes de qualquer trabalho com a entrada, devolvem a
 -- linha de `public.processes` (o app lê o detalhe depois, com as fases, as aprovações e o cliente) e
@@ -221,3 +228,15 @@ END;
 $$;
 REVOKE EXECUTE ON FUNCTION public.update_process(uuid, text, boolean) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.update_process(uuid, text, boolean) TO authenticated;
+
+-- Template: o mesmo texto que a API aceita (F-86) ------------------------------------------------------------
+-- `IS NOT DISTINCT FROM` e não `=`: `visible_text` devolve NULL para o que recusa, e um CHECK cujo resultado
+-- é NULL passa, então `name = visible_text(name)` deixaria entrar justamente o nome inválido. Os CHECKs de
+-- tamanho e de posição da Onda 2 ficam como estão. Quem executa o CHECK é quem escreve na tabela (só a
+-- migration: nenhum papel da API tem INSERT ou UPDATE nela), então `visible_text` não precisa de EXECUTE
+-- para mais ninguém.
+ALTER TABLE public.default_stage_template
+  ADD CONSTRAINT default_stage_template_name_visible_ck
+    CHECK (private.visible_text(name, 120) IS NOT DISTINCT FROM name),
+  ADD CONSTRAINT default_stage_template_description_visible_ck
+    CHECK (description IS NULL OR private.visible_text(description, 2000) IS NOT DISTINCT FROM description);

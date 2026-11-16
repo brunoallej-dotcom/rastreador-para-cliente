@@ -10,7 +10,7 @@
 -- gravada na mesma transação (ator, papel, recurso, cliente, processo, request_id, sem título nem nome) e o
 -- isolamento por tenant das linhas que as funções criam (AC-09).
 BEGIN;
-SELECT plan(326);
+SELECT plan(389);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A e B são clientes ativos; X é arquivado. a1 é login de A e b1, de B. c1 é CEO com fator verificado; c2,
@@ -167,6 +167,45 @@ SELECT is(
   (SELECT p.prorettype::regtype::text FROM pg_proc p WHERE p.oid = 'public.create_process(uuid, text, jsonb)'::regprocedure),
   'processes',
   'create_process devolve a linha de processes (sem título em metadados nem texto de erro)'
+);
+
+-- Os travamentos, no catálogo (a concorrência em si não se prova num teste de uma sessão só): o cliente é
+-- travado com FOR NO KEY UPDATE em create_process (criar e arquivar se serializam, E-16) e o processo, em
+-- update_process (as escritas do mesmo processo se serializam, a aprovação da Onda 9 inclusive). Nenhuma das
+-- duas usa FOR UPDATE, que bloquearia quem só referencia a linha por chave estrangeira.
+SELECT ok(
+  (SELECT p.prosrc ~ 'FROM public\.clients c\s+WHERE c\.id = p_client_id\s+FOR NO KEY UPDATE'
+     FROM pg_proc p WHERE p.oid = 'public.create_process(uuid, text, jsonb)'::regprocedure),
+  'E-16: create_process trava a linha de public.clients com FOR NO KEY UPDATE'
+);
+SELECT ok(
+  (SELECT p.prosrc ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+FOR NO KEY UPDATE'
+     FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure),
+  'AC-19: update_process trava a linha de public.processes com FOR NO KEY UPDATE'
+);
+SELECT ok(
+  (SELECT position('FOR NO KEY UPDATE' IN p.prosrc) < position('INSERT INTO public.processes' IN p.prosrc)
+          AND position('FOR NO KEY UPDATE' IN p.prosrc) > 0
+     FROM pg_proc p WHERE p.oid = 'public.create_process(uuid, text, jsonb)'::regprocedure),
+  'E-16: create_process trava o cliente ANTES de inserir o processo'
+);
+SELECT ok(
+  (SELECT position('FOR NO KEY UPDATE' IN p.prosrc) < position('UPDATE public.processes p' IN p.prosrc)
+          AND position('FOR NO KEY UPDATE' IN p.prosrc) > 0
+     FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure),
+  'AC-19: update_process trava o processo ANTES de mudá-lo'
+);
+SELECT is_empty(
+  $$ SELECT p.proname FROM pg_proc p
+      WHERE p.oid IN ('public.create_process(uuid, text, jsonb)'::regprocedure,
+                      'public.update_process(uuid, text, boolean)'::regprocedure)
+        AND p.prosrc ~ 'FOR\s+UPDATE\M' $$,
+  'create_process e update_process não usam FOR UPDATE (só FOR NO KEY UPDATE)'
+);
+SELECT ok(
+  (SELECT p.prosrc ~ 'IF private\.is_ceo\(\) IS NOT TRUE THEN' FROM pg_proc p WHERE p.oid = 'public.create_process(uuid, text, jsonb)'::regprocedure)
+  AND (SELECT p.prosrc ~ 'IF private\.is_ceo\(\) IS NOT TRUE THEN' FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure),
+  'F-55: as duas funções abrem com IF private.is_ceo() IS NOT TRUE'
 );
 
 -- AC-10: anon ------------------------------------------------------------------------------------------
@@ -993,6 +1032,49 @@ SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c2', 'aal2');
 SELECT is_empty($$ SELECT id FROM public.processes $$, 'F-24: o CEO aal2 sem fator verificado continua sem ver processo nenhum');
 SELECT tests.clear_authentication();
+
+-- F-86: o template aceita só o texto que a API aceita, já normalizado (como postgres: nenhum papel da API escreve nele) -----------------
+SELECT ok(
+  (SELECT bool_and(c.convalidated) AND count(*) = 2
+     FROM pg_constraint c
+    WHERE c.conrelid = 'public.default_stage_template'::regclass
+      AND c.conname IN ('default_stage_template_name_visible_ck', 'default_stage_template_description_visible_ck')),
+  'F-86: os dois CHECKs de texto do template existem e foram validados contra as linhas do seed'
+);
+SELECT is_empty(
+  $$ SELECT t.position FROM public.default_stage_template t
+      WHERE private.visible_text(t.name, 120) IS DISTINCT FROM t.name
+         OR (t.description IS NOT NULL AND private.visible_text(t.description, 2000) IS DISTINCT FROM t.description) $$,
+  'F-86: o seed do template (Q-01) passa pelas mesmas regras do Zod e já está normalizado'
+);
+SELECT throws_ok(
+  format('INSERT INTO public.default_stage_template (position, name) VALUES (20, %L)', b.value),
+  '23514', NULL,
+  'F-86: o template recusa o nome: ' || b.label
+) FROM bad_texts b WHERE b.label <> 'nulo' ORDER BY b.label;
+SELECT throws_ok(
+  format('INSERT INTO public.default_stage_template (position, name, description) VALUES (20, %L, %L)', 'Boa', b.value),
+  '23514', NULL,
+  'F-86: o template recusa a descrição: ' || b.label
+) FROM bad_texts b WHERE b.label NOT IN ('nulo', '161 caracteres') ORDER BY b.label;
+SELECT throws_ok(
+  $$ INSERT INTO public.default_stage_template (position, name) VALUES (20, '  Com espacos nas pontas  ') $$,
+  '23514', NULL, 'F-86: o template recusa um nome que o Zod apararia (o que entra no template é copiado como está)'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.default_stage_template (position, name) VALUES (20, 'Cafe' || chr(769)) $$,
+  '23514', NULL, 'F-86: o template recusa um nome fora do NFC'
+);
+SELECT throws_ok(
+  $$ INSERT INTO public.default_stage_template (position, name, description) VALUES (20, 'Boa', '  Descricao com espacos  ') $$,
+  '23514', NULL, 'F-86: o template recusa uma descrição com espaços nas pontas'
+);
+SELECT lives_ok(
+  $$ INSERT INTO public.default_stage_template (position, name, description)
+     VALUES (20, 'Etapa extra', 'Descricao ok'), (21, chr(26085) || chr(26412), NULL) $$,
+  'F-86: o template aceita nome e descrição que a API aceita (japonês incluso)'
+);
+DELETE FROM public.default_stage_template WHERE position IN (20, 21);
 
 -- Template com buracos nas posições: as fases do processo continuam de 1 a n (I1) ----------------------------------------------------------
 DELETE FROM public.default_stage_template WHERE position IN (2, 4);
