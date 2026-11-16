@@ -10,7 +10,9 @@ import { processIdParamsSchema, toProcessPatch, updateProcessBodySchema } from '
  * `PATCH /admin/processes/{processId}` (operationId `updateProcess`). Policy equal to the contract:
  * role ceo only, `allowPending: []`, user 60 / min in the `writes` counter. Renames and/or cancels
  * (`status: "cancelled"`, the only manual transition) an ACTIVE process; any other one is a 422
- * `PROCESS_NOT_ACTIVE`. Repeating a PATCH is safe.
+ * `PROCESS_NOT_ACTIVE`. A repeated RENAME is idempotent (same title: 200, nothing changes); a repeated
+ * CANCEL whose first call was saved is 422 `PROCESS_NOT_ACTIVE`, because the process is already
+ * cancelled (E-60): the retry undoes nothing, and the CEO reads the process to see it.
  *
  * `route` is `withRoute` in production; tests pass a pipeline wired to fakes.
  */
