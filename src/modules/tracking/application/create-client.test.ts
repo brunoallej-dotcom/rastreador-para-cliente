@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ForbiddenError, ServiceUnavailableError, ValidationError } from '@/shared/kernel';
+import {
+  ConflictError,
+  ForbiddenError,
+  ServiceUnavailableError,
+  ValidationError,
+} from '@/shared/kernel';
 import { ceoPrincipal, clientPrincipal } from './client-fixtures';
 import { createClient } from './create-client';
 import { createFakeClientRepository } from './fake-client-repository';
@@ -39,6 +44,20 @@ describe('createClient', () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(ValidationError);
+    expect(clients.clients()).toEqual([]);
+  });
+
+  it('E-40: a name an active client already has comes back as the ConflictError of the database, and nothing is created', async () => {
+    const clients = createFakeClientRepository();
+    clients.refuseWrites(new ConflictError('the name is taken', { detail: 'taken' }));
+
+    const result = await createClient({ clients }, ceoPrincipal, { name: 'Acme Ltda' });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(ConflictError);
+      expect(result.error.detail).toBe('taken');
+    }
     expect(clients.clients()).toEqual([]);
   });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
@@ -81,6 +82,23 @@ describe('updateClient', () => {
     if (!result.ok) expect(result.error).toBeInstanceOf(ForbiddenError);
     expect(clients.calls).toEqual([]);
   });
+
+  it.each([
+    ['a rename', { name: 'Acme Brasil' }],
+    ['an unarchive', { archived: false }],
+  ])(
+    "E-41, E-42: %s that takes an active client's name is the ConflictError of the database, nothing changes",
+    async (_label, patch) => {
+      const clients = repository();
+      clients.refuseWrites(new ConflictError('the name is taken'));
+
+      const result = await updateClient({ clients }, ceoPrincipal, { clientId: CLIENT_ID, patch });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toBeInstanceOf(ConflictError);
+      expect(clients.clients()).toEqual([clientFixture({ id: CLIENT_ID, name: 'Acme' })]);
+    },
+  );
 
   it('E-21: an outage is thrown', async () => {
     const clients = repository();
