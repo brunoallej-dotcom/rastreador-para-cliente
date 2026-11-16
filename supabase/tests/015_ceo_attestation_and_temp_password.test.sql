@@ -1,11 +1,11 @@
--- Onda 6.1: elevação de CEO atestada pelo backend (F-50 b, F-60, F-61, F-63) e validade de 72 h da
+-- Onda 6.1 (e a revisão dela, F-64 a F-72): elevação de CEO atestada pelo backend (F-50 b, F-60, F-61, F-63) e validade de 72 h da
 -- senha temporária (F-41). Cobre: privilégios dos registros e das funções (só o service_role atesta),
 -- `aal2` sem atestado negado em toda função e leitura de CEO, atestado de outra sessão, de outro
 -- usuário, de fator removido ou não verificado, cada recusa do atestado (o motivo, as sessões apagadas
 -- e a auditoria), o oráculo (janela de 120 s), a ativação pelo backend, o registro de fatores e de
 -- challenges e a validade da senha temporária (vencida, dentro do prazo, renovada pelo reset).
 BEGIN;
-SELECT plan(99);
+SELECT plan(138);
 
 -- ids determinísticos por cenário n: usuário, fator, challenge e sessão extra ---------------------------
 CREATE FUNCTION pg_temp.uid(n integer) RETURNS uuid LANGUAGE sql IMMUTABLE AS
@@ -41,9 +41,9 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   PERFORM tests.create_user(pg_temp.uid(n), 'ceo');
-  UPDATE auth.sessions SET aal = 'aal2' WHERE id = pg_temp.uid(n);
   INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, created_at, updated_at, secret)
   VALUES (pg_temp.fid(n), pg_temp.uid(n), 'cenario', 'totp', p_factor_status::auth.factor_status, now(), now(), 'TESTSECRET');
+  UPDATE auth.sessions SET aal = 'aal2', factor_id = pg_temp.fid(n) WHERE id = pg_temp.uid(n);
   IF p_in_registry THEN
     INSERT INTO private.mfa_backend_factors (factor_id, user_id, activated_at, activation_challenge_id)
     VALUES (pg_temp.fid(n), pg_temp.uid(n),
@@ -112,15 +112,15 @@ SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c3');
 SELECT is(
   (SELECT count(*)::integer FROM pg_class c
     WHERE c.oid IN ('private.mfa_backend_factors'::regclass, 'private.mfa_backend_challenges'::regclass,
-                    'private.mfa_session_attestations'::regclass)
+                    'private.mfa_session_attestations'::regclass, 'private.mfa_first_activations'::regclass)
       AND c.relrowsecurity),
-  3,
-  'F-63: as três tabelas de atestado têm RLS habilitado'
+  4,
+  'F-63: as quatro tabelas de atestado têm RLS habilitado'
 );
 SELECT is_empty(
   $$ SELECT t.name, r.role
        FROM (VALUES ('private.mfa_backend_factors'), ('private.mfa_backend_challenges'),
-                    ('private.mfa_session_attestations')) t (name)
+                    ('private.mfa_session_attestations'), ('private.mfa_first_activations')) t (name)
       CROSS JOIN (VALUES ('anon'), ('authenticated'), ('service_role')) r (role)
       WHERE has_table_privilege(r.role, t.name,
                                 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') $$,
@@ -129,7 +129,8 @@ SELECT is_empty(
 SELECT is_empty(
   $$ SELECT policyname FROM pg_policies
       WHERE schemaname = 'private'
-        AND tablename IN ('mfa_backend_factors', 'mfa_backend_challenges', 'mfa_session_attestations') $$,
+        AND tablename IN ('mfa_backend_factors', 'mfa_backend_challenges', 'mfa_session_attestations',
+                          'mfa_first_activations') $$,
   'F-63: nenhuma policy nas tabelas de atestado (RLS sem policy nega a quem não é dono)'
 );
 
@@ -153,7 +154,8 @@ SELECT is_empty(
       CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
       WHERE p.oid IN ('public.attest_mfa_session(uuid, uuid, uuid, uuid)'::regprocedure,
                       'public.register_backend_totp_factor(uuid, uuid, uuid)'::regprocedure,
-                      'public.record_backend_mfa_challenge(uuid, uuid, uuid)'::regprocedure)
+                      'public.record_backend_mfa_challenge(uuid, uuid, uuid)'::regprocedure,
+                      'public.consume_totp_code(uuid, uuid, bytea)'::regprocedure)
         AND a.privilege_type = 'EXECUTE'
         AND a.grantee NOT IN (p.proowner, 'service_role'::regrole) $$,
   'F-63: attest_mfa_session e as funções de registro: EXECUTE só para o dono e o service_role (nem PUBLIC, nem anon, nem authenticated)'
@@ -362,8 +364,8 @@ SELECT tests.clear_authentication();
 SELECT pg_temp.arrange(1);
 SELECT is(
   pg_temp.attest(1),
-  ARRAY['attested', '1', '0'],
-  'F-63: com tudo certo o atestado é gravado, as sessões ficam e nada é auditado'
+  ARRAY['attested_activated', '1', '0'],
+  'F-63, F-72: com tudo certo o atestado é gravado e diz que ATIVOU o fator; as sessões ficam e nada é auditado'
 );
 SELECT is(
   (SELECT row(a.user_id, a.factor_id, a.challenge_id)::text
@@ -380,7 +382,7 @@ SELECT is(
 SELECT is(
   pg_temp.attest(1),
   ARRAY['attested', '1', '0'],
-  'F-63: atestar de novo a mesma sessão é idempotente'
+  'F-63: atestar de novo a mesma sessão é idempotente, e já não diz que ativou (a ativação é uma vez só)'
 );
 SELECT is(
   (SELECT count(*)::integer FROM private.mfa_session_attestations WHERE session_id = pg_temp.uid(1)),
@@ -392,31 +394,32 @@ SELECT is(
 SELECT tests.create_user(pg_temp.uid(2), 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT is(
   pg_temp.attest_with(pg_temp.uid(2), pg_temp.uid(2), gen_random_uuid(), gen_random_uuid()),
-  ARRAY['not_ceo', '0', '1'],
-  'F-63: quem não é CEO é recusado (not_ceo)'
+  ARRAY['not_ceo', '1', '1'],
+  'F-63, F-66: quem não é CEO é recusado (not_ceo) e as sessões ficam (não é sinal de ataque)'
 );
 
 SELECT pg_temp.arrange(3);
 SELECT is(
   pg_temp.attest_with(pg_temp.uid(3), gen_random_uuid(), pg_temp.fid(3), pg_temp.cid(3)),
-  ARRAY['session_not_found', '0', '1'],
-  'F-63: uma sessão que não existe é recusada (session_not_found)'
+  ARRAY['session_not_found', '1', '1'],
+  'F-63, F-66: uma sessão que não existe é recusada (session_not_found) sem derrubar as outras'
 );
 
 SELECT pg_temp.arrange(4);
 UPDATE auth.sessions SET aal = 'aal1' WHERE id = pg_temp.uid(4);
 SELECT is(
   pg_temp.attest(4),
-  ARRAY['session_not_aal2', '0', '1'],
-  'F-63: uma sessão que o Auth não elevou a aal2 é recusada (session_not_aal2)'
+  ARRAY['session_not_aal2', '1', '1'],
+  'F-63, F-66: uma sessão que o Auth não elevou a aal2 é recusada (session_not_aal2) sem revogar'
 );
 
 SELECT pg_temp.arrange(5);
 SELECT pg_temp.arrange(6);
+UPDATE auth.sessions SET factor_id = pg_temp.fid(6) WHERE id = pg_temp.uid(5);
 SELECT is(
   pg_temp.attest_with(pg_temp.uid(5), pg_temp.uid(5), pg_temp.fid(6), pg_temp.cid(5)),
-  ARRAY['factor_not_found', '0', '1'],
-  'F-63: o fator de OUTRO usuário é recusado (factor_not_found)'
+  ARRAY['factor_not_found', '1', '1'],
+  'F-63, F-66: o fator de OUTRO usuário é recusado (factor_not_found), sem revogar'
 );
 SELECT is(
   (SELECT count(*)::integer FROM auth.sessions WHERE user_id = pg_temp.uid(6)),
@@ -428,15 +431,15 @@ SELECT pg_temp.arrange(7);
 UPDATE auth.mfa_factors SET factor_type = 'phone', phone = '+5511999990007' WHERE id = pg_temp.fid(7);
 SELECT is(
   pg_temp.attest(7),
-  ARRAY['factor_not_totp', '0', '1'],
-  'F-63: um fator que não é TOTP é recusado (factor_not_totp)'
+  ARRAY['factor_not_totp', '1', '1'],
+  'F-63, F-66: um fator que não é TOTP é recusado (factor_not_totp), sem revogar'
 );
 
 SELECT pg_temp.arrange(8, p_factor_status => 'unverified');
 SELECT is(
   pg_temp.attest(8),
-  ARRAY['factor_not_verified', '0', '1'],
-  'F-63: um fator não verificado é recusado (factor_not_verified)'
+  ARRAY['factor_not_verified', '1', '1'],
+  'F-63, F-66: um fator não verificado é recusado (factor_not_verified), sem revogar'
 );
 
 SELECT pg_temp.arrange(9, p_in_registry => false);
@@ -464,15 +467,15 @@ SELECT is(
 SELECT pg_temp.arrange(13, p_verified_ago => NULL);
 SELECT is(
   pg_temp.attest(13),
-  ARRAY['challenge_not_verified', '0', '1'],
-  'F-63: um challenge que o Auth não verificou é recusado (challenge_not_verified)'
+  ARRAY['challenge_not_verified', '1', '1'],
+  'F-63, F-66: um challenge que o Auth não verificou é recusado (challenge_not_verified), sem revogar'
 );
 
 SELECT pg_temp.arrange(14, p_verified_ago => interval '121 seconds');
 SELECT is(
   pg_temp.attest(14),
-  ARRAY['challenge_stale', '0', '1'],
-  'F-63: um challenge verificado há mais de 120 s é recusado (challenge_stale)'
+  ARRAY['challenge_stale', '1', '1'],
+  'F-63, F-66: um challenge verificado há mais de 120 s é recusado (challenge_stale), sem revogar'
 );
 
 SELECT pg_temp.arrange(15, p_in_backend => false);
@@ -495,8 +498,9 @@ SELECT is(
      FROM public.audit_events e
     WHERE e.action = 'auth.mfa_attestation_refused' AND e.resource_id = pg_temp.uid(16)),
   row(NULL::uuid, NULL::public.app_role, 'account', NULL::uuid, NULL::uuid,
-      jsonb_build_object('reason', 'oracle', 'factor_id', pg_temp.fid(16)))::text,
-  'E-33: a auditoria da recusa leva só o motivo e o id do fator (sem PII), em nome de ninguém'
+      jsonb_build_object('reason', 'oracle', 'factor_id', pg_temp.fid(16),
+                         'severity', 'alert', 'revoked', true))::text,
+  'E-33, F-66, F-68: a auditoria da recusa leva o motivo, o id do fator, a severidade e se revogou (sem PII), em nome de ninguém'
 );
 SELECT is(
   (SELECT count(*)::integer FROM private.mfa_session_attestations WHERE user_id = pg_temp.uid(16)),
@@ -543,8 +547,8 @@ SELECT pg_temp.arrange(21);                                                     
 SELECT pg_temp.extra_challenge(21, 221, interval '5 seconds', true, true);     -- o verify seguinte
 SELECT is(
   pg_temp.attest_with(pg_temp.uid(21), pg_temp.uid(21), pg_temp.fid(21), pg_temp.cid(221)),
-  ARRAY['attested', '1', '0'],
-  'F-61: o verify depois de uma falha do atestado ativa o fator pelo challenge que o ativou (recupera, não tranca o CEO)'
+  ARRAY['attested_activated', '1', '0'],
+  'F-61, F-72: o verify depois de uma falha do atestado ativa o fator pelo challenge que o ativou e DIZ que ativou (o app derruba as outras sessões)'
 );
 SELECT is(
   (SELECT bf.activation_challenge_id FROM private.mfa_backend_factors bf WHERE bf.factor_id = pg_temp.fid(21)),
@@ -673,6 +677,33 @@ SELECT throws_ok(
   'P0001', 'INVALID_INPUT', 'F-63: fator nulo é INVALID_INPUT'
 );
 
+-- F-67: só um challenge novo e ainda não verificado se registra (ninguém "adota" um challenge que foi
+-- verificado direto no Auth, nem um velho)
+INSERT INTO auth.mfa_challenges (id, factor_id, created_at, verified_at, ip_address)
+VALUES (pg_temp.cid(52), pg_temp.fid(40), now(), now(), '127.0.0.1'),
+       (pg_temp.cid(53), pg_temp.fid(40), now() - interval '61 seconds', NULL, '127.0.0.1'),
+       (pg_temp.cid(54), pg_temp.fid(40), now() - interval '59 seconds', NULL, '127.0.0.1');
+SET LOCAL ROLE service_role;
+SELECT throws_ok(
+  $$ SELECT public.record_backend_mfa_challenge(pg_temp.uid(40), pg_temp.fid(40), pg_temp.cid(52)) $$,
+  'P0001', 'NOT_FOUND', 'F-67: um challenge que já foi verificado não se registra'
+);
+SELECT throws_ok(
+  $$ SELECT public.record_backend_mfa_challenge(pg_temp.uid(40), pg_temp.fid(40), pg_temp.cid(53)) $$,
+  'P0001', 'NOT_FOUND', 'F-67: um challenge criado há 61 s não se registra'
+);
+SELECT lives_ok(
+  $$ SELECT public.record_backend_mfa_challenge(pg_temp.uid(40), pg_temp.fid(40), pg_temp.cid(54)) $$,
+  'F-67: um challenge criado há 59 s e não verificado se registra'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT count(*)::integer FROM private.mfa_backend_challenges
+    WHERE challenge_id IN (pg_temp.cid(52), pg_temp.cid(53))),
+  0,
+  'F-67: os dois recusados não ficaram no registro'
+);
+
 -- limpeza oportunista: só de fator já ativado, só de challenge de fator já verificado, só antigo
 SELECT pg_temp.arrange(60, p_activated => true, p_was_verified => true);
 SELECT pg_temp.extra_challenge(60, 160, interval '0 seconds', true, true);
@@ -701,6 +732,221 @@ SELECT is(
   2,
   'F-63: a limpeza não mexe em fator que ainda não foi ativado (a prova da ativação pode estar ali)'
 );
+
+-- severidade da auditoria: só os sinais de ataque são `alert` e revogam (F-66, F-68) -----------------------
+SELECT is(
+  (SELECT e.metadata ->> 'severity' || '/' || (e.metadata ->> 'revoked')
+     FROM public.audit_events e
+    WHERE e.action = 'auth.mfa_attestation_refused' AND e.resource_id = pg_temp.uid(3)),
+  'warning/false',
+  'F-66, F-68: uma recusa de corrida é auditada como warning e não revoga'
+);
+
+-- F-64: apagar o fator do CEO direto no Auth não reabre o cadastro -----------------------------------------
+SELECT pg_temp.arrange(80);
+SELECT pg_temp.attest(80);
+SELECT is(
+  (SELECT count(*)::integer FROM private.mfa_first_activations WHERE user_id = pg_temp.uid(80)),
+  1,
+  'F-64: a primeira ativação pelo backend grava a marca do usuário'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM pg_constraint
+    WHERE conrelid = 'private.mfa_first_activations'::regclass AND contype = 'f'),
+  1,
+  'F-64: a marca tem uma só FK (auth.users): nenhuma para o fator, para o CASCADE não a apagar'
+);
+-- o ataque: com uma aal2 obtida direto no Auth, DELETE /factors/{id}
+DELETE FROM auth.mfa_factors WHERE id = pg_temp.fid(80);
+SELECT is(
+  (SELECT (SELECT count(*) FROM private.mfa_backend_factors WHERE user_id = pg_temp.uid(80))::text
+          || '/' || (SELECT count(*) FROM private.mfa_session_attestations WHERE user_id = pg_temp.uid(80))::text
+          || '/' || (SELECT count(*) FROM private.mfa_first_activations WHERE user_id = pg_temp.uid(80))::text),
+  '0/0/1',
+  'F-64: apagar o fator leva o registro e os atestados, mas NÃO a marca de primeira ativação'
+);
+INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, created_at, updated_at, secret)
+VALUES (pg_temp.fid(81), pg_temp.uid(80), 'do atacante', 'totp', 'unverified', now(), now(), 'TESTSECRET');
+SET LOCAL ROLE service_role;
+SELECT is(
+  public.register_backend_totp_factor(pg_temp.uid(80), pg_temp.fid(81), pg_temp.uid(80)),
+  'factor_reenrolled',
+  'F-64: o enroll pelo backend depois do fator apagado é recusado (factor_reenrolled)'
+);
+RESET ROLE;
+SELECT is(
+  (SELECT count(*)::integer FROM private.mfa_backend_factors WHERE factor_id = pg_temp.fid(81)),
+  0,
+  'F-64: o fator do atacante não foi cadastrado'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM auth.sessions WHERE user_id = pg_temp.uid(80)),
+  0,
+  'F-64: a recusa apagou todas as sessões do usuário'
+);
+SELECT is(
+  (SELECT e.metadata
+     FROM public.audit_events e
+    WHERE e.action = 'auth.mfa_attestation_refused' AND e.resource_id = pg_temp.uid(80)),
+  jsonb_build_object('reason', 'factor_reenrolled', 'factor_id', pg_temp.fid(81),
+                     'severity', 'alert', 'revoked', true),
+  'F-64: a recusa é auditada como alerta'
+);
+-- só o reset do operador reabre o cadastro
+SELECT tests.reset_first_activation(pg_temp.uid(80));
+INSERT INTO auth.sessions (id, user_id, created_at, updated_at, aal)
+VALUES (pg_temp.uid(80), pg_temp.uid(80), now(), now(), 'aal1');
+SET LOCAL ROLE service_role;
+SELECT is(
+  public.register_backend_totp_factor(pg_temp.uid(80), pg_temp.fid(81), pg_temp.uid(80)),
+  'registered',
+  'F-64: depois do reset do operador (a marca apagada) o cadastro volta a funcionar'
+);
+RESET ROLE;
+
+-- F-64 no atestado: um fator cadastrado ANTES da marca, mas ativado depois dela, também é recusado
+SELECT pg_temp.arrange(82);
+INSERT INTO private.mfa_first_activations (user_id) VALUES (pg_temp.uid(82));
+SELECT is(
+  pg_temp.attest(82),
+  ARRAY['factor_reenrolled', '0', '1'],
+  'F-64: a ativação de um fator novo, com a marca do usuário gravada, é recusada no atestado (factor_reenrolled) e revoga'
+);
+
+-- F-71: a prova da ativação não depende de o Auth guardar as linhas de challenge -------------------------------
+SELECT ok(
+  (SELECT b.verified_at IS NOT NULL FROM private.mfa_backend_challenges b WHERE b.challenge_id = pg_temp.cid(1)),
+  'F-71: o atestado copia o instante da verificação para o registro do backend'
+);
+DELETE FROM auth.mfa_challenges WHERE id = pg_temp.cid(1);
+SELECT is(
+  (SELECT count(*)::integer FROM private.mfa_backend_challenges WHERE challenge_id = pg_temp.cid(1)),
+  1,
+  'F-71: o Auth apagar o challenge não apaga o registro do backend (sem CASCADE)'
+);
+SELECT ok(
+  (SELECT bf.activated_at IS NOT NULL FROM private.mfa_backend_factors bf WHERE bf.factor_id = pg_temp.fid(1)),
+  'F-71: nem a ativação do fator'
+);
+-- a derivação da ativação usa a cópia quando o Auth já não tem o challenge que ativou
+SELECT pg_temp.arrange(83);                                                    -- cid(83): o que ativou
+SELECT pg_temp.extra_challenge(83, 283, interval '5 seconds', true, true);    -- o verify seguinte
+UPDATE private.mfa_backend_challenges SET verified_at = now() - interval '1 hour'
+ WHERE challenge_id = pg_temp.cid(83);
+DELETE FROM auth.mfa_challenges WHERE id = pg_temp.cid(83);
+SELECT is(
+  pg_temp.attest_with(pg_temp.uid(83), pg_temp.uid(83), pg_temp.fid(83), pg_temp.cid(283)),
+  ARRAY['attested_activated', '1', '0'],
+  'F-71: a ativação é derivada da cópia do registro quando o Auth já apagou o challenge que ativou'
+);
+
+-- F-67: um challenge atesta uma sessão só; a sessão tem de ter sido elevada pelo fator ---------------------------
+SELECT pg_temp.arrange(84);
+SELECT pg_temp.attest(84);
+INSERT INTO auth.sessions (id, user_id, created_at, updated_at, aal, factor_id)
+VALUES (pg_temp.sid(84), pg_temp.uid(84), now(), now(), 'aal2', pg_temp.fid(84));
+SELECT is(
+  pg_temp.attest_with(pg_temp.uid(84), pg_temp.sid(84), pg_temp.fid(84), pg_temp.cid(84)),
+  ARRAY['challenge_reused', '0', '1'],
+  'F-67: o challenge que já atestou uma sessão não atesta outra (challenge_reused) e revoga'
+);
+SELECT pg_temp.arrange(85);
+SELECT pg_temp.attest(85);
+INSERT INTO auth.sessions (id, user_id, created_at, updated_at, aal, factor_id)
+VALUES (pg_temp.sid(85), pg_temp.uid(85), now(), now(), 'aal2', pg_temp.fid(85));
+SELECT throws_ok(
+  $$ INSERT INTO private.mfa_session_attestations (session_id, user_id, factor_id, challenge_id)
+     VALUES (pg_temp.sid(85), pg_temp.uid(85), pg_temp.fid(85), pg_temp.cid(85)) $$,
+  '23505', NULL, 'F-67: challenge_id é UNIQUE na tabela de atestados'
+);
+SELECT pg_temp.arrange(86);
+UPDATE auth.sessions SET factor_id = NULL WHERE id = pg_temp.uid(86);
+SELECT is(
+  pg_temp.attest(86),
+  ARRAY['session_factor_mismatch', '0', '1'],
+  'F-67: uma sessão que o Auth não elevou por este fator é recusada (session_factor_mismatch) e revoga'
+);
+
+-- um CEO desativado ---------------------------------------------------------------------------------------------
+SELECT pg_temp.arrange(87);
+UPDATE public.profiles SET disabled_at = now() WHERE id = pg_temp.uid(87);
+SELECT is(
+  pg_temp.attest(87),
+  ARRAY['not_ceo', '1', '1'],
+  'F-67: um CEO desativado não recebe atestado (not_ceo)'
+);
+SELECT tests.create_user(pg_temp.uid(88), 'ceo');
+INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, created_at, updated_at, secret)
+VALUES (pg_temp.fid(88), pg_temp.uid(88), 'candidato', 'totp', 'unverified', now(), now(), 'TESTSECRET');
+UPDATE public.profiles SET disabled_at = now() WHERE id = pg_temp.uid(88);
+SET LOCAL ROLE service_role;
+SELECT throws_ok(
+  $$ SELECT public.register_backend_totp_factor(pg_temp.uid(88), pg_temp.fid(88), pg_temp.uid(88)) $$,
+  'P0001', 'NOT_FOUND', 'F-67: um CEO desativado não cadastra fator (NOT_FOUND)'
+);
+RESET ROLE;
+
+-- todo objeto de CEO nega a aal2 SEM atestado (p_attested => false) ---------------------------------------------------
+-- c9: CEO com fator verificado que NUNCA é atestado; o resto do que se lê vem de dados de outros usuários
+SELECT tests.create_user('00000000-0000-4000-8000-0000000000c9', 'ceo');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c9');
+INSERT INTO public.processes (id, client_id, title)
+VALUES ('00000000-0000-4000-8000-0000000d0001', '00000000-0000-4000-8000-00000000000a', 'Processo do teste F-63');
+INSERT INTO public.process_stages (id, process_id, position, name, status, started_at, completed_at) VALUES
+  ('00000000-0000-4000-8000-0000000d0002', '00000000-0000-4000-8000-0000000d0001', 1, 'Fase 1', 'completed', now() - interval '2 days', now() - interval '1 day'),
+  ('00000000-0000-4000-8000-0000000d0003', '00000000-0000-4000-8000-0000000d0001', 2, 'Fase 2', 'in_progress', now() - interval '1 day', NULL);
+INSERT INTO public.stage_approvals (process_stage_id, process_id, approved_by)
+VALUES ('00000000-0000-4000-8000-0000000d0002', '00000000-0000-4000-8000-0000000d0001',
+        '00000000-0000-4000-8000-0000000000c1');
+INSERT INTO public.audit_events (actor_id, actor_role, action, resource_type, resource_id)
+VALUES ('00000000-0000-4000-8000-0000000000c1', 'ceo', 'client.created', 'client',
+        '00000000-0000-4000-8000-00000000000a');
+
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c9', 'aal2', false);
+SELECT throws_ok(
+  $$ SELECT public.update_client('00000000-0000-4000-8000-00000000000a', 'Renomeado sem atestado') $$,
+  '42501', 'FORBIDDEN', 'F-63: aal2 sem atestado não executa update_client'
+);
+SELECT throws_ok(
+  $$ SELECT public.require_password_change('00000000-0000-4000-8000-0000000000a1') $$,
+  '42501', 'FORBIDDEN', 'F-63: aal2 sem atestado não executa require_password_change'
+);
+SELECT throws_ok(
+  $$ SELECT public.set_account_display_name('00000000-0000-4000-8000-0000000000a1', 'Renomeado sem atestado') $$,
+  '42501', 'FORBIDDEN', 'F-63: aal2 sem atestado não executa set_account_display_name'
+);
+SELECT throws_ok(
+  $$ SELECT public.record_account_provisioned('00000000-0000-4000-8000-0000000000a1') $$,
+  '42501', 'FORBIDDEN', 'F-63: aal2 sem atestado não executa record_account_provisioned'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.profiles WHERE id <> '00000000-0000-4000-8000-0000000000c9'),
+  0,
+  'F-63: a policy de CEO de profiles não entrega os perfis de outros a uma aal2 sem atestado'
+);
+SELECT is((SELECT count(*)::integer FROM public.audit_events), 0, 'F-63: a policy de CEO de audit_events nega');
+SELECT is((SELECT count(*)::integer FROM public.processes), 0, 'F-63: a policy de CEO de processes nega');
+SELECT is((SELECT count(*)::integer FROM public.process_stages), 0, 'F-63: a policy de CEO de process_stages nega');
+SELECT is((SELECT count(*)::integer FROM public.stage_approvals), 0, 'F-63: a policy de CEO de stage_approvals nega');
+SELECT is(
+  (SELECT count(*)::integer FROM public.default_stage_template), 0,
+  'F-63: a policy de CEO de default_stage_template nega'
+);
+SELECT tests.clear_authentication();
+
+-- o controle positivo: a mesma sessão, atestada, lê tudo isso
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c9', 'aal2');
+SELECT ok((SELECT count(*) FROM public.profiles WHERE id <> '00000000-0000-4000-8000-0000000000c9') > 0,
+          'F-63 (controle): atestado, o CEO lê os perfis de outros');
+SELECT ok((SELECT count(*) FROM public.audit_events) > 0, 'F-63 (controle): atestado, o CEO lê a auditoria');
+SELECT ok((SELECT count(*) FROM public.processes) > 0, 'F-63 (controle): atestado, o CEO lê os processos');
+SELECT ok((SELECT count(*) FROM public.process_stages) > 0, 'F-63 (controle): atestado, o CEO lê as fases');
+SELECT ok((SELECT count(*) FROM public.stage_approvals) > 0, 'F-63 (controle): atestado, o CEO lê as aprovações');
+SELECT lives_ok(
+  $$ SELECT public.update_client('00000000-0000-4000-8000-00000000000a', 'Renomeado com atestado') $$,
+  'F-63 (controle): atestado, o CEO executa update_client'
+);
+SELECT tests.clear_authentication();
 
 -- F-41: a senha temporária vale 72 h ---------------------------------------------------------------------------------------
 SELECT is(

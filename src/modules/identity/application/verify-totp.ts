@@ -2,6 +2,7 @@ import {
   err,
   ForbiddenError,
   ok,
+  ServiceUnavailableError,
   UnauthenticatedError,
   type DomainError,
   type Principal,
@@ -19,6 +20,13 @@ export type VerifyTotpDeps = {
   readonly principals: PrincipalQuery;
   readonly clients: ClientDirectory;
 };
+
+/**
+ * What a 503 in the middle of a verification tells the CEO (E-37): the code was already burned (and may
+ * already have been accepted at Auth), so the same code is refused the next time; the next one works.
+ */
+export const NEXT_CODE_HINT =
+  'The code could not be confirmed. Wait for the next code in your authenticator app and try again.';
 
 export type VerifyTotpInput = {
   /**
@@ -69,13 +77,15 @@ export type VerifyTotpOutcome = {
  *    session, factor and challenge and refuses an oracle (a code that was also verified straight at
  *    Auth inside the TOTP window), a factor the backend never activated or a challenge it never
  *    recorded. A refusal → `InvalidMfaCodeError` (`attestation_refused`: the same 422 as a wrong
- *    code), and the database has already deleted every session of the user and audited it. Whatever
- *    else goes wrong (the database is down) throws, and the session stays unattested: pending
- *    `VERIFY_MFA`, a 503 (fail closed). The CEO verifies again with the next code.
- * 6. When this verification ACTIVATED the first factor (the CEO had `ENROLL_MFA` pending), the other
- *    sessions of the CEO are signed out, so a session opened with the password alone does not
- *    outlive the moment the account gets its second factor (F-20). It is best effort: a failure
- *    never turns a good verification into an error, and the caller logs it.
+ *    code), and for the signs of an attack the database has already deleted every session of the user
+ *    (all refusals are audited). Whatever else goes wrong (the database is down) throws, and the
+ *    session stays unattested: pending `VERIFY_MFA`, a 503 (fail closed) whose `detail` says to wait
+ *    for the next code, because this one is burned (`NEXT_CODE_HINT`, E-37).
+ * 6. When THIS attestation ACTIVATED the first factor of the CEO (the database says so: it derives the
+ *    activation, so it is also the retry after an attestation that failed), the other sessions of the
+ *    CEO are signed out, so a session opened with the password alone does not outlive the moment the
+ *    account gets its second factor (F-20, F-72). It is best effort: a failure never turns a good
+ *    verification into an error, and the caller logs it.
  *
  * What this does NOT do (F-23): the refresh token a browser held BEFORE the verification keeps
  * working for the Auth server's reuse interval (`refresh_token_reuse_interval`, 10 s locally) and
@@ -91,24 +101,26 @@ export async function verifyTotp(
   if (principal.role !== 'ceo') {
     return err(new ForbiddenError('only a CEO verifies TOTP', { detail: 'Access denied.' }));
   }
-  const activated = principal.pendingActions.includes('ENROLL_MFA');
-
   const factor = await resolveFactor(deps.mfa, input.factorId);
   if (!factor.ok) return factor;
   const { factorId, candidateCount, foreignFactorCount } = factor.value;
   const withContext = (error: InvalidMfaCodeError) =>
     withListing(error, { candidateCount, foreignFactorCount });
 
-  const verified = await deps.mfa.verifyTotp({
-    factorId,
-    code: input.code,
-    recordChallenge: (challengeId) =>
-      deps.attestor.recordChallenge({ userId: principal.userId, factorId, challengeId }),
-  });
+  const verified = await withNextCodeHint(() =>
+    deps.mfa.verifyTotp({
+      factorId,
+      code: input.code,
+      burnCode: (codeDigest) =>
+        deps.attestor.burnCode({ userId: principal.userId, factorId, codeDigest }),
+      recordChallenge: (challengeId) =>
+        deps.attestor.recordChallenge({ userId: principal.userId, factorId, challengeId }),
+    }),
+  );
   if (!verified.ok) return err(withContext(verified.error));
   const { challengeId } = verified.value;
 
-  const elevated = await deps.principals.current();
+  const elevated = await withNextCodeHint(() => deps.principals.current());
   if (elevated === null) {
     return err(
       new UnauthenticatedError('the session ended while the TOTP code was verified', {
@@ -120,12 +132,14 @@ export async function verifyTotp(
     throw new Error('the principal after the TOTP verification is another user');
   }
 
-  const attestation = await deps.attestor.attest({
-    userId: principal.userId,
-    sessionId: await deps.mfa.currentSessionId(),
-    factorId,
-    challengeId,
-  });
+  const attestation = await withNextCodeHint(async () =>
+    deps.attestor.attest({
+      userId: principal.userId,
+      sessionId: await deps.mfa.currentSessionId(),
+      factorId,
+      challengeId,
+    }),
+  );
   if (!attestation.attested) {
     return err(
       withContext(
@@ -137,6 +151,7 @@ export async function verifyTotp(
     );
   }
 
+  const { activated } = attestation;
   const otherSessionsRevoked = activated
     ? await attempt(() => deps.mfa.revokeOtherSessions())
     : null;
@@ -235,6 +250,21 @@ function withListing(
     ...(candidateCount === undefined ? {} : { candidateCount }),
     ...(foreignFactorCount === undefined ? {} : { foreignFactorCount }),
   });
+}
+
+/**
+ * An outage after the code was burned is a 503 that says what to do (E-37): wait for the next code. The
+ * error stays a `ServiceUnavailableError` (the pipeline maps it as before), now with a `detail`.
+ */
+async function withNextCodeHint<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof ServiceUnavailableError) {
+      throw new ServiceUnavailableError(error.message, { cause: error, detail: NEXT_CODE_HINT });
+    }
+    throw error;
+  }
 }
 
 /** Runs a best-effort step: `true` when it worked, `false` when it threw (the caller logs it). */

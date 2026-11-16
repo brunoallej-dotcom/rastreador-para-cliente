@@ -1,5 +1,9 @@
 import type { ConflictError, Result } from '@/shared/kernel';
-import type { InvalidMfaCodeError, MfaAlreadyEnrolledError } from './mfa-errors';
+import type {
+  InvalidMfaCodeError,
+  MfaAlreadyEnrolledError,
+  MfaReenrollmentRefusedError,
+} from './mfa-errors';
 
 /** A TOTP factor of the user, as the Auth service reports it. Never carries the secret. */
 export type TotpFactor = {
@@ -61,17 +65,22 @@ export interface MfaGateway {
    * factor and answers the challenge with `code`. The first success activates the factor, and every
    * success replaces the session with an `aal2` one (new cookies).
    *
-   * `recordChallenge` runs between the challenge and the answer: the backend must have recorded the
-   * challenge it created BEFORE the Auth service can verify it (the attestation tells the backend's
-   * challenges from the ones made straight at Auth, F-63). If it refuses, the challenge is never
-   * answered; if it throws, so does this method.
+   * `burnCode` receives the digest of the code (a PostgREST `bytea` literal, never the code) and
+   * runs FIRST: the replay guard lives behind the admin path now (F-65), so the gateway cannot burn
+   * with the user's session. `recordChallenge` runs between the challenge and the answer: the backend
+   * must have recorded the challenge it created BEFORE the Auth service can verify it (the
+   * attestation tells the backend's challenges from the ones made straight at Auth, F-63). If either
+   * refuses, nothing after it runs; if either throws, so does this method.
    *
    * `err(InvalidMfaCodeError)` for a wrong or expired code, a replayed one, or a factor the account
    * does not own (the `reason` tells which, for the log). A code that was refused is burned too.
    * On success, `challengeId` is the challenge that was answered.
    */
   verifyTotp(
-    input: TotpCodeInput & { readonly recordChallenge: RecordChallenge },
+    input: TotpCodeInput & {
+      readonly burnCode: BurnCode;
+      readonly recordChallenge: RecordChallenge;
+    },
   ): Promise<Result<{ readonly challengeId: string }, InvalidMfaCodeError>>;
 
   /**
@@ -90,6 +99,13 @@ export interface MfaGateway {
   revokeOtherSessions(): Promise<void>;
 }
 
+/**
+ * What the gateway calls with the digest of the code, before anything else: `ok` the first time the code
+ * is seen, `err(InvalidMfaCodeError)` for a replay (`code_reused`) or a factor the account does not
+ * own (`factor_not_found`).
+ */
+export type BurnCode = (codeDigest: string) => Promise<Result<void, InvalidMfaCodeError>>;
+
 /** What the gateway calls with a challenge the backend has just created, before it is answered. */
 export type RecordChallenge = (challengeId: string) => Promise<Result<void, InvalidMfaCodeError>>;
 
@@ -100,8 +116,13 @@ export type RecordChallenge = (challengeId: string) => Promise<Result<void, Inva
  *   TOTP window: someone holding the password found a valid code there and replayed it (F-50 b);
  * - `factor_not_backend`, `factor_not_activated_by_backend`, `challenge_not_backend`: the factor or
  *   the challenge never went through the backend (F-61);
- * - the others: the ids the backend sent do not describe a consistent, fresh, verified `aal2`
- *   session of a CEO.
+ * - `factor_reenrolled`: the account already had its first factor activated and this is a new one (the
+ *   old one was deleted at Auth, F-64);
+ * - `challenge_reused`, `session_factor_mismatch`, `challenge_not_found`: a challenge or a session that
+ *   is not the one the backend just verified (F-67);
+ * - the others: the ids the backend sent do not describe a consistent, fresh,
+ *   verified `aal2` session of a CEO. Anyone can cause them by a race, so they refuse without
+ *   revoking (F-66).
  */
 export const ATTESTATION_REFUSALS = [
   'not_ceo',
@@ -117,11 +138,39 @@ export const ATTESTATION_REFUSALS = [
   'challenge_not_backend',
   'oracle',
   'factor_not_activated_by_backend',
+  'session_factor_mismatch',
+  'challenge_reused',
+  'factor_reenrolled',
 ] as const;
 export type AttestationRefusal = (typeof ATTESTATION_REFUSALS)[number];
 
+/**
+ * The refusals that are SIGNS OF AN ATTACK: the database deleted every session of the user (and the
+ * log is an alert). The other reasons are races and inconsistencies that refuse without revoking
+ * (F-66). The list mirrors `private.refuse_mfa_attestation`; a unit test pins both.
+ */
+export const ATTESTATION_ATTACK_SIGNALS: ReadonlySet<AttestationRefusal> = new Set([
+  'oracle',
+  'factor_not_backend',
+  'factor_not_activated_by_backend',
+  'challenge_not_backend',
+  'challenge_not_found',
+  'challenge_reused',
+  'session_factor_mismatch',
+  'factor_reenrolled',
+]);
+
 export type AttestationOutcome =
-  { readonly attested: true } | { readonly attested: false; readonly reason: AttestationRefusal };
+  | {
+      readonly attested: true;
+      /**
+       * This attestation ACTIVATED the first factor of the user (`attested_activated`): the database
+       * derived it, so it is true on the retry after a failed attestation too (F-72). The other sessions
+       * of the CEO are signed out then (F-20), whatever the pending actions said.
+       */
+      readonly activated: boolean;
+    }
+  | { readonly attested: false; readonly reason: AttestationRefusal };
 
 /**
  * The backend's own records of what it did to MFA, kept by the database behind the `service_role`
@@ -135,12 +184,25 @@ export interface MfaAttestor {
   /**
    * Records a factor the enrollment has just created as the backend's own (F-60, F-61). `err` with
    * `ConflictError` when the factor is already gone (another enrollment replaced it): retrying is safe.
+   * `err` with `MfaReenrollmentRefusedError` when the user already had a first factor activated and
+   * it was deleted behind the backend's back (F-64): the database deleted every session of the user.
    */
   registerEnrollment(input: {
     readonly userId: string;
     readonly factorId: string;
     readonly sessionId: string;
-  }): Promise<Result<void, ConflictError>>;
+  }): Promise<Result<void, ConflictError | MfaReenrollmentRefusedError>>;
+
+  /**
+   * Burns a TOTP code (F-21, F-65): `ok` the first time, `err(InvalidMfaCodeError)` `code_reused` for a
+   * replay inside 120 s and `factor_not_found` for a factor the user does not own. It is the admin path's
+   * job, not the user's session's: with the user's session it was an oracle for the codes.
+   */
+  burnCode(input: {
+    readonly userId: string;
+    readonly factorId: string;
+    readonly codeDigest: string;
+  }): Promise<Result<void, InvalidMfaCodeError>>;
 
   /**
    * Records a challenge the backend has just created, before it is answered. `err` with

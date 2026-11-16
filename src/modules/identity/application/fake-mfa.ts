@@ -9,7 +9,11 @@ import {
   type Principal,
   type Result,
 } from '@/shared/kernel';
-import { InvalidMfaCodeError, type MfaAlreadyEnrolledError } from '../domain/mfa-errors';
+import {
+  InvalidMfaCodeError,
+  MfaReenrollmentRefusedError,
+  type MfaAlreadyEnrolledError,
+} from '../domain/mfa-errors';
 import type {
   AttestationOutcome,
   AttestationRefusal,
@@ -27,12 +31,19 @@ export const FAKE_VALID_CODE = '123456';
 /** The session every fake request runs in (the one the claims of its token name). */
 export const FAKE_SESSION_ID = '99999999-9999-4999-8999-999999999999';
 
-/** A factor as the tests describe it. `backendEnrolled` is `true` unless the test says otherwise. */
+/**
+ * A factor as the tests describe it. `backendEnrolled` is `true` unless the test says otherwise, and
+ * `activated` (the database has attested a verification of it as the backend's, F-72) follows
+ * `verified`: a factor that is already verified is taken for one the backend activated.
+ */
 export type FakeFactor = {
   readonly id: string;
   readonly verified: boolean;
   readonly backendEnrolled?: boolean;
+  readonly activated?: boolean;
 };
+
+type StoredFactor = TotpFactor & { readonly activated: boolean };
 
 export type FakeMfaOptions = {
   readonly factors?: readonly FakeFactor[];
@@ -58,8 +69,12 @@ export type FakeAttestor = MfaAttestor & {
   refuseNextChallengeRecord(): void;
   /** The next `registerEnrollment` finds the factor already gone (a parallel enrollment). */
   conflictOnNextRegistration(): void;
+  /** The next `registerEnrollment` is refused: the user already had a first factor activated (F-64). */
+  refuseNextRegistrationAsReenrollment(): void;
+  /** `factorId:digest` of every code burned, in order (the replay guard, F-21). */
+  burnedCodes(): readonly string[];
   /** Makes the next calls of that method throw `ServiceUnavailableError`. */
-  failWith(method: 'register' | 'record' | 'attest'): void;
+  failWith(method: 'register' | 'record' | 'attest' | 'burn'): void;
 };
 
 export type FakeMfa = MfaGateway &
@@ -86,17 +101,19 @@ export type FakeMfa = MfaGateway &
   };
 
 export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
-  let factors: TotpFactor[] = (options.factors ?? []).map((factor) => ({
+  let factors: StoredFactor[] = (options.factors ?? []).map((factor) => ({
     id: factor.id,
     verified: factor.verified,
     backendEnrolled: factor.backendEnrolled ?? true,
+    activated: factor.activated ?? factor.verified,
   }));
   let nextId = 1;
   let nextChallenge = 1;
   let elevated = false;
   let revocations = 0;
-  /** `factorId:code` of every code a verification already burned (accepted or refused). */
+  /** `factorId:digest` of every code the replay guard already burned (accepted or refused). */
   const burned = new Set<string>();
+  const burnLog: string[] = [];
   let enrollError: ConflictError | MfaAlreadyEnrolledError | undefined;
   const calls: string[] = [];
   const failing = new Set<string>();
@@ -117,6 +134,7 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
   let nextRefusal: AttestationRefusal | undefined;
   let refuseNextRecord = false;
   let conflictNextRegistration = false;
+  let reenrollNextRegistration = false;
 
   const attestor: FakeAttestor = {
     registrations: () => registrations,
@@ -131,11 +149,19 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
     conflictOnNextRegistration: () => {
       conflictNextRegistration = true;
     },
+    refuseNextRegistrationAsReenrollment: () => {
+      reenrollNextRegistration = true;
+    },
+    burnedCodes: () => burnLog,
     failWith: (method) => void failing.add(`attestor:${method}`),
 
     registerEnrollment({ factorId }) {
       calls.push(`register:${factorId}`);
       unavailable('attestor:register');
+      if (reenrollNextRegistration) {
+        reenrollNextRegistration = false;
+        return Promise.resolve(err(new MfaReenrollmentRefusedError()));
+      }
       if (conflictNextRegistration) {
         conflictNextRegistration = false;
         return Promise.resolve(err(new ConflictError('the factor is gone')));
@@ -144,6 +170,23 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
       factors = factors.map((factor) =>
         factor.id === factorId ? { ...factor, backendEnrolled: true } : factor,
       );
+      return Promise.resolve(ok(undefined));
+    },
+
+    burnCode({ factorId, codeDigest }) {
+      calls.push(`burn:${factorId}`);
+      unavailable('attestor:burn');
+      // like the database: a factor that is not the user's is unknown, a code is burned the first time
+      // it is sent (right or wrong), and a second time is a replay
+      if (!factors.some((factor) => factor.id === factorId)) {
+        return Promise.resolve(err(new InvalidMfaCodeError('factor_not_found', { factorId })));
+      }
+      const use = `${factorId}:${codeDigest}`;
+      if (burned.has(use)) {
+        return Promise.resolve(err(new InvalidMfaCodeError('code_reused', { factorId })));
+      }
+      burned.add(use);
+      burnLog.push(use);
       return Promise.resolve(ok(undefined));
     },
 
@@ -168,8 +211,16 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
           ? undefined
           : 'factor_not_backend');
       nextRefusal = undefined;
-      const outcome: AttestationOutcome =
-        refusal === undefined ? { attested: true } : { attested: false, reason: refusal };
+      if (refusal !== undefined) {
+        const refused: AttestationOutcome = { attested: false, reason: refusal };
+        return Promise.resolve(refused);
+      }
+      // the database derives the activation: the first attestation of a factor activates it
+      const activated = factors.some((factor) => factor.id === input.factorId && !factor.activated);
+      factors = factors.map((factor) =>
+        factor.id === input.factorId ? { ...factor, activated: true } : factor,
+      );
+      const outcome: AttestationOutcome = { attested: true, activated };
       return Promise.resolve(outcome);
     },
   };
@@ -180,7 +231,7 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
     factors: () => factors.map(({ id, verified }) => ({ id, verified })),
     backendFactors: () => factors.filter((factor) => factor.backendEnrolled).map(({ id }) => id),
     plant: (factor) => {
-      factors = [...factors, { ...factor, backendEnrolled: false }];
+      factors = [...factors, { ...factor, backendEnrolled: false, activated: false }];
     },
     elevated: () => elevated,
     revocations: () => revocations,
@@ -192,7 +243,9 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
     listTotpFactors() {
       calls.push('list');
       unavailable('list');
-      return Promise.resolve([...factors]);
+      return Promise.resolve(
+        factors.map(({ id, verified, backendEnrolled }) => ({ id, verified, backendEnrolled })),
+      );
     },
 
     removeUnverifiedTotp(factorId) {
@@ -214,7 +267,7 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
       const factorId = `00000000-0000-4000-8000-${String(nextId).padStart(12, '0')}`;
       nextId += 1;
       // not the backend's until the attestor registers it, like the database
-      factors = [{ id: factorId, verified: false, backendEnrolled: false }];
+      factors = [{ id: factorId, verified: false, backendEnrolled: false, activated: false }];
       return Promise.resolve(
         ok({
           factorId,
@@ -228,21 +281,19 @@ export function createFakeMfa(options: FakeMfaOptions = {}): FakeMfa {
     async verifyTotp({
       factorId,
       code,
+      burnCode,
       recordChallenge,
     }: TotpCodeInput & {
+      readonly burnCode: (codeDigest: string) => Promise<Result<void, InvalidMfaCodeError>>;
       readonly recordChallenge: (challengeId: string) => Promise<Result<void, InvalidMfaCodeError>>;
     }) {
       calls.push(`verify:${factorId}`);
       unavailable('verify');
-      if (!factors.some((factor) => factor.id === factorId)) {
-        return err(new InvalidMfaCodeError('factor_not_found', { factorId }));
-      }
-      // like the database: a code is burned the first time it is sent, right or wrong
-      const use = `${factorId}:${code}`;
-      if (burned.has(use)) {
-        return err(new InvalidMfaCodeError('code_reused', { factorId }));
-      }
-      burned.add(use);
+      // like the gateway: the code is burned FIRST, through the replay guard (the digest, never the code)
+      // an opaque stand-in for the digest: the characters of the code shifted, so it never contains the code
+      const digest = [...code].map((char) => String.fromCharCode(char.charCodeAt(0) + 17)).join('');
+      const burnedNow = await burnCode(digest);
+      if (!burnedNow.ok) return burnedNow;
       // like the gateway: the challenge is recorded BEFORE the Auth service answers it
       const challengeId = `challenge-${nextChallenge}`;
       nextChallenge += 1;

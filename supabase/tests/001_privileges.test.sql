@@ -4,7 +4,7 @@
 -- Inclui a secret key (service_role): sem escrita em profiles, audit_events e template e sem
 -- acesso a private.password_baselines.
 BEGIN;
-SELECT plan(59);
+SELECT plan(61);
 
 -- AC-10: anon não tem privilégio algum em public ---------------------------------------------
 SELECT cmp_ok(
@@ -274,10 +274,11 @@ SELECT is_empty(
        JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = 'public'
         AND p.proname NOT IN (
-          'rate_limit_hit', 'register_backend_totp_factor', 'record_backend_mfa_challenge', 'attest_mfa_session'
+          'rate_limit_hit', 'consume_totp_code', 'register_backend_totp_factor',
+          'record_backend_mfa_challenge', 'attest_mfa_session'
         )
         AND has_function_privilege('service_role', p.oid, 'EXECUTE') $$,
-  'SEC-04: service_role não executa funções de public além de rate_limit_hit e das três do atestado de CEO (Onda 6.1)'
+  'SEC-04: service_role não executa funções de public além de rate_limit_hit, da queima de código TOTP e das três do atestado de CEO (Ondas 5 e 6.1)'
 );
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
@@ -400,6 +401,28 @@ SELECT throws_ok(
   'password_baselines: service_role não lê as linhas de base de senha'
 );
 RESET ROLE;
+
+-- F-63: o atestado não pode ser contornado em silêncio. A única definição de "aal2 de verdade" é
+-- private.session_is_attested(); nenhuma outra função de public ou private lê o claim `aal` do JWT (nem
+-- os claims direto), então uma função de CEO nova que o fizesse reprova aqui, não passa despercebida.
+SELECT is_empty(
+  $$ SELECT n.nspname || '.' || p.proname
+       FROM pg_proc p
+       JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname IN ('public', 'private')
+        AND (p.prosrc ~ $re$'aal'$re$ OR p.prosrc ~* $re$request\.jwt\.claim$re$)
+        AND NOT (n.nspname = 'private' AND p.proname = 'session_is_attested') $$,
+  'F-63: nenhuma função de public ou private além de session_is_attested lê o claim aal do JWT'
+);
+SELECT is(
+  (SELECT count(*)::integer
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'private' AND p.proname = 'session_is_attested'
+      AND p.prosrc ~ $re$'aal'$re$),
+  1,
+  'F-63: o guarda de catálogo acima enxerga a leitura do claim (session_is_attested a faz): não é um teste vazio'
+);
 
 SELECT * FROM finish();
 ROLLBACK;

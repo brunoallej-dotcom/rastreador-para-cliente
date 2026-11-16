@@ -3,7 +3,7 @@
 -- usuário, reuso dentro e depois da janela de 120 s, escrita direta negada e a exigência do fator
 -- em toda leitura e função de CEO.
 BEGIN;
-SELECT plan(50);
+SELECT plan(54);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000a', 'Cliente A');
@@ -29,14 +29,14 @@ SELECT f.user_id, f.id AS factor_id
   FROM auth.mfa_factors f
  WHERE f.factor_type = 'totp' AND f.status = 'verified'
    AND f.user_id IN ('00000000-0000-4000-8000-0000000000c1', '00000000-0000-4000-8000-0000000000c2');
-GRANT SELECT ON factor_of TO authenticated;
+GRANT SELECT ON factor_of TO authenticated, service_role;
 
 -- um digest por "código" (32 bytes, como o SHA-256 que o app envia)
 CREATE TEMP TABLE digest_of (name text PRIMARY KEY, value bytea NOT NULL);
 INSERT INTO digest_of (name, value) VALUES
   ('one', decode(repeat('01', 32), 'hex')),
   ('two', decode(repeat('02', 32), 'hex'));
-GRANT SELECT ON digest_of TO authenticated;
+GRANT SELECT ON digest_of TO authenticated, service_role;
 
 -- privilégios: tabela e função ---------------------------------------------------------------------
 SELECT ok(
@@ -55,81 +55,94 @@ SELECT is_empty(
   'totp_code_uses: nenhuma policy (RLS sem policy nega a quem não é dono)'
 );
 SELECT ok(
-  (SELECT p.prosecdef FROM pg_proc p WHERE p.oid = 'public.consume_totp_code(uuid, bytea)'::regprocedure),
+  (SELECT p.prosecdef FROM pg_proc p WHERE p.oid = 'public.consume_totp_code(uuid, uuid, bytea)'::regprocedure),
   'consume_totp_code: SECURITY DEFINER'
 );
 SELECT ok(
   (SELECT 'search_path=""' = ANY (p.proconfig) FROM pg_proc p
-    WHERE p.oid = 'public.consume_totp_code(uuid, bytea)'::regprocedure),
+    WHERE p.oid = 'public.consume_totp_code(uuid, uuid, bytea)'::regprocedure),
   'AC-25: consume_totp_code tem search_path vazio'
 );
 SELECT ok(
-  NOT has_function_privilege('anon', 'public.consume_totp_code(uuid, bytea)', 'EXECUTE'),
+  to_regprocedure('public.consume_totp_code(uuid, bytea)') IS NULL,
+  'F-65: a versão de dois argumentos, executável por authenticated, deixou de existir'
+);
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.consume_totp_code(uuid, uuid, bytea)', 'EXECUTE'),
   'consume_totp_code: anon não executa'
 );
 SELECT ok(
-  has_function_privilege('authenticated', 'public.consume_totp_code(uuid, bytea)', 'EXECUTE'),
-  'consume_totp_code: authenticated executa'
+  NOT has_function_privilege('authenticated', 'public.consume_totp_code(uuid, uuid, bytea)', 'EXECUTE'),
+  'F-65: consume_totp_code: authenticated NÃO executa (era um oráculo de código pelo PostgREST)'
 );
 SELECT ok(
-  NOT has_function_privilege('service_role', 'public.consume_totp_code(uuid, bytea)', 'EXECUTE'),
-  'consume_totp_code: service_role não executa (só o usuário, com a própria sessão)'
+  has_function_privilege('service_role', 'public.consume_totp_code(uuid, uuid, bytea)', 'EXECUTE'),
+  'F-65: consume_totp_code: service_role executa (o app a chama depois dos limites da rota)'
 );
 SELECT is_empty(
   $$ SELECT a.grantee
        FROM pg_proc p
       CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
-      WHERE p.oid = 'public.consume_totp_code(uuid, bytea)'::regprocedure
+      WHERE p.oid = 'public.consume_totp_code(uuid, uuid, bytea)'::regprocedure
         AND a.privilege_type = 'EXECUTE'
-        AND a.grantee NOT IN (p.proowner, 'authenticated'::regrole) $$,
-  'consume_totp_code: EXECUTE concedido apenas ao dono e a authenticated (nem PUBLIC)'
+        AND a.grantee NOT IN (p.proowner, 'service_role'::regrole) $$,
+  'consume_totp_code: EXECUTE concedido apenas ao dono e ao service_role (nem PUBLIC)'
 );
 
--- anon e sessão morta: negados ----------------------------------------------------------------------
+-- anon, authenticated e usuário que não existe: negados --------------------------------------------------
 SET LOCAL ROLE anon;
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000003c3',
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c3',
+                                      '00000000-0000-4000-8000-0000000003c3',
                                       decode(repeat('ab', 32), 'hex')) $$,
   '42501', NULL, 'consume_totp_code: anon é negado (42501)'
 );
 RESET ROLE;
 
-DELETE FROM auth.sessions WHERE id = '00000000-0000-4000-8000-0000000000c4';
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c4');
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000004c4',
-                                      decode(repeat('ab', 32), 'hex')) $$,
-  '42501', 'FORBIDDEN', 'consume_totp_code: sessão apagada (sem principal ativo) é FORBIDDEN'
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c1', f.factor_id, decode(repeat('ab', 32), 'hex'))
+       FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
+  '42501', NULL, 'F-65: nem o CEO atestado, com a própria sessão, queima código pelo PostgREST (42501)'
 );
 SELECT tests.clear_authentication();
 
+SET LOCAL ROLE service_role;
+SELECT throws_ok(
+  $$ SELECT public.consume_totp_code('99999999-9999-4999-8999-999999999999',
+                                      '00000000-0000-4000-8000-0000000004c4',
+                                      decode(repeat('ab', 32), 'hex')) $$,
+  '42501', 'FORBIDDEN', 'consume_totp_code: usuário que não existe é FORBIDDEN'
+);
+RESET ROLE;
+
 -- o dono consome; o mesmo código não é consumido duas vezes ---------------------------------------------
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1');
+SET LOCAL ROLE service_role;
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'one'),
   true,
   'F-21: o primeiro uso de um código é aceito'
 );
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'one'),
   false,
   'F-21: o mesmo código do mesmo fator, dentro da janela, é recusado (replay)'
 );
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'one'),
   false,
   'F-21: e continua recusado na terceira vez'
 );
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'two'),
   true,
   'F-21: outro código do mesmo fator é aceito'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 
 SELECT is(
   (SELECT count(*)::integer FROM private.totp_code_uses),
@@ -143,84 +156,89 @@ SELECT is(
 );
 
 -- o fator é do usuário: nenhum outro queima os códigos dele ---------------------------------------------
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c2');
+SET LOCAL ROLE service_role;
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code(f.factor_id, decode(repeat('ab', 32), 'hex'))
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c2', f.factor_id,
+                                      decode(repeat('ab', 32), 'hex'))
        FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
   'P0001', 'NOT_FOUND', 'F-21: o fator de outro CEO é NOT_FOUND (ninguém queima os códigos alheios)'
 );
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code('99999999-9999-4999-8999-999999999999',
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c2',
+                                      '99999999-9999-4999-8999-999999999999',
                                       decode(repeat('ab', 32), 'hex')) $$,
   'P0001', 'NOT_FOUND', 'F-21: um fator inexistente é NOT_FOUND, igual ao de outro usuário'
 );
-SELECT tests.clear_authentication();
+SELECT throws_ok(
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000a1', f.factor_id,
+                                      decode(repeat('ab', 32), 'hex'))
+       FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
+  'P0001', 'NOT_FOUND', 'F-21: um cliente também não alcança o fator de um CEO'
+);
+RESET ROLE;
 SELECT is(
   (SELECT count(*)::integer FROM private.totp_code_uses),
   2,
   'F-21: as tentativas sobre fator alheio ou inexistente não gravaram nada'
 );
 
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000a1');
-SELECT throws_ok(
-  $$ SELECT public.consume_totp_code(f.factor_id, decode(repeat('ab', 32), 'hex'))
-       FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
-  'P0001', 'NOT_FOUND', 'F-21: um cliente também não alcança o fator de um CEO'
-);
-SELECT tests.clear_authentication();
-
 -- um fator que não é TOTP não conta
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c5', 'ceo');
 INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, created_at, updated_at, phone)
 VALUES ('00000000-0000-4000-8000-0000000005c5', '00000000-0000-4000-8000-0000000000c5',
         'telefone', 'phone', 'verified', now(), now(), '+5511999990001');
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c5');
+SET LOCAL ROLE service_role;
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000005c5',
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c5',
+                                      '00000000-0000-4000-8000-0000000005c5',
                                       decode(repeat('ab', 32), 'hex')) $$,
   'P0001', 'NOT_FOUND', 'F-21: um fator que não é TOTP é NOT_FOUND'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 
 -- entrada inválida --------------------------------------------------------------------------------
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1');
+SET LOCAL ROLE service_role;
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code(f.factor_id, '\x0102'::bytea)
+  $$ SELECT public.consume_totp_code(f.user_id, f.factor_id, '\x0102'::bytea)
        FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
   'P0001', 'INVALID_INPUT', 'consume_totp_code: digest que não tem 32 bytes é INVALID_INPUT'
 );
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code(f.factor_id, NULL)
+  $$ SELECT public.consume_totp_code(f.user_id, f.factor_id, NULL)
        FROM factor_of f WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' $$,
   'P0001', 'INVALID_INPUT', 'consume_totp_code: digest nulo é INVALID_INPUT'
 );
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code(NULL, decode(repeat('ab', 32), 'hex')) $$,
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c1', NULL, decode(repeat('ab', 32), 'hex')) $$,
   'P0001', 'INVALID_INPUT', 'consume_totp_code: fator nulo é INVALID_INPUT'
 );
-SELECT tests.clear_authentication();
+SELECT throws_ok(
+  $$ SELECT public.consume_totp_code(NULL, '00000000-0000-4000-8000-0000000003c3', decode(repeat('ab', 32), 'hex')) $$,
+  'P0001', 'INVALID_INPUT', 'consume_totp_code: usuário nulo é INVALID_INPUT'
+);
+RESET ROLE;
 
 -- a janela de 120 s ----------------------------------------------------------------------------------
 -- (o teste roda numa transação só, e now() é fixo nela: o tempo é movido nas linhas gravadas)
 UPDATE private.totp_code_uses SET used_at = now() - interval '119 seconds';
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1');
+SET LOCAL ROLE service_role;
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'one'),
   false,
   'F-21: com o código usado há 119 s, o reuso ainda é recusado'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 
 UPDATE private.totp_code_uses SET used_at = now() - interval '121 seconds';
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1');
+SET LOCAL ROLE service_role;
 SELECT is(
-  (SELECT public.consume_totp_code(f.factor_id, d.value) FROM factor_of f, digest_of d
+  (SELECT public.consume_totp_code(f.user_id, f.factor_id, d.value) FROM factor_of f, digest_of d
     WHERE f.user_id = '00000000-0000-4000-8000-0000000000c1' AND d.name = 'one'),
   true,
   'F-21: com o código usado há 121 s, o mesmo digest volta a ser aceito (a janela passou)'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 SELECT is(
   (SELECT count(*)::integer FROM private.totp_code_uses),
   1,
@@ -329,11 +347,18 @@ SELECT is(
   'F-24, F-63: um fator verificado novo não devolve o acesso ao mesmo JWT aal2: o atestado era do fator removido'
 );
 SELECT tests.clear_authentication();
+-- F-64: nem um verify novo pelo backend atesta o fator que veio DEPOIS do primeiro (o c1 já teve um
+-- fator ativado): só o reset de MFA do operador (E-25) reabre isso
+SELECT throws_ok(
+  $$ SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2') $$,
+  'P0001', NULL, 'F-64: um fator novo, depois do primeiro ativado, não é atestado (factor_reenrolled), nem com um verify pelo backend'
+);
+SELECT tests.reset_first_activation('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT is(
   (SELECT count(*)::integer FROM public.clients),
   1,
-  'F-24: depois de um verify novo pelo backend (atestado do fator novo), o CEO lê os clientes'
+  'F-24: depois do reset do operador e de um verify novo pelo backend, o CEO lê os clientes'
 );
 SELECT tests.clear_authentication();
 
@@ -362,13 +387,14 @@ SELECT throws_ok(
 SELECT tests.clear_authentication();
 
 -- o dono queima código no fator AINDA NÃO verificado (é assim que a primeira ativação passa) -------------
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c3');
+SET LOCAL ROLE service_role;
 SELECT is(
-  public.consume_totp_code('00000000-0000-4000-8000-0000000003c3', decode(repeat('0c', 32), 'hex')),
+  public.consume_totp_code('00000000-0000-4000-8000-0000000000c3',
+                           '00000000-0000-4000-8000-0000000003c3', decode(repeat('0c', 32), 'hex')),
   true,
   'F-21: o dono queima um código no próprio fator não verificado (primeira ativação)'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 
 -- perfil desativado não queima código -----------------------------------------------------------------
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c7', 'ceo');
@@ -376,12 +402,13 @@ INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, c
 VALUES ('00000000-0000-4000-8000-0000000007c7', '00000000-0000-4000-8000-0000000000c7',
         'desativado', 'totp', 'verified', now(), now(), 'TESTSECRET');
 UPDATE public.profiles SET disabled_at = now() WHERE id = '00000000-0000-4000-8000-0000000000c7';
-SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c7', 'aal2');
+SET LOCAL ROLE service_role;
 SELECT throws_ok(
-  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000007c7', decode(repeat('0d', 32), 'hex')) $$,
+  $$ SELECT public.consume_totp_code('00000000-0000-4000-8000-0000000000c7',
+                                      '00000000-0000-4000-8000-0000000007c7', decode(repeat('0d', 32), 'hex')) $$,
   '42501', 'FORBIDDEN', 'consume_totp_code: perfil desativado é negado'
 );
-SELECT tests.clear_authentication();
+RESET ROLE;
 
 -- is_ceo() segue STABLE (as policies o chamam uma vez por consulta) -------------------------------------
 SELECT is(

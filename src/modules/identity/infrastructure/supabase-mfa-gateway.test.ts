@@ -38,8 +38,6 @@ function fakeSupabase(
     challenge?: Outcome;
     verify?: Outcome;
     signOut?: Outcome;
-    /** What `consume_totp_code` answers (default: the code is accepted). */
-    consume?: { data: unknown; error?: unknown; status?: number } | Error;
     /** What `list_backend_totp_factors` answers (default: the backend enrolled nothing). */
     registry?: { data: unknown; error?: unknown; status?: number } | Error;
     /** What `getClaims` answers (default: a verified token that names SESSION_ID). */
@@ -71,11 +69,6 @@ function fakeSupabase(
       const registry = options.registry ?? { data: [] };
       if (registry instanceof Error) return Promise.reject(registry);
       return Promise.resolve({ error: null, status: 200, ...registry });
-    }
-    if (name === 'consume_totp_code') {
-      const consume = options.consume ?? { data: true };
-      if (consume instanceof Error) return Promise.reject(consume);
-      return Promise.resolve({ error: null, status: 200, ...consume });
     }
     return {
       setHeader: () => undefined,
@@ -423,20 +416,18 @@ describe('SupabaseMfaGateway.enrollTotp', () => {
 });
 
 describe('SupabaseMfaGateway.verifyTotp', () => {
-  /** The backend records every challenge it creates: here the record always works. */
+  /** The replay guard and the record of the challenge live behind the admin path: here both work. */
+  const burnCode = vi.fn((_codeDigest: string) => Promise.resolve(ok<void>(undefined)));
   const recordChallenge = vi.fn(() => Promise.resolve(ok<void>(undefined)));
-  const input = { factorId: FACTOR_ID, code: '123456', recordChallenge };
+  const input = { factorId: FACTOR_ID, code: '123456', burnCode, recordChallenge };
 
   it('burns the code, challenges the factor, answers the challenge with the code and succeeds', async () => {
-    const { supabase, mfa, rpc } = fakeSupabase();
+    const { supabase, mfa } = fakeSupabase();
 
     const result = await createSupabaseMfaGateway(supabase).verifyTotp(input);
 
     expect(result).toEqual({ ok: true, value: { challengeId: CHALLENGE_ID } });
-    expect(rpc).toHaveBeenCalledWith('consume_totp_code', {
-      p_factor_id: FACTOR_ID,
-      p_code_digest: codeDigest(FACTOR_ID, '123456'),
-    });
+    expect(burnCode).toHaveBeenCalledWith(codeDigest(FACTOR_ID, '123456'));
     expect(mfa.challenge).toHaveBeenCalledWith({ factorId: FACTOR_ID });
     expect(mfa.verify).toHaveBeenCalledWith({
       factorId: FACTOR_ID,
@@ -445,14 +436,25 @@ describe('SupabaseMfaGateway.verifyTotp', () => {
     });
   });
 
-  it('F-21: the code is burned BEFORE the Auth server sees it', async () => {
-    const { supabase, mfa, rpc } = fakeSupabase();
+  it("F-65: the user's own session never burns the code: no RPC of the request client is made", async () => {
+    const { supabase, rpc } = fakeSupabase();
 
     await createSupabaseMfaGateway(supabase).verifyTotp(input);
 
-    const burned = rpc.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY;
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('F-21: the code is burned BEFORE the Auth server sees it, and what is burned is the digest, never the code', async () => {
+    const { supabase, mfa } = fakeSupabase();
+    const burn = vi.fn((_codeDigest: string) => Promise.resolve(ok<void>(undefined)));
+
+    await createSupabaseMfaGateway(supabase).verifyTotp({ ...input, burnCode: burn });
+
+    const burned = burn.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY;
     const challenged = mfa.challenge.mock.invocationCallOrder[0] ?? 0;
     expect(burned).toBeLessThan(challenged);
+    expect(burn.mock.calls[0]?.[0]).toMatch(/^\\x[0-9a-f]{64}$/);
+    expect(burn.mock.calls[0]?.[0]).not.toContain('123456');
   });
 
   it("F-63: the challenge is recorded as the backend's after Auth creates it and BEFORE Auth answers it", async () => {
@@ -495,26 +497,57 @@ describe('SupabaseMfaGateway.verifyTotp', () => {
     expect(mfa.verify).not.toHaveBeenCalled();
   });
 
-  it("F-63: nothing is recorded for a code that was never challenged (replayed, or not the account's)", async () => {
+  it('F-21: a replayed code (the burn is refused) is the refusal as it is, and neither Auth nor the record is touched', async () => {
+    const { supabase, mfa } = fakeSupabase();
     const record = vi.fn(() => Promise.resolve(ok<void>(undefined)));
-    const replay = fakeSupabase({ consume: { data: false } });
-    const foreign = fakeSupabase({
-      consume: { data: null, error: { code: 'P0001', message: 'NOT_FOUND' }, status: 400 },
-    });
+    const refusal = new InvalidMfaCodeError('code_reused', { factorId: FACTOR_ID });
 
-    await createSupabaseMfaGateway(replay.supabase).verifyTotp({
+    const result = await createSupabaseMfaGateway(supabase).verifyTotp({
       ...input,
-      recordChallenge: record,
-    });
-    await createSupabaseMfaGateway(foreign.supabase).verifyTotp({
-      ...input,
+      burnCode: () => Promise.resolve(err(refusal)),
       recordChallenge: record,
     });
 
+    expect(result).toEqual({ ok: false, error: refusal });
+    expect(mfa.challenge).not.toHaveBeenCalled();
+    expect(mfa.verify).not.toHaveBeenCalled();
     expect(record).not.toHaveBeenCalled();
   });
 
-  it('F-21: what the database receives is the SHA-256 of "<factorId>:<code>", never the code', () => {
+  it("F-20: a factor that is not the account's (the burn says so) is the refusal as it is, and the code is never tried", async () => {
+    const { supabase, mfa } = fakeSupabase();
+    const refusal = new InvalidMfaCodeError('factor_not_found', { factorId: FACTOR_ID });
+
+    const result = await createSupabaseMfaGateway(supabase).verifyTotp({
+      ...input,
+      burnCode: () => Promise.resolve(err(refusal)),
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.reason).toBe('factor_not_found');
+    expect(mfa.challenge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an Auth user that is gone (401)', new UnauthenticatedError('gone')],
+    ['the database down (503)', new ServiceUnavailableError('down')],
+    ['an answer it does not understand', new Error('not understood')],
+  ])(
+    'fail closed: %s while burning throws and nothing reaches the Auth server',
+    async (_label, thrown) => {
+      const { supabase, mfa } = fakeSupabase();
+
+      await expect(
+        createSupabaseMfaGateway(supabase).verifyTotp({
+          ...input,
+          burnCode: () => Promise.reject(thrown),
+        }),
+      ).rejects.toBe(thrown);
+      expect(mfa.challenge).not.toHaveBeenCalled();
+    },
+  );
+
+  it('F-21: what is burned is the SHA-256 of "<factorId>:<code>", never the code', () => {
     const digest = codeDigest(FACTOR_ID, '123456');
 
     expect(digest).toBe(`\\x${createHash('sha256').update(`${FACTOR_ID}:123456`).digest('hex')}`);
@@ -524,78 +557,6 @@ describe('SupabaseMfaGateway.verifyTotp', () => {
     expect(codeDigest(CHALLENGE_ID, '123456')).not.toBe(digest);
     expect(codeDigest(FACTOR_ID, '654321')).not.toBe(digest);
   });
-
-  it('F-21: a replayed code (the database says false) is InvalidMfaCodeError (code_reused) and the Auth server is never asked', async () => {
-    const { supabase, mfa } = fakeSupabase({ consume: { data: false } });
-
-    const result = await createSupabaseMfaGateway(supabase).verifyTotp(input);
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toBeInstanceOf(InvalidMfaCodeError);
-      expect(result.error.reason).toBe('code_reused');
-    }
-    expect(mfa.challenge).not.toHaveBeenCalled();
-    expect(mfa.verify).not.toHaveBeenCalled();
-  });
-
-  it('F-20: a factor that is not a TOTP factor of the account (NOT_FOUND) is InvalidMfaCodeError (factor_not_found), and the code is never tried', async () => {
-    const { supabase, mfa } = fakeSupabase({
-      consume: { data: null, error: { code: 'P0001', message: 'NOT_FOUND' }, status: 400 },
-    });
-
-    const result = await createSupabaseMfaGateway(supabase).verifyTotp(input);
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.reason).toBe('factor_not_found');
-    expect(mfa.challenge).not.toHaveBeenCalled();
-  });
-
-  it('a session with no active principal (42501) is UnauthenticatedError', async () => {
-    const { supabase, mfa } = fakeSupabase({
-      consume: { data: null, error: { code: '42501', message: 'FORBIDDEN' }, status: 403 },
-    });
-
-    await expect(createSupabaseMfaGateway(supabase).verifyTotp(input)).rejects.toBeInstanceOf(
-      UnauthenticatedError,
-    );
-    expect(mfa.challenge).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ['the database down (503)', { data: null, error: { code: '', message: 'x' }, status: 503 }],
-    ['a transport failure', new TypeError('fetch failed')],
-  ])('E-21: %s while burning the code is ServiceUnavailableError', async (_label, consume) => {
-    const { supabase, mfa } = fakeSupabase({ consume });
-
-    await expect(createSupabaseMfaGateway(supabase).verifyTotp(input)).rejects.toBeInstanceOf(
-      ServiceUnavailableError,
-    );
-    expect(mfa.challenge).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    [
-      'an error it does not know',
-      { data: null, error: { code: 'XX000', message: 'boom' }, status: 400 },
-    ],
-    ['an answer that is not a boolean', { data: 'yes' }],
-    ['no answer', { data: null }],
-  ])(
-    '%s while burning the code is a plain error (500): nothing reaches the Auth server',
-    async (_label, consume) => {
-      const { supabase, mfa } = fakeSupabase({ consume });
-
-      const failure = await createSupabaseMfaGateway(supabase)
-        .verifyTotp(input)
-        .catch((thrown: unknown) => thrown);
-
-      expect(failure).toBeInstanceOf(Error);
-      expect(failure).not.toBeInstanceOf(InvalidMfaCodeError);
-      expect(failure).not.toBeInstanceOf(ServiceUnavailableError);
-      expect(mfa.challenge).not.toHaveBeenCalled();
-    },
-  );
 
   it('E-28: a wrong code is InvalidMfaCodeError (invalid_code)', async () => {
     const { supabase } = fakeSupabase({

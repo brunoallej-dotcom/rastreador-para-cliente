@@ -83,3 +83,14 @@ export class MfaAlreadyEnrolledError extends DomainError {
     });
   }
 }
+
+/**
+ * The account already had its first TOTP factor activated through the backend, that factor no longer
+ * exists (someone deleted it straight at the Auth server, F-64) and a new enrollment came. The answer
+ * is the same 409 as a verified factor that exists: the client learns nothing more. Every session of
+ * the user was deleted by the database, and the log raises `auth.mfa.reenrollment_refused`. Only the
+ * operator's MFA reset (E-25, Wave 11) lets the account enroll again.
+ */
+export class MfaReenrollmentRefusedError extends MfaAlreadyEnrolledError {
+  readonly reason = 'factor_reenrolled';
+}

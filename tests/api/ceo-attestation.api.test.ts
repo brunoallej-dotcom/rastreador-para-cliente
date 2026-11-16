@@ -7,12 +7,14 @@
 // Auth directly with supabase-js, exactly as anyone could. What the backend does about it is what is
 // being checked: a session he elevates there is not a CEO's, and a code he finds there is no use at the
 // backend.
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { afterEach, beforeEach, describe, expect, it, onTestFailed, vi } from 'vitest';
 import { POST as loginRoute } from '@/app/api/v1/auth/login/route';
 import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import type * as LoggerModule from '@/shared/observability/logger';
+import type { Database } from '@/shared/db/database.types';
 import { timing } from '@/shared/http/response-floor';
-import { agePasswordBaseline } from '../helpers/db';
+import { agePasswordBaseline, resetFirstActivation } from '../helpers/db';
 import { listClientsViaApi } from '../helpers/clients';
 import { expectToMatchContract } from '../helpers/contract';
 import {
@@ -38,6 +40,7 @@ import {
 } from '../helpers/http';
 import {
   enrollTotp,
+  enrollTotpViaApi,
   factorsOf,
   loginAsCeoReadyToEnroll,
   loginAsCeoWithMfa,
@@ -489,6 +492,11 @@ describe('E-37: fail closed', () => {
 
     expect(failed.status).toBe(503);
     expectToMatchContract('verifyTotp', 503, await bodyOf(failed), failed);
+    // the 503 tells the CEO what to do: this code is burned, wait for the next one
+    expect(await bodyOf(failed)).toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+      detail: expect.stringContaining('next code') as string,
+    });
     // the Auth server did take the code (the session is aal2 there) but nothing is attested
     expect(await factorsOf(ceo.id)).toEqual([
       { id: enrollment.factorId, type: 'totp', status: 'verified' },
@@ -500,11 +508,42 @@ describe('E-37: fail closed', () => {
     expect(await listClientsStatus(cookies)).toBe(403);
 
     // the CEO verifies again with the next code: the activation by the backend is recovered from the
-    // challenge that did verify the factor, and the session is attested
-    const retry = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+    // challenge that did verify the factor, and the session is attested. The principal of the retry
+    // is a returning one (VERIFY_MFA, no ENROLL_MFA), but the database says it ACTIVATED the factor now,
+    // so the other sessions of the CEO are signed out all the same (F-72)
+    const retrySpy = spyOnSupabaseFetch();
+    let retry: Response;
+    try {
+      retry = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+    } finally {
+      retrySpy.restore();
+    }
     expect(retry.status).toBe(200);
     expect(await bodyOf(retry)).toMatchObject({ aal: 'aal2', pendingActions: [] });
     expect(await listClientsStatus(cookies)).toBe(200);
+    const revocations = (calls: string[]) =>
+      calls.filter((call) => call.includes('/auth/v1/logout') && call.includes('scope=others'));
+    expect(revocations(spy.calls)).toEqual([]); // the 503 attempt revoked nothing
+    expect(revocations(retrySpy.calls)).toHaveLength(1); // the recovery did (F-72)
+    expect(events('auth.mfa.verified').at(-1)).toMatchObject({ activated: true });
+  });
+
+  it('F-72: a verification of a factor the database had ALREADY activated does not sign the other sessions out', async () => {
+    const legit = await loginAsCeoWithMfa();
+    const secondLogin = await loginViaApi(legit.ceo);
+    const spy = spyOnSupabaseFetch();
+    try {
+      const verified = await verifyTotpViaApi(secondLogin, { code: nextTotpCode(legit.secret) });
+      expect(verified.status).toBe(200);
+    } finally {
+      spy.restore();
+    }
+
+    expect(
+      spy.calls.filter((call) => call.includes('/auth/v1/logout') && call.includes('scope=others')),
+    ).toEqual([]);
+    expect(events('auth.mfa.verified').at(-1)).toMatchObject({ activated: false });
+    expect(await listClientsStatus(legit.cookies)).toBe(200); // the first session is untouched
   });
 
   it('E-37: when the challenge cannot be recorded the code is never tried at Auth', async () => {
@@ -531,6 +570,133 @@ describe('E-37: fail closed', () => {
       aal: 'aal1',
       pendingActions: ['VERIFY_MFA'],
     });
+  });
+});
+
+// --------------------------------------------------------------------------------- F-64 ----
+
+describe('F-64: deleting the CEO factor at Auth does not let anyone enroll a new one', () => {
+  it('the attacker deletes the verified factor with an aal2 he got at Auth, then enrolls through the backend: refused with a 409, an alert, every session gone; only the operator reset reopens the enrollment', async () => {
+    const legit = await loginAsCeoWithMfa();
+    // the attacker: password, the publishable key and a code he found at Auth. With the aal2 session
+    // that gives him, Auth lets him delete the factor (it asks for aal2, which he has)
+    const attacker = await directAal2Session(
+      legit.ceo,
+      { factorId: legit.factorId, secret: legit.secret },
+      nextTotpCode(legit.secret),
+    );
+    const attackerCookies = await cookiesOf(attacker.supabase);
+    const removed = await attacker.supabase.auth.mfa.unenroll({ factorId: legit.factorId });
+    expect(removed.error).toBeNull();
+    expect(await factorsOf(legit.ceo.id)).toEqual([]);
+
+    // the CEO's attested session lost its power with the factor (F-24); the account is back to ENROLL_MFA
+    expect(await listClientsStatus(legit.cookies)).not.toBe(200);
+
+    // the attacker comes through the backend with the password and tries to enroll HIS factor
+    const viaBackend = await loginViaApi(legit.ceo);
+    expect(await getSession(viaBackend).then(bodyOf)).toMatchObject({
+      pendingActions: ['ENROLL_MFA'],
+    });
+    logged.lines.length = 0;
+
+    const response = await enrollTotpViaApi(viaBackend);
+
+    // the usual 409 (nothing new for the client), the alert and the sessions
+    expect(response.status).toBe(409);
+    expectToMatchContract('enrollTotp', 409, await bodyOf(response), response);
+    expect(await bodyOf(response)).toMatchObject({ code: 'MFA_ALREADY_ENROLLED' });
+    expect(events('auth.mfa.reenrollment_refused')).toEqual([
+      expect.objectContaining({ level: 'error', userId: legit.ceo.id }),
+    ]);
+    for (const jar of [viaBackend, attackerCookies, legit.cookies]) {
+      expect((await getSession(jar)).status).toBe(401);
+    }
+    expect(await auditOf(legit.ceo.id, 'auth.mfa_attestation_refused')).toEqual([
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          reason: 'factor_reenrolled',
+          severity: 'alert',
+          revoked: true,
+        }) as unknown,
+      }),
+    ]);
+
+    // signing in again does not help: the mark of the first activation outlived the factor
+    const again = await loginViaApi(legit.ceo);
+    expect((await enrollTotpViaApi(again)).status).toBe(409);
+    expect((await getSession(again)).status).toBe(401);
+
+    // only the operator's reset (E-25) deletes the mark, and then the CEO enrolls and activates anew
+    expect(await resetFirstActivation(legit.ceo.id)).toBe(true);
+    const fresh = await loginViaApi(legit.ceo);
+    const enrollment = await enrollTotp(fresh);
+    const verified = await verifyTotpViaApi(fresh, { code: nextTotpCode(enrollment.secret) });
+    expect(verified.status).toBe(200);
+    expect(await listClientsStatus(fresh)).toBe(200);
+  });
+
+  it('F-64: a CEO that never activated a factor is not affected: the enrollment can be repeated (E-26) and activated', async () => {
+    const { cookies } = await loginAsCeoReadyToEnroll();
+    await enrollTotp(cookies);
+    const second = await enrollTotp(cookies); // replaces the first candidate (E-26)
+
+    const verified = await verifyTotpViaApi(cookies, { code: nextTotpCode(second.secret) });
+
+    expect(verified.status).toBe(200);
+    expect(await listClientsStatus(cookies)).toBe(200);
+  });
+});
+
+// --------------------------------------------------------------------------------- F-65 ----
+
+describe('F-65: the replay guard is not a code oracle at PostgREST', () => {
+  it('a session that is not even a CEO (an aal2 straight at Auth) cannot call consume_totp_code, in either signature', async () => {
+    const legit = await loginAsCeoWithMfa();
+    const attacker = await directAal2Session(
+      legit.ceo,
+      { factorId: legit.factorId, secret: legit.secret },
+      nextTotpCode(legit.secret),
+    );
+    const digest = `\\x${'ab'.repeat(32)}`;
+
+    const threeArguments = await attacker.supabase.rpc('consume_totp_code', {
+      p_user_id: legit.ceo.id,
+      p_factor_id: legit.factorId,
+      p_code_digest: digest,
+    });
+    const twoArguments = await attacker.supabase.rpc('consume_totp_code', {
+      p_factor_id: legit.factorId,
+      p_code_digest: digest,
+    } as never);
+
+    expect(threeArguments.error?.code).toBe('42501');
+    expect(threeArguments.data).toBeNull();
+    expect(twoArguments.error).not.toBeNull();
+    expect(twoArguments.data).toBeNull();
+  });
+
+  it('nor can the attested CEO session itself: the burn belongs to the admin path, behind the limits of the route', async () => {
+    const legit = await loginAsCeoWithMfa();
+    const holder = createSupabaseClient<Database>(
+      process.env.SUPABASE_URL ?? '',
+      process.env.SUPABASE_PUBLISHABLE_KEY ?? '',
+      {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          headers: { Authorization: `Bearer ${readSessionCookie(legit.cookies).access_token}` },
+        },
+      },
+    );
+
+    const result = await holder.rpc('consume_totp_code', {
+      p_user_id: legit.ceo.id,
+      p_factor_id: legit.factorId,
+      p_code_digest: `\\x${'cd'.repeat(32)}`,
+    });
+
+    expect(result.error?.code).toBe('42501');
+    expect(result.data).toBeNull();
   });
 });
 

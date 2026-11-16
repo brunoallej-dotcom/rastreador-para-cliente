@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConflictError, ServiceUnavailableError, type Principal } from '@/shared/kernel';
-import { MfaAlreadyEnrolledError } from '../domain/mfa-errors';
+import { MfaAlreadyEnrolledError, MfaReenrollmentRefusedError } from '../domain/mfa-errors';
 import { createFakeMfa, FAKE_SESSION_ID } from './fake-mfa';
 import { enrollTotp } from './enroll-totp';
 
@@ -239,5 +239,23 @@ describe('enrollTotp: the backend records the factor it enrolled (ADR 0013, F-60
     const stale = mfa.factors();
     expect(stale).toHaveLength(1);
     expect(mfa.backendFactors()).toEqual([]);
+  });
+});
+
+describe('enrollTotp: the first factor is only enrolled once (F-64)', () => {
+  it('a registration the database refuses because the account already had its first factor activated is the usual 409, and no secret is returned', async () => {
+    const mfa = createFakeMfa();
+    mfa.attestor.refuseNextRegistrationAsReenrollment();
+
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBeInstanceOf(MfaReenrollmentRefusedError);
+    expect(result.error).toBeInstanceOf(MfaAlreadyEnrolledError);
+    expect(result.error.code).toBe('MFA_ALREADY_ENROLLED');
+    expect(result.error.detail).toBe(
+      'An authenticator app is already registered for this account.',
+    );
   });
 });

@@ -319,6 +319,45 @@ describe('src/shared/ never imports modules', () => {
   });
 });
 
+describe('src/ never imports test code (fixtures use the secret key)', () => {
+  const importOf = (source: string) => `import { x } from '${source}';\nexport const y = x;`;
+
+  it.each([
+    ['a handler', 'src/modules/identity/presentation/login.handler.ts'],
+    ['identity infrastructure', 'src/modules/identity/infrastructure/supabase-mfa-gateway.ts'],
+    ['the shared pipeline', 'src/shared/http/with-route.ts'],
+    ['a test beside the code', 'src/modules/identity/application/login.test.ts'],
+    ['the rate limiter', 'src/shared/http/rate-limit/postgres-rate-limiter.ts'],
+  ])('refuses tests/helpers/fixtures from %s, by a relative path', async (_label, file) => {
+    const depth = file.split('/').length - 1;
+    const source = `${'../'.repeat(depth)}tests/helpers/fixtures`;
+    expect(await violations(file, importOf(source)), file).toContain('no-restricted-imports');
+  });
+
+  it.each([
+    'tests/helpers/mfa',
+    'tests/helpers/db',
+    'tests/helpers/clients',
+    'tests/setup/local-env',
+  ])('refuses %s', async (target) => {
+    const file = 'src/modules/identity/infrastructure/x.ts';
+    expect(await violations(file, importOf(`../../../../${target}`))).toContain(
+      'no-restricted-imports',
+    );
+  });
+
+  it('still lets a unit test beside the code use the contract validator (no key, no database)', async () => {
+    const file = 'src/modules/platform/presentation/health.handler.test.ts';
+    const code = importOf('../../../../tests/helpers/contract');
+    expect(await violations(file, code)).toEqual([]);
+  });
+
+  it('is not fooled by a path that merely contains "tests"', async () => {
+    const file = 'src/modules/identity/infrastructure/x.ts';
+    expect(await violations(file, importOf('../domain/tests-of-nothing'))).toEqual([]);
+  });
+});
+
 describe('the admin client (secret key, bypasses RLS) has exactly two doors', () => {
   const ADMIN = '@/shared/db/admin-client';
   const importAdmin = (source = ADMIN) =>

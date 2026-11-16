@@ -3,7 +3,7 @@ import { ServiceUnavailableError, UnauthenticatedError, type Principal } from '@
 import { InvalidMfaCodeError } from '../domain/mfa-errors';
 import { createFakeClientDirectory } from './fakes';
 import { createFakeMfa, FAKE_SESSION_ID, FAKE_VALID_CODE } from './fake-mfa';
-import { verifyTotp } from './verify-totp';
+import { NEXT_CODE_HINT, verifyTotp } from './verify-totp';
 
 const FACTOR = '00000000-0000-4000-8000-0000000000a1';
 const USER_ID = '11111111-1111-4111-8111-111111111111';
@@ -24,6 +24,7 @@ const elevated: Principal = { ...enrolling, aal: 'aal2', pendingActions: [] };
 const input = { factorId: FACTOR, code: FAKE_VALID_CODE };
 
 /** The calls of a verification that gets all the way through, for a factor (see the fake's challenge ids). */
+const burned = (factorId: string) => `burn:${factorId}`;
 const recorded = (factorId: string, n = 1) => `record:${factorId}:challenge-${n}`;
 const attested = (factorId: string, n = 1) =>
   `attest:${FAKE_SESSION_ID}:${factorId}:challenge-${n}`;
@@ -66,7 +67,7 @@ describe('verifyTotp', () => {
       expect((result.error as InvalidMfaCodeError).reason).toBe('invalid_code');
     }
     expect(mfa.elevated()).toBe(false);
-    expect(mfa.calls).toEqual([`verify:${FACTOR}`, recorded(FACTOR)]);
+    expect(mfa.calls).toEqual([`verify:${FACTOR}`, burned(FACTOR), recorded(FACTOR)]);
   });
 
   it('E-28: a factor the account does not have answers like a wrong code, with its own reason for the log', async () => {
@@ -178,6 +179,7 @@ describe('verifyTotp: the first activation signs the other sessions out', () => 
 
     expect(mfa.calls).toEqual([
       `verify:${FACTOR}`,
+      burned(FACTOR),
       recorded(FACTOR),
       'current',
       'session',
@@ -224,6 +226,7 @@ describe('verifyTotp without a factor id (the factor of the session, E-31)', () 
     expect(mfa.calls).toEqual([
       'list',
       `verify:${FACTOR}`,
+      burned(FACTOR),
       recorded(FACTOR),
       'current',
       'session',
@@ -307,6 +310,7 @@ describe('verifyTotp without a factor id (the factor of the session, E-31)', () 
     expect(result.ok).toBe(true);
     expect(mfa.calls).toEqual([
       `verify:${FACTOR}`,
+      burned(FACTOR),
       recorded(FACTOR),
       'current',
       'session',
@@ -637,5 +641,105 @@ describe('verifyTotp: the attestation of the session (ADR 0013, F-50 b, F-63)', 
     await verifyTotp(d, returning, { factorId: FACTOR, ...code });
 
     expect(mfa.attestor.attestations().map(({ userId }) => userId)).toEqual([USER_ID]);
+  });
+});
+
+describe('verifyTotp: the review of Wave 6.1 (F-65, F-72, E-37)', () => {
+  const OTHER = '00000000-0000-4000-8000-0000000000a2';
+
+  it('F-65: the code is burned through the attestor (the admin path), with the id of the principal, never the code', async () => {
+    const { mfa, deps: d } = deps();
+
+    await verifyTotp(d, enrolling, input);
+
+    expect(mfa.attestor.burnedCodes()).toHaveLength(1);
+    expect(mfa.attestor.burnedCodes()[0]).toContain(FACTOR);
+    expect(mfa.attestor.burnedCodes().join('')).not.toContain(FAKE_VALID_CODE);
+    expect(mfa.calls.indexOf(burned(FACTOR))).toBeLessThan(mfa.calls.indexOf(recorded(FACTOR)));
+  });
+
+  it("F-65: a factor that is not the account's is refused by the burn, before the challenge is recorded", async () => {
+    const { mfa, deps: d } = deps();
+
+    const result = await verifyTotp(d, returning, { factorId: OTHER, code: FAKE_VALID_CODE });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect((result.error as InvalidMfaCodeError).reason).toBe('factor_not_found');
+    expect(mfa.calls).toEqual([`verify:${OTHER}`, burned(OTHER)]);
+  });
+
+  it('F-72: it is the ATTESTATION that says the factor was activated: a retry whose principal no longer has ENROLL_MFA still signs the other sessions out', async () => {
+    // Auth already verified the factor on the first try (its attestation failed); the retry's principal
+    // is a returning one (VERIFY_MFA), but the database has not activated the factor yet
+    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: false }] });
+
+    const result = await verifyTotp(d, returning, input);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.activated).toBe(true);
+    expect(result.value.otherSessionsRevoked).toBe(true);
+    expect(mfa.revocations()).toBe(1);
+  });
+
+  it('F-72: a factor the database had already activated is not activated again: nobody is signed out, whatever the pending actions say', async () => {
+    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true, activated: true }] });
+
+    const result = await verifyTotp(d, enrolling, input);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.activated).toBe(false);
+    expect(result.value.otherSessionsRevoked).toBeNull();
+    expect(mfa.revocations()).toBe(0);
+  });
+
+  it.each([
+    ['burning the code', 'burn'],
+    ['recording the challenge', 'record'],
+    ['attesting the session', 'attest'],
+  ] as const)(
+    'E-37: a 503 while %s says the code is burned: wait for the next one (NEXT_CODE_HINT)',
+    async (_label, step) => {
+      const { mfa, deps: d } = deps();
+      mfa.attestor.failWith(step);
+
+      const failure = await verifyTotp(d, enrolling, input).catch((thrown: unknown) => thrown);
+
+      expect(failure).toBeInstanceOf(ServiceUnavailableError);
+      expect((failure as ServiceUnavailableError).detail).toBe(NEXT_CODE_HINT);
+      expect(NEXT_CODE_HINT).toMatch(/next code/);
+    },
+  );
+
+  it('E-37: an Auth outage while verifying says the same', async () => {
+    const { mfa, deps: d } = deps();
+    mfa.failWith('verify');
+
+    const failure = await verifyTotp(d, enrolling, input).catch((thrown: unknown) => thrown);
+
+    expect((failure as ServiceUnavailableError).detail).toBe(NEXT_CODE_HINT);
+  });
+
+  it('E-37: an outage BEFORE the code is burned (listing the factors) does not promise the code is burned', async () => {
+    const { mfa, deps: d } = deps();
+    mfa.failWith('list');
+
+    const failure = await verifyTotp(d, enrolling, { code: FAKE_VALID_CODE }).catch(
+      (thrown: unknown) => thrown,
+    );
+
+    expect(failure).toBeInstanceOf(ServiceUnavailableError);
+    expect((failure as ServiceUnavailableError).detail).toBeUndefined();
+  });
+
+  it('E-37: the hint keeps the error a ServiceUnavailableError and the original as its cause', async () => {
+    const { mfa, deps: d } = deps();
+    mfa.attestor.failWith('attest');
+
+    const failure = await verifyTotp(d, enrolling, input).catch((thrown: unknown) => thrown);
+
+    expect(failure).toBeInstanceOf(ServiceUnavailableError);
+    expect((failure as Error).cause).toBeInstanceOf(ServiceUnavailableError);
   });
 });

@@ -170,8 +170,19 @@ const ADMIN_CLIENT = pattern(
 );
 
 /**
- * no-restricted-imports options. `next/headers`, non-canonical specifiers and the admin client are
- * forbidden everywhere in src/. Later config objects REPLACE earlier ones for the same rule, so
+ * Production code never imports test code. `tests/helpers/*` build fixtures and users with the secret
+ * key and attest sessions the way the backend does; `tests/setup` and `tests/stubs` wire the test runner.
+ * The one exception is `tests/helpers/contract` (the OpenAPI validator, no key, no database), which the
+ * unit tests that live beside the code use to check a response against the contract.
+ */
+const TESTS_DIRECTORY = pattern(
+  String.raw`(?:^|/)tests/(?!helpers/contract(?:\.[cm]?[jt]sx?)?$)`,
+  'src/ never imports from tests/ (fixtures use the secret key and are test code); only tests/helpers/contract, the OpenAPI validator, may be imported by the unit tests beside the code.',
+);
+
+/**
+ * no-restricted-imports options. `next/headers`, non-canonical specifiers, the tests directory and the
+ * admin client are forbidden everywhere in src/. Later config objects REPLACE earlier ones for the same rule, so
  * each layer lists its full set: going through this helper is what puts the shared patterns in
  * every list.
  * @param {readonly { regex: string, message: string }[]} always
@@ -179,7 +190,10 @@ const ADMIN_CLIENT = pattern(
  */
 const restrictImportsWith = (always, ...patterns) => [
   'error',
-  { paths: [NEXT_HEADERS], patterns: [NON_CANONICAL_SPECIFIER, ...always, ...patterns] },
+  {
+    paths: [NEXT_HEADERS],
+    patterns: [NON_CANONICAL_SPECIFIER, TESTS_DIRECTORY, ...always, ...patterns],
+  },
 ];
 
 /** @param {...{ regex: string, message: string }} patterns */

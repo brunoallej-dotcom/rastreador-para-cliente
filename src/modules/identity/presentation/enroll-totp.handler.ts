@@ -1,6 +1,7 @@
 import { getRequestSupabase } from '@/shared/db/server-client';
 import { clientIpFingerprint, json, withRoute, type WithRoute } from '@/shared/http';
 import { enrollTotp } from '../application/enroll-totp';
+import { MfaReenrollmentRefusedError } from '../domain/mfa-errors';
 import { createSupabaseMfaAttestor } from '../infrastructure/supabase-mfa-attestor';
 import { createSupabaseMfaGateway } from '../infrastructure/supabase-mfa-gateway';
 import { toTotpEnrollmentDto } from './totp.dto';
@@ -44,7 +45,22 @@ export function createEnrollTotpHandler(route: WithRoute = withRoute) {
         { mfa: createSupabaseMfaGateway(supabase), attestor: createSupabaseMfaAttestor() },
         principal,
       );
-      if (!result.ok) return result.error;
+      if (!result.ok) {
+        // F-64: the account had its first factor activated, someone deleted it straight at Auth and a
+        // new enrollment came. The database deleted every session; the answer is the usual 409. A
+        // stable name at error level, so an alert can be built on it.
+        if (result.error instanceof MfaReenrollmentRefusedError) {
+          logger.error(
+            {
+              event: 'auth.mfa.reenrollment_refused',
+              userId: principal.userId,
+              ipHash: clientIpFingerprint(request),
+            },
+            'auth.mfa.reenrollment_refused',
+          );
+        }
+        return result.error;
+      }
 
       const { enrollment, replacedFactors } = result.value;
       // Ids and a count only. Never the secret, the URI or the QR code (they are in the response).

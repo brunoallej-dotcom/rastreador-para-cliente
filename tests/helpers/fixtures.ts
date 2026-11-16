@@ -263,7 +263,11 @@ export async function ceoAal2Client(init: UserInit = {}): Promise<CeoAal2> {
     p_factor_id: factorId,
     p_session_id: sessionId,
   });
-  if (registered.error) throw new Error(`register factor failed: ${registered.error.message}`);
+  if (registered.error || registered.data !== 'registered') {
+    throw new Error(
+      `register factor failed: ${registered.error?.message ?? String(registered.data)}`,
+    );
+  }
 
   const challenge = await supabase.auth.mfa.challenge({ factorId });
   if (challenge.error) throw new Error(`TOTP challenge failed: ${challenge.error.message}`);
@@ -289,7 +293,7 @@ export async function ceoAal2Client(init: UserInit = {}): Promise<CeoAal2> {
     p_factor_id: factorId,
     p_challenge_id: challengeId,
   });
-  if (attested.error || attested.data !== 'attested') {
+  if (attested.error || (attested.data !== 'attested' && attested.data !== 'attested_activated')) {
     throw new Error(`attest session failed: ${attested.error?.message ?? String(attested.data)}`);
   }
 

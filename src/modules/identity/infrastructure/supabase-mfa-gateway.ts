@@ -41,11 +41,6 @@ const SESSION_GONE_CODES: ReadonlySet<string> = new Set([
   'user_not_found',
 ]);
 
-/** `PostgREST` answer of `consume_totp_code`: SQLSTATE `P0001` with the catalog `MESSAGE`. */
-const SQL_BUSINESS_RULE = 'P0001';
-const SQL_NOT_FOUND = 'NOT_FOUND';
-const SQL_INSUFFICIENT_PRIVILEGE = '42501';
-
 /**
  * What the Auth server answers for the factors of the user. Only the type is read from every entry:
  * the TOTP ones are filtered FIRST and only then parsed strictly (`totpFactorSchema`), so a factor
@@ -224,39 +219,15 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       return ok({ factorId: id, uri: totp.uri, secret: totp.secret, qrCode: totp.qr_code });
     },
 
-    async verifyTotp({ factorId, code, recordChallenge }) {
+    async verifyTotp({ factorId, code, burnCode, recordChallenge }) {
       // 1. Burn the code BEFORE the Auth server sees it (F-21): the Auth server accepts the same
       //    code again inside its window, the database does not. A wrong code is burned too, which
-      //    costs nothing (a code is single-use whatever its fate). The database also checks that
-      //    the factor is a TOTP factor of THIS user, so nobody burns another account's codes.
-      const consumed = await attempt(
-        'burn a TOTP code',
-        async () =>
-          await supabase.rpc('consume_totp_code', {
-            p_factor_id: factorId,
-            p_code_digest: codeDigest(factorId, code),
-          }),
-      );
-      if (consumed.error) {
-        const { code: sqlState, message } = consumed.error;
-        if (sqlState === SQL_BUSINESS_RULE && message === SQL_NOT_FOUND) {
-          return err(
-            new InvalidMfaCodeError('factor_not_found', { cause: consumed.error, factorId }),
-          );
-        }
-        // no active principal: the session ended after the pipeline accepted it
-        if (sqlState === SQL_INSUFFICIENT_PRIVILEGE) {
-          throw new UnauthenticatedError('burn a TOTP code: no active principal', {
-            cause: consumed.error,
-            detail: 'Authentication required.',
-          });
-        }
-        throw upstreamFailure('burn a TOTP code', consumed.error, consumed.status);
-      }
-      if (consumed.data === false) return err(new InvalidMfaCodeError('code_reused', { factorId }));
-      if (consumed.data !== true) {
-        throw new Error('burn a TOTP code: an answer that is not understood');
-      }
+      //    costs nothing (a code is single-use whatever its fate). The burn is the ADMIN path's, not
+      //    this client's (F-65): with the user's own session it was a code oracle at PostgREST. It
+      //    also checks that the factor is a TOTP factor of THIS user, so nobody burns another
+      //    account's codes. What it receives is the digest, never the code.
+      const burned = await burnCode(codeDigest(factorId, code));
+      if (!burned.ok) return burned;
 
       // 2. The Auth server's own challenge and verification.
       const challenge = await attempt('challenge a factor', () =>

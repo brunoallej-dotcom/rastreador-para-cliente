@@ -44,6 +44,7 @@ describe('getAdminFacade', () => {
     expect(Object.keys(facade).sort()).toEqual([
       'attestMfaSession',
       'authAdmin',
+      'consumeTotpCode',
       'rateLimitHit',
       'recordBackendMfaChallenge',
       'registerBackendTotpFactor',
@@ -99,31 +100,65 @@ describe('getAdminFacade', () => {
       'register_backend_totp_factor',
       { userId: 'u', factorId: 'f', sessionId: 's' },
       { p_user_id: 'u', p_factor_id: 'f', p_session_id: 's' },
+      'registered',
+    ],
+    [
+      'registerBackendTotpFactor',
+      'register_backend_totp_factor',
+      { userId: 'u', factorId: 'f', sessionId: 's' },
+      { p_user_id: 'u', p_factor_id: 'f', p_session_id: 's' },
+      'factor_reenrolled',
     ],
     [
       'recordBackendMfaChallenge',
       'record_backend_mfa_challenge',
       { userId: 'u', factorId: 'f', challengeId: 'c' },
       { p_user_id: 'u', p_factor_id: 'f', p_challenge_id: 'c' },
+      null,
     ],
     [
       'attestMfaSession',
       'attest_mfa_session',
       { userId: 'u', sessionId: 's', factorId: 'f', challengeId: 'c' },
       { p_user_id: 'u', p_session_id: 's', p_factor_id: 'f', p_challenge_id: 'c' },
+      'attested_activated',
+    ],
+    [
+      'consumeTotpCode',
+      'consume_totp_code',
+      { userId: 'u', factorId: 'f', codeDigest: '\\x00' },
+      { p_user_id: 'u', p_factor_id: 'f', p_code_digest: '\\x00' },
+      true,
     ],
   ] as const)(
-    'F-63: %s calls the %s RPC with the secret key and the typed parameters, and returns the answer',
-    async (method, rpcName, input, body) => {
-      const calls = stubFetch(() => json('attested'));
+    'F-63: %s calls the %s RPC with the secret key and the typed parameters, and returns the validated answer (%j)',
+    async (method, rpcName, input, body, reply) => {
+      const calls = stubFetch(() => json(reply));
 
       const answer = await getAdminFacade()[method](input as never);
 
-      expect(answer).toEqual({ data: 'attested', error: null, status: 200 });
+      expect(answer).toEqual({ data: reply, error: null, status: 200 });
       expect(calls).toHaveLength(1);
       expect(calls[0]?.url).toContain(`/rest/v1/rpc/${rpcName}`);
       expect(calls[0]?.headers.get('apikey')).toBe(FAKE_ENV.SUPABASE_SECRET_KEY);
       expect(JSON.parse(calls[0]?.body ?? '{}')).toEqual(body);
+    },
+  );
+
+  it.each([
+    ['registerBackendTotpFactor', { userId: 'u', factorId: 'f', sessionId: 's' }, 'maybe'],
+    ['registerBackendTotpFactor', { userId: 'u', factorId: 'f', sessionId: 's' }, null],
+    ['recordBackendMfaChallenge', { userId: 'u', factorId: 'f', challengeId: 'c' }, 'done'],
+    ['attestMfaSession', { userId: 'u', sessionId: 's', factorId: 'f', challengeId: 'c' }, true],
+    ['attestMfaSession', { userId: 'u', sessionId: 's', factorId: 'f', challengeId: 'c' }, null],
+    ['consumeTotpCode', { userId: 'u', factorId: 'f', codeDigest: '\\x00' }, 'yes'],
+    ['consumeTotpCode', { userId: 'u', factorId: 'f', codeDigest: '\\x00' }, null],
+  ] as const)(
+    'F-63: %s fails closed on a payload the schema of that function does not accept (%j)',
+    async (method, input, reply) => {
+      stubFetch(() => json(reply));
+
+      await expect(getAdminFacade()[method](input as never)).rejects.toThrow(/not understood/);
     },
   );
 

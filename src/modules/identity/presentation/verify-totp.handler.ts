@@ -7,6 +7,7 @@ import {
 import { clientIpFingerprint, json, withRoute, type WithRoute } from '@/shared/http';
 import { verifyTotp } from '../application/verify-totp';
 import { InvalidMfaCodeError } from '../domain/mfa-errors';
+import { ATTESTATION_ATTACK_SIGNALS } from '../domain/mfa-ports';
 import { createSupabaseMfaAttestor } from '../infrastructure/supabase-mfa-attestor';
 import { createSupabaseMfaGateway } from '../infrastructure/supabase-mfa-gateway';
 import { createTrackingClientDirectory } from '../infrastructure/tracking-client-directory';
@@ -128,7 +129,13 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
           // activated was used (F-61). Every session of the CEO is already gone. The response is the
           // same 422; this line is how the people find out.
           if (result.error.reason === 'attestation_refused') {
-            logger.error(
+            // a race or an inconsistency (F-66) refuses without revoking and is a warning; a sign of
+            // an attack, which deleted every session, is an alert. The ALERT also comes from the audit
+            // trail (`auth.mfa_attestation_refused`), which survives a 503 after the COMMIT (F-68).
+            const sign =
+              result.error.attestationReason !== undefined &&
+              ATTESTATION_ATTACK_SIGNALS.has(result.error.attestationReason);
+            logger[sign ? 'error' : 'warn'](
               {
                 event: 'auth.mfa.attestation_refused',
                 userId: principal.userId,

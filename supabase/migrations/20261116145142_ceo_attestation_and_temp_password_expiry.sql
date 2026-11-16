@@ -29,6 +29,17 @@
 --   então cai no mesmo caminho da conta desativada (401 genérico); um reset grava uma linha nova e o
 --   prazo recomeça.
 --
+-- Endurecimento da revisão da Onda 6.1 (ADR 0013, threat model F-64 a F-72):
+--   * F-64: `private.mfa_first_activations`, sem FK para o fator, impede que quem apagou o fator do CEO
+--     direto no Auth cadastre e ative o dele no lugar;
+--   * F-65: a queima de código TOTP deixa de ser executável por `authenticated` (era um oráculo de
+--     código pelo PostgREST) e passa ao `service_role`;
+--   * F-66: só os sinais de ataque derrubam todas as sessões; corrida e inconsistência só recusam;
+--   * F-67: o challenge registrado tem de ser novo e não verificado; a sessão tem de ter sido elevada
+--     pelo fator atestado; um challenge atesta uma sessão só;
+--   * F-71: a prova da ativação não depende de o Auth guardar as linhas de `mfa_challenges`;
+--   * F-69: a migration para se existir CEO com fator verificado fora do registro.
+--
 -- Comportamento do GoTrue local em que isto se apoia (verificado na Onda 6.1, anotado no ADR 0013):
 --   * `auth.sessions.aal` existe e vira `aal2` na mesma linha (mesmo `id`) quando o verify passa; o
 --     claim `session_id` do JWT é o `auth.sessions.id` e sobrevive ao refresh; o refresh mantém `aal2`;
@@ -59,15 +70,32 @@ REVOKE ALL ON private.mfa_backend_factors FROM PUBLIC, anon, authenticated, serv
 -- CASCADE de auth.users
 CREATE INDEX mfa_backend_factors_user_id_idx ON private.mfa_backend_factors (user_id);
 
+-- Marca de que o usuário JÁ ativou um fator pelo backend (F-64). NÃO tem FK para o fator: apagar o
+-- fator (o `DELETE /factors/{id}` do Auth, que uma `aal2` obtida direto no Auth consegue) leva o
+-- registro do fator e os atestados pelo CASCADE, mas não esta linha. Com ela, nem o cadastro nem a
+-- ativação de um fator NOVO passam pelo backend (`register_backend_totp_factor` e
+-- `attest_mfa_session` recusam com `factor_reenrolled`): quem apagou o fator do CEO não consegue
+-- cadastrar o dele no lugar. Só o runbook de reset de MFA (E-25, Onda 11) apaga a linha, por SQL,
+-- como operação manual. Nenhuma função da API a apaga.
+CREATE TABLE private.mfa_first_activations (
+  user_id            uuid PRIMARY KEY REFERENCES auth.users (id) ON DELETE CASCADE,
+  first_activated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE private.mfa_first_activations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON private.mfa_first_activations FROM PUBLIC, anon, authenticated, service_role;
+
 -- Challenges que o backend criou. `factor_was_verified` guarda o estado do fator no momento em que o
 -- backend registrou o challenge (antes do verify): é a prova de que um challenge pode ter sido a
--- ativação do fator. O challenge apagado pelo Auth leva a linha junto (ON DELETE CASCADE).
+-- ativação do fator. Sem FK para `auth.mfa_challenges` de propósito (F-71): se o Auth apagar o
+-- challenge, a prova não some com ele. `verified_at` é uma cópia do instante da verificação, feita
+-- pela função de atestado (o Auth pode apagar o original). O fator apagado leva as linhas (CASCADE).
 CREATE TABLE private.mfa_backend_challenges (
-  challenge_id        uuid PRIMARY KEY REFERENCES auth.mfa_challenges (id) ON DELETE CASCADE,
+  challenge_id        uuid PRIMARY KEY,
   factor_id           uuid NOT NULL REFERENCES auth.mfa_factors (id) ON DELETE CASCADE,
   user_id             uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
   factor_was_verified boolean NOT NULL,
-  recorded_at         timestamptz NOT NULL DEFAULT now()
+  recorded_at         timestamptz NOT NULL DEFAULT now(),
+  verified_at         timestamptz
 );
 ALTER TABLE private.mfa_backend_challenges ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON private.mfa_backend_challenges FROM PUBLIC, anon, authenticated, service_role;
@@ -77,13 +105,14 @@ REVOKE ALL ON private.mfa_backend_challenges FROM PUBLIC, anon, authenticated, s
 CREATE INDEX mfa_backend_challenges_factor_id_idx ON private.mfa_backend_challenges (factor_id);
 
 -- Um atestado por sessão do Auth (sessão apagada = atestado apagado). `challenge_id` não tem FK de
--- propósito: se o Auth apagasse o challenge, o CEO perderia a sessão sem motivo. O fator tem FK com
--- CASCADE: remover o fator derruba o atestado (F-24).
+-- propósito: se o Auth apagasse o challenge, o CEO perderia a sessão sem motivo. É UNIQUE: um
+-- challenge atesta uma sessão só (o atestado de outra sessão com o mesmo challenge é recusado). O
+-- fator tem FK com CASCADE: remover o fator derruba o atestado (F-24).
 CREATE TABLE private.mfa_session_attestations (
   session_id   uuid PRIMARY KEY REFERENCES auth.sessions (id) ON DELETE CASCADE,
   user_id      uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
   factor_id    uuid NOT NULL REFERENCES auth.mfa_factors (id) ON DELETE CASCADE,
-  challenge_id uuid NOT NULL,
+  challenge_id uuid NOT NULL UNIQUE,
   attested_at  timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE private.mfa_session_attestations ENABLE ROW LEVEL SECURITY;
@@ -93,6 +122,33 @@ REVOKE ALL ON private.mfa_session_attestations FROM PUBLIC, anon, authenticated,
 CREATE INDEX mfa_session_attestations_user_id_idx ON private.mfa_session_attestations (user_id);
 -- Índice: o ON DELETE CASCADE de auth.mfa_factors (remover o fator derruba os atestados dele)
 CREATE INDEX mfa_session_attestations_factor_id_idx ON private.mfa_session_attestations (factor_id);
+
+-- Fatores que antecedem o registro (F-69) ----------------------------------------------------------
+-- Não há backfill: ainda não existe ambiente hospedado com CEO, e o banco local é recriado. Um CEO
+-- com fator TOTP verificado ANTES desta migration não tem ativação do backend registrada e ficaria
+-- sem acesso (`factor_not_backend`). Se algum existir, a migration para: quem opera decide, para
+-- cada CEO, se zera o fator (E-25) ou se registra a ativação à mão, e então aplica de novo.
+DO $$
+DECLARE
+  v_orphans integer;
+BEGIN
+  SELECT count(*)
+    INTO v_orphans
+    FROM auth.mfa_factors f
+    JOIN public.profiles p ON p.id = f.user_id
+   WHERE p.role = 'ceo'
+     AND f.factor_type = 'totp'
+     AND f.status = 'verified'
+     AND NOT EXISTS (
+       SELECT 1 FROM private.mfa_backend_factors bf WHERE bf.factor_id = f.id
+     );
+  IF v_orphans > 0 THEN
+    RAISE EXCEPTION
+      'ceo_attestation: % CEO(s) have a verified TOTP factor that predates the backend registry; decide per CEO (reset the factor or register its activation by hand) before applying this migration',
+      v_orphans;
+  END IF;
+END;
+$$;
 
 -- Validade da senha temporária ----------------------------------------------------------------------
 -- Prazo de uma senha temporária (criação ou reset): 72 h (decisão de 2026-11-16, F-41). Um lugar só;
@@ -304,9 +360,136 @@ GRANT EXECUTE ON FUNCTION public.list_backend_totp_factors() TO authenticated;
 -- Nenhuma lê `auth.uid()`: o ator é o próprio app, e os ids vêm como parâmetro. Por isso cada uma
 -- revalida tudo contra `auth.*` e confia em nada: dono, tipo, estado, sessão.
 
--- Registra um fator TOTP recém-criado pelo enroll do backend.
+-- Queima de código TOTP (F-21) agora é do service_role (F-65). A versão da Onda 5,
+-- `consume_totp_code(p_factor_id, p_code_digest)`, era executável por `authenticated`: com uma sessão
+-- só de senha, quem tem a publishable key mandava os 10^6 digests possíveis pelo PostgREST, sem limite
+-- nenhum; um `false` revelava o código que o CEO acabou de usar (o Auth ainda o aceita por ~90 s) e
+-- cada `true` queimava um código do CEO. A nova função faz o mesmo, só que o app a chama depois dos
+-- limites da rota (5 / 5 min e 20 / dia), com o usuário que ele autenticou.
+DROP FUNCTION public.consume_totp_code(uuid, bytea);
+
+-- Queima um código TOTP: true na primeira vez, false se o mesmo código do mesmo fator já foi consumido
+-- nos últimos 120 s. Só o dono do fator consome (ninguém queima os códigos de outro).
+--  * usuário desativado ou que não existe → 42501 FORBIDDEN;
+--  * fator inexistente, de outro usuário ou que não é TOTP → P0001 NOT_FOUND (o app responde como a um
+--    código errado: sem sondagem de ids de fator);
+--  * a chave primária decide a corrida de duas requisições com o mesmo código: a segunda espera a
+--    primeira e não atualiza a linha, então devolve false.
+-- A janela de 120 s cobre os três períodos de 30 s que o Auth aceita, com folga.
+CREATE FUNCTION public.consume_totp_code(p_user_id uuid, p_factor_id uuid, p_code_digest bytea)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  c_reuse_window CONSTANT interval := interval '120 seconds';
+  v_consumed     boolean;
+BEGIN
+  IF p_user_id IS NULL OR p_factor_id IS NULL OR p_code_digest IS NULL OR octet_length(p_code_digest) <> 32 THEN
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'INVALID_INPUT';
+  END IF;
+
+  PERFORM 1
+     FROM public.profiles p
+    WHERE p.id = p_user_id
+      AND p.disabled_at IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'FORBIDDEN';
+  END IF;
+
+  PERFORM 1
+     FROM auth.mfa_factors f
+    WHERE f.id = p_factor_id
+      AND f.user_id = p_user_id
+      AND f.factor_type = 'totp';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
+  END IF;
+
+  DELETE FROM private.totp_code_uses u
+   WHERE u.factor_id = p_factor_id
+     AND u.used_at < now() - c_reuse_window;
+
+  BEGIN
+    INSERT INTO private.totp_code_uses AS u (factor_id, code_digest, used_at)
+    VALUES (p_factor_id, p_code_digest, now())
+    ON CONFLICT (factor_id, code_digest)
+    DO UPDATE SET used_at = now()
+    WHERE u.used_at < now() - c_reuse_window
+    RETURNING true INTO v_consumed;
+  EXCEPTION WHEN foreign_key_violation THEN
+    -- o fator foi apagado entre a checagem acima e o INSERT (um enroll em outra aba): é o mesmo
+    -- NOT_FOUND de um fator inexistente, não uma falha do banco (que viraria 503)
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
+  END;
+
+  RETURN coalesce(v_consumed, false);
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION public.consume_totp_code(uuid, uuid, bytea) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.consume_totp_code(uuid, uuid, bytea) TO service_role;
+
+-- Recusa de atestado ou de cadastro: devolve o motivo, audita sempre e, quando o motivo é SINAL DE
+-- ATAQUE, apaga TODAS as sessões do usuário (a senha e um código válido vazaram, ou um fator ou
+-- challenge que o backend não criou apareceu). A recusa é um RETORNO, não uma exceção: a exceção
+-- desfaria a auditoria e a revogação. Os motivos de corrida ou de inconsistência (a sessão sumiu entre
+-- o verify e o atestado, o challenge envelheceu...) recusam sem revogar: quem os provoca não precisa
+-- de um código válido, e derrubar as sessões do CEO por uma corrida seria uma negação de serviço
+-- barata (F-66). A auditoria leva `severity` (`alert` para os sinais de ataque, `warning` para os
+-- demais) e `revoked`: o alerta sai do `audit_events`, que sobrevive a um 503 depois do COMMIT (F-68).
+-- O motivo e o id do fator não são PII.
+CREATE FUNCTION private.refuse_mfa_attestation(p_user_id uuid, p_factor_id uuid, p_reason text)
+RETURNS text
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_attack boolean := p_reason IN (
+    'oracle',
+    'factor_not_backend',
+    'factor_not_activated_by_backend',
+    'challenge_not_backend',
+    'challenge_not_found',
+    'challenge_reused',
+    'session_factor_mismatch',
+    'factor_reenrolled'
+  );
+BEGIN
+  IF v_attack THEN
+    DELETE FROM auth.sessions s WHERE s.user_id = p_user_id;
+  END IF;
+
+  PERFORM private.record_audit_event(
+    NULL::public.app_role,
+    'auth.mfa_attestation_refused',
+    'account',
+    p_user_id,
+    NULL::uuid,
+    NULL::uuid,
+    jsonb_build_object(
+      'reason', p_reason,
+      'factor_id', p_factor_id,
+      'severity', CASE WHEN v_attack THEN 'alert' ELSE 'warning' END,
+      'revoked', v_attack
+    )
+  );
+
+  RETURN p_reason;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION private.refuse_mfa_attestation(uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+
+-- Registra um fator TOTP recém-criado pelo enroll do backend. Devolve `registered`, ou
+-- `factor_reenrolled` quando o usuário JÁ ativou um fator pelo backend e esse fator não existe mais
+-- (F-64): quem apagou o fator do CEO direto no Auth não cadastra o dele no lugar. A recusa audita e
+-- apaga todas as sessões do usuário (ver `refuse_mfa_attestation`). Só o reset de MFA do operador
+-- (E-25) apaga a marca e reabre o cadastro.
 CREATE FUNCTION public.register_backend_totp_factor(p_user_id uuid, p_factor_id uuid, p_session_id uuid)
-RETURNS void
+RETURNS text
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
@@ -317,7 +500,7 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'INVALID_INPUT';
   END IF;
 
-  -- só CEO tem MFA (SEC-11); a sessão que cadastra é do próprio usuário
+  -- só CEO tem MFA (SEC-11), e um CEO desativado não cadastra; a sessão que cadastra é do próprio usuário
   PERFORM 1
      FROM public.profiles p
     WHERE p.id = p_user_id
@@ -346,6 +529,11 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
   END IF;
 
+  -- F-64: o primeiro fator ativado pelo backend já existiu; um fator novo só depois do reset do operador
+  IF EXISTS (SELECT 1 FROM private.mfa_first_activations a WHERE a.user_id = p_user_id) THEN
+    RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_reenrolled');
+  END IF;
+
   BEGIN
     INSERT INTO private.mfa_backend_factors (factor_id, user_id, enrolled_session_id)
     VALUES (p_factor_id, p_user_id, p_session_id)
@@ -354,14 +542,19 @@ BEGIN
     -- o fator foi removido entre a checagem e o INSERT (outro enroll): é o NOT_FOUND de um fator que não existe
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
   END;
+
+  RETURN 'registered';
 END;
 $$;
 REVOKE EXECUTE ON FUNCTION public.register_backend_totp_factor(uuid, uuid, uuid) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.register_backend_totp_factor(uuid, uuid, uuid) TO service_role;
 
--- Registra um challenge que o backend acabou de criar no Auth, ANTES de ele ser respondido. Grava o
--- estado do fator agora: um challenge registrado com o fator ainda não verificado é o único que pode ter
--- sido a ativação. Não exige que o fator seja do backend: um fator plantado também é registrado, para o
+-- Registra um challenge que o backend acabou de criar no Auth, ANTES de ele ser respondido. Só aceita
+-- um challenge ainda NÃO verificado e criado há menos de 60 s (F-67): o app registra logo depois de
+-- criá-lo, e um challenge que já foi verificado ou é velho não é um que o backend acabou de criar (ninguém
+-- "adota" um challenge verificado direto no Auth para escapar do oráculo). Grava o estado do fator
+-- agora: um challenge registrado com o fator ainda não verificado é o único que pode ter sido a
+-- ativação. Não exige que o fator seja do backend: um fator plantado também é registrado, para o
 -- atestado recusá-lo com alerta (F-61) em vez de a chamada falhar sem rastro.
 CREATE FUNCTION public.record_backend_mfa_challenge(p_user_id uuid, p_factor_id uuid, p_challenge_id uuid)
 RETURNS void
@@ -371,8 +564,9 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
-  c_prune_after CONSTANT interval := interval '7 days';
-  v_factor_status auth.factor_status;
+  c_prune_after     CONSTANT interval := interval '7 days';
+  c_challenge_fresh CONSTANT interval := interval '60 seconds';
+  v_factor_status   auth.factor_status;
 BEGIN
   IF p_user_id IS NULL OR p_factor_id IS NULL OR p_challenge_id IS NULL THEN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'INVALID_INPUT';
@@ -388,11 +582,13 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
   END IF;
 
-  -- o challenge existe e é DESTE fator (o app não escolhe um challenge qualquer)
+  -- o challenge existe, é DESTE fator, não foi verificado e acabou de ser criado
   PERFORM 1
      FROM auth.mfa_challenges c
     WHERE c.id = p_challenge_id
-      AND c.factor_id = p_factor_id;
+      AND c.factor_id = p_factor_id
+      AND c.verified_at IS NULL
+      AND c.created_at > now() - c_challenge_fresh;
   IF NOT FOUND THEN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
   END IF;
@@ -422,52 +618,31 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.record_backend_mfa_challenge(uuid, uuid, uuid) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.record_backend_mfa_challenge(uuid, uuid, uuid) TO service_role;
 
--- Recusa de atestado: apaga TODAS as sessões do usuário (a senha e um código válido vazaram, ou o
--- estado do Auth não bate com o do backend) e deixa a trilha de auditoria. Devolve o motivo. É uma
--- função à parte porque a recusa é um RETORNO, não uma exceção: a exceção desfaria a auditoria e a
--- revogação. O motivo e o id do fator não são PII.
-CREATE FUNCTION private.refuse_mfa_attestation(p_user_id uuid, p_factor_id uuid, p_reason text)
-RETURNS text
-LANGUAGE plpgsql
-VOLATILE
-SECURITY DEFINER
-SET search_path = ''
-AS $$
-BEGIN
-  DELETE FROM auth.sessions s WHERE s.user_id = p_user_id;
-
-  PERFORM private.record_audit_event(
-    NULL::public.app_role,
-    'auth.mfa_attestation_refused',
-    'account',
-    p_user_id,
-    NULL::uuid,
-    NULL::uuid,
-    jsonb_build_object('reason', p_reason, 'factor_id', p_factor_id)
-  );
-
-  RETURN p_reason;
-END;
-$$;
-REVOKE EXECUTE ON FUNCTION private.refuse_mfa_attestation(uuid, uuid, text) FROM PUBLIC, anon, authenticated;
-
 -- Atestado de sessão. O backend chama logo depois de um verify de TOTP que o Auth aceitou, com os ids
--- que ele tem. Devolve 'attested' ou o motivo da recusa (um valor do conjunto abaixo); só levanta
--- exceção para entrada nula (INVALID_INPUT).
+-- que ele tem. Devolve `attested`, `attested_activated` (este atestado ativou o fator pelo backend:
+-- o app derruba as outras sessões, F-20) ou o motivo da recusa (um valor do conjunto abaixo); só
+-- levanta exceção para entrada nula (INVALID_INPUT).
 --
 -- Tudo é conferido aqui, contra `auth.*` e os registros do backend:
---   * a sessão existe, é do usuário e está em `aal2`; o usuário é um CEO ativo;
---   * o fator é do usuário, é TOTP e está verificado, e é um fator que o backend cadastrou;
---   * o challenge é deste fator, foi verificado há menos de 120 s e é um challenge do backend;
+--   * o usuário é um CEO ativo;
+--   * a sessão existe, é dele, está em `aal2` e foi elevada por ESTE fator (`auth.sessions.factor_id`);
+--   * o fator é do usuário, é TOTP, está verificado e é um fator que o backend cadastrou;
+--   * o challenge é desse fator, foi verificado há menos de 120 s e é um challenge do backend, e
+--     nenhuma outra sessão foi atestada com ele;
 --   * oráculo: nenhum challenge verificado nos últimos 120 s foi criado fora do backend;
 --   * ativação: um fator que o backend cadastrou só é "ativado pelo backend" se um challenge dele,
 --     registrado quando o fator ainda não estava verificado, foi verificado, e nenhum challenge
 --     verificado de fora do backend jamais existiu para ele. A ativação é derivada, então um atestado
 --     que falhou por indisponibilidade depois de o Auth já ter ativado o fator se recupera no
---     próximo verify, sem trancar o CEO.
--- Qualquer recusa apaga todas as sessões do usuário e audita (`auth.mfa_attestation_refused`).
--- Não dá para transformar isto em negação de serviço contra um CEO sem um código TOTP verificado
--- direto no Auth: código errado não deixa challenge verificado.
+--     próximo verify, sem trancar o CEO. E só acontece UMA vez por usuário (`mfa_first_activations`,
+--     F-64): depois do primeiro fator, um fator novo (de quem apagou o antigo no Auth) é recusado
+--     com `factor_reenrolled`.
+-- A prova da ativação não depende de o Auth guardar linhas (F-71): o instante da verificação é
+-- copiado para o registro do backend aqui.
+-- Toda recusa audita (`auth.mfa_attestation_refused`) e as de sinal de ataque apagam todas as
+-- sessões do usuário (ver `refuse_mfa_attestation`). Não dá para transformar isto em negação de
+-- serviço contra um CEO sem um código TOTP verificado direto no Auth: código errado não deixa
+-- challenge verificado.
 CREATE FUNCTION public.attest_mfa_session(
   p_user_id      uuid,
   p_session_id   uuid,
@@ -483,12 +658,15 @@ AS $$
 DECLARE
   c_oracle_window CONSTANT interval := interval '120 seconds';
   v_session_aal   auth.aal_level;
+  v_session_factor uuid;
   v_factor_type   auth.factor_type;
   v_factor_status auth.factor_status;
   v_challenge_factor uuid;
   v_verified_at   timestamptz;
   v_activated_at  timestamptz;
   v_activation_challenge uuid;
+  v_activation_verified_at timestamptz;
+  v_activated     boolean := false;
 BEGIN
   IF p_user_id IS NULL OR p_session_id IS NULL OR p_factor_id IS NULL OR p_challenge_id IS NULL THEN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'INVALID_INPUT';
@@ -504,9 +682,9 @@ BEGIN
     RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'not_ceo');
   END IF;
 
-  -- sessão: do usuário e aal2 (o Auth a elevou)
-  SELECT s.aal
-    INTO v_session_aal
+  -- sessão: do usuário, aal2 (o Auth a elevou) e elevada por este fator
+  SELECT s.aal, s.factor_id
+    INTO v_session_aal, v_session_factor
     FROM auth.sessions s
    WHERE s.id = p_session_id
      AND s.user_id = p_user_id;
@@ -515,6 +693,9 @@ BEGIN
   END IF;
   IF v_session_aal IS DISTINCT FROM 'aal2' THEN
     RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'session_not_aal2');
+  END IF;
+  IF v_session_factor IS DISTINCT FROM p_factor_id THEN
+    RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'session_factor_mismatch');
   END IF;
 
   -- fator: do usuário, TOTP, verificado
@@ -567,6 +748,15 @@ BEGIN
   IF NOT FOUND THEN
     RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'challenge_not_backend');
   END IF;
+  -- um challenge atesta uma sessão só (o UNIQUE da tabela também garante)
+  IF EXISTS (
+    SELECT 1
+      FROM private.mfa_session_attestations a
+     WHERE a.challenge_id = p_challenge_id
+       AND a.session_id <> p_session_id
+  ) THEN
+    RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'challenge_reused');
+  END IF;
 
   -- oráculo (F-50 b): um código aceito direto no Auth, na janela do TOTP, pode ser o que o backend
   -- acabou de ver; o Auth não protege contra replay. Challenges do próprio backend (inclusive o de um
@@ -586,8 +776,13 @@ BEGIN
     RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'oracle');
   END IF;
 
-  -- ativação pelo backend, na primeira vez
+  -- ativação pelo backend, na primeira vez do fator
   IF v_activated_at IS NULL THEN
+    -- F-64: o usuário já teve um primeiro fator ativado; este é um fator novo (o anterior foi apagado)
+    IF EXISTS (SELECT 1 FROM private.mfa_first_activations a WHERE a.user_id = p_user_id) THEN
+      RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_reenrolled');
+    END IF;
+
     -- um challenge verificado que o backend não criou, em qualquer época, pode ter ativado o fator
     IF EXISTS (
       SELECT 1
@@ -603,26 +798,44 @@ BEGIN
       RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_not_activated_by_backend');
     END IF;
 
-    -- o challenge do backend, registrado com o fator ainda não verificado, que foi verificado
-    SELECT b.challenge_id
-      INTO v_activation_challenge
+    -- o challenge do backend, registrado com o fator ainda não verificado, que foi verificado (o
+    -- instante vem da cópia do registro, ou do Auth se a cópia ainda não existe)
+    SELECT b.challenge_id, coalesce(b.verified_at, c.verified_at)
+      INTO v_activation_challenge, v_activation_verified_at
       FROM private.mfa_backend_challenges b
-      JOIN auth.mfa_challenges c ON c.id = b.challenge_id
+      LEFT JOIN auth.mfa_challenges c ON c.id = b.challenge_id
      WHERE b.factor_id = p_factor_id
        AND b.user_id = p_user_id
        AND NOT b.factor_was_verified
-       AND c.verified_at IS NOT NULL
-     ORDER BY c.verified_at, b.challenge_id
+       AND coalesce(b.verified_at, c.verified_at) IS NOT NULL
+     ORDER BY coalesce(b.verified_at, c.verified_at), b.challenge_id
      LIMIT 1;
     IF NOT FOUND THEN
       RETURN private.refuse_mfa_attestation(p_user_id, p_factor_id, 'factor_not_activated_by_backend');
     END IF;
 
+    UPDATE private.mfa_backend_challenges b
+       SET verified_at = v_activation_verified_at
+     WHERE b.challenge_id = v_activation_challenge
+       AND b.verified_at IS NULL;
+
     UPDATE private.mfa_backend_factors bf
        SET activated_at = now(),
            activation_challenge_id = v_activation_challenge
      WHERE bf.factor_id = p_factor_id;
+
+    INSERT INTO private.mfa_first_activations (user_id)
+    VALUES (p_user_id)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    v_activated := true;
   END IF;
+
+  -- a cópia do instante da verificação deste challenge: a prova não depende de o Auth guardar a linha
+  UPDATE private.mfa_backend_challenges b
+     SET verified_at = v_verified_at
+   WHERE b.challenge_id = p_challenge_id
+     AND b.verified_at IS NULL;
 
   INSERT INTO private.mfa_session_attestations AS a (session_id, user_id, factor_id, challenge_id)
   VALUES (p_session_id, p_user_id, p_factor_id, p_challenge_id)
@@ -632,7 +845,7 @@ BEGIN
         attested_at = now()
     WHERE a.user_id = EXCLUDED.user_id;
 
-  RETURN 'attested';
+  RETURN CASE WHEN v_activated THEN 'attested_activated' ELSE 'attested' END;
 END;
 $$;
 REVOKE EXECUTE ON FUNCTION public.attest_mfa_session(uuid, uuid, uuid, uuid) FROM PUBLIC, anon, authenticated;

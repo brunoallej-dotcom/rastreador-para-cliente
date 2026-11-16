@@ -14,6 +14,8 @@
 --       backend, registra e verifica um challenge do backend e chama a função REAL
 --       public.attest_mfa_session (levanta erro se ela recusar). false, sem fazer nada, quando não há
 --       o que atestar: usuário que não é CEO ou está desativado, sem fator TOTP verificado ou sem a sessão.
+--   tests.reset_first_activation(user_id)
+--       apaga a marca de primeira ativação (o reset de MFA do operador, E-25): reabre o cadastro de fator.
 --   tests.authenticate_as(user_id, aal DEFAULT 'aal1', attested DEFAULT true, session_id DEFAULT NULL)
 --       role = authenticated e request.jwt.claims com sub, aal e session_id (por padrão = user_id). Com aal2 e
 --       attested, atesta a sessão antes (tests.attest_session): é o CEO que o backend elevou. Com
@@ -119,7 +121,7 @@ BEGIN
     RETURN false;
   END IF;
 
-  UPDATE auth.sessions SET aal = 'aal2' WHERE id = v_session_id;
+  UPDATE auth.sessions SET aal = 'aal2', factor_id = v_factor_id WHERE id = v_session_id;
 
   INSERT INTO private.mfa_backend_factors (factor_id, user_id, enrolled_session_id)
   VALUES (v_factor_id, p_user_id, v_session_id)
@@ -135,11 +137,22 @@ BEGIN
   VALUES (v_challenge_id, v_factor_id, p_user_id, v_activated);
 
   v_result := public.attest_mfa_session(p_user_id, v_session_id, v_factor_id, v_challenge_id);
-  IF v_result IS DISTINCT FROM 'attested' THEN
+  IF v_result NOT IN ('attested', 'attested_activated') THEN
     RAISE EXCEPTION 'tests.attest_session: a função recusou o atestado (%)', v_result;
   END IF;
   RETURN true;
 END;
+$$;
+
+-- Simula o reset de MFA do operador (E-25, Onda 11): apaga a marca de primeira ativação, a única coisa
+-- que reabre o cadastro e a ativação de um fator novo depois que o primeiro foi ativado (F-64).
+CREATE OR REPLACE FUNCTION tests.reset_first_activation(p_user_id uuid)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  DELETE FROM private.mfa_first_activations WHERE user_id = p_user_id;
 $$;
 
 CREATE OR REPLACE FUNCTION tests.authenticate_as(

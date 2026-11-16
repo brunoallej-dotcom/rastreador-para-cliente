@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AdminRpcResult } from '@/shared/db/admin-client';
-import { ConflictError, ServiceUnavailableError } from '@/shared/kernel';
-import { InvalidMfaCodeError } from '../domain/mfa-errors';
+import { ConflictError, ServiceUnavailableError, UnauthenticatedError } from '@/shared/kernel';
+import {
+  InvalidMfaCodeError,
+  MfaAlreadyEnrolledError,
+  MfaReenrollmentRefusedError,
+} from '../domain/mfa-errors';
 import { ATTESTATION_REFUSALS } from '../domain/mfa-ports';
 import { createSupabaseMfaAttestor, type MfaAdminApi } from './supabase-mfa-attestor';
 
@@ -10,28 +14,33 @@ const FACTOR_ID = '33333333-3333-4333-8333-333333333333';
 const CHALLENGE_ID = '44444444-4444-4444-8444-444444444444';
 const SESSION_ID = '66666666-6666-4666-8666-666666666666';
 
-const answer = (data: unknown): AdminRpcResult => ({ data, error: null, status: 200 });
-const failure = (code: string, message: string, status = 400): AdminRpcResult => ({
+// The facade validates the payloads before they get here, so what the attestor sees is already typed;
+// a test that wants "an answer it does not understand" hands the attestor an impossible value anyway.
+const answer = (data: unknown): AdminRpcResult<never> =>
+  ({ data, error: null, status: 200 }) as AdminRpcResult<never>;
+const failure = (code: string, message: string, status = 400): AdminRpcResult<never> => ({
   data: null,
   error: { code, message },
   status,
 });
 
-type Outcome = AdminRpcResult | Error;
-const settle = (outcome: Outcome | undefined, fallback: AdminRpcResult) =>
+type Outcome = AdminRpcResult<never> | Error;
+const settle = (outcome: Outcome | undefined, fallback: AdminRpcResult<never>) =>
   outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome ?? fallback);
 
 function fakeAdmin(
-  outcomes: { register?: Outcome; record?: Outcome; attest?: Outcome } = {},
+  outcomes: { register?: Outcome; record?: Outcome; attest?: Outcome; burn?: Outcome } = {},
 ): MfaAdminApi & {
   registerBackendTotpFactor: ReturnType<typeof vi.fn>;
   recordBackendMfaChallenge: ReturnType<typeof vi.fn>;
   attestMfaSession: ReturnType<typeof vi.fn>;
+  consumeTotpCode: ReturnType<typeof vi.fn>;
 } {
   return {
-    registerBackendTotpFactor: vi.fn(() => settle(outcomes.register, answer(null))),
+    registerBackendTotpFactor: vi.fn(() => settle(outcomes.register, answer('registered'))),
     recordBackendMfaChallenge: vi.fn(() => settle(outcomes.record, answer(null))),
     attestMfaSession: vi.fn(() => settle(outcomes.attest, answer('attested'))),
+    consumeTotpCode: vi.fn(() => settle(outcomes.burn, answer(true))),
   };
 }
 
@@ -126,7 +135,7 @@ describe('SupabaseMfaAttestor.attest', () => {
 
     const result = await createSupabaseMfaAttestor(admin).attest(attestation);
 
-    expect(result).toEqual({ attested: true });
+    expect(result).toEqual({ attested: true, activated: false });
     expect(admin.attestMfaSession).toHaveBeenCalledWith(attestation);
   });
 
@@ -188,4 +197,104 @@ describe('SupabaseMfaAttestor: the admin path is resolved lazily', () => {
     // No facade injected and no environment: constructing must not throw.
     expect(() => createSupabaseMfaAttestor()).not.toThrow();
   });
+});
+
+describe('SupabaseMfaAttestor: the new answers (the review of Wave 6.1)', () => {
+  it('F-72: attested_activated is an attestation that says it ACTIVATED the factor', async () => {
+    const admin = fakeAdmin({ attest: answer('attested_activated') });
+
+    expect(await createSupabaseMfaAttestor(admin).attest(attestation)).toEqual({
+      attested: true,
+      activated: true,
+    });
+  });
+
+  it('F-64: a registration the database refuses as factor_reenrolled is MfaReenrollmentRefusedError (a 409 MFA_ALREADY_ENROLLED)', async () => {
+    const admin = fakeAdmin({ register: answer('factor_reenrolled') });
+
+    const result = await createSupabaseMfaAttestor(admin).registerEnrollment(registration);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBeInstanceOf(MfaReenrollmentRefusedError);
+    expect(result.error).toBeInstanceOf(MfaAlreadyEnrolledError);
+    expect(result.error.code).toBe('MFA_ALREADY_ENROLLED');
+  });
+
+  it("F-65: burnCode asks the admin path to burn the digest of the user's factor", async () => {
+    const admin = fakeAdmin();
+    const codeDigest = '\\x' + 'ab'.repeat(32);
+
+    const result = await createSupabaseMfaAttestor(admin).burnCode({
+      userId: USER_ID,
+      factorId: FACTOR_ID,
+      codeDigest,
+    });
+
+    expect(result).toEqual({ ok: true, value: undefined });
+    expect(admin.consumeTotpCode).toHaveBeenCalledWith({
+      userId: USER_ID,
+      factorId: FACTOR_ID,
+      codeDigest,
+    });
+  });
+
+  it('F-21: a code the database already burned (false) is a replay: InvalidMfaCodeError (code_reused)', async () => {
+    const admin = fakeAdmin({ burn: answer(false) });
+
+    const result = await createSupabaseMfaAttestor(admin).burnCode({
+      userId: USER_ID,
+      factorId: FACTOR_ID,
+      codeDigest: '\\x00',
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBeInstanceOf(InvalidMfaCodeError);
+    expect(result.error.reason).toBe('code_reused');
+    expect(result.error.factorId).toBe(FACTOR_ID);
+  });
+
+  it('F-20: a factor that is not a TOTP factor of the user (NOT_FOUND) is factor_not_found', async () => {
+    const admin = fakeAdmin({ burn: failure('P0001', 'NOT_FOUND') });
+
+    const result = await createSupabaseMfaAttestor(admin).burnCode({
+      userId: USER_ID,
+      factorId: FACTOR_ID,
+      codeDigest: '\\x00',
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.reason).toBe('factor_not_found');
+  });
+
+  it('a user that is gone or disabled (42501) is UnauthenticatedError', async () => {
+    const admin = fakeAdmin({ burn: failure('42501', 'FORBIDDEN', 403) });
+
+    await expect(
+      createSupabaseMfaAttestor(admin).burnCode({
+        userId: USER_ID,
+        factorId: FACTOR_ID,
+        codeDigest: '\\x00',
+      }),
+    ).rejects.toBeInstanceOf(UnauthenticatedError);
+  });
+
+  it.each([
+    ['the database down (503)', failure('', 'x', 503), ServiceUnavailableError],
+    ['a throw of the facade', new TypeError('fetch failed'), ServiceUnavailableError],
+    ['an error it does not know', failure('XX000', 'boom'), Error],
+  ])(
+    'fail closed: %s while burning throws, so the code is never tried',
+    async (_label, outcome, expected) => {
+      const admin = fakeAdmin({ burn: outcome });
+
+      const thrown = await createSupabaseMfaAttestor(admin)
+        .burnCode({ userId: USER_ID, factorId: FACTOR_ID, codeDigest: '\\x00' })
+        .catch((error: unknown) => error);
+
+      expect(thrown).toBeInstanceOf(expected);
+      expect(thrown).not.toBeInstanceOf(InvalidMfaCodeError);
+    },
+  );
 });
