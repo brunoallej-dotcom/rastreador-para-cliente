@@ -15,7 +15,10 @@ import {
 import type { Logger } from '@/shared/observability/logger';
 import { ClientArchivedError, ProcessNotActiveError } from '../domain/errors';
 import {
+  invariantViolations,
   PROCESS_STATUSES,
+  summaryViolations,
+  type InvariantViolation,
   type Process,
   type ProcessListPosition,
   type ProcessPage,
@@ -37,8 +40,6 @@ import { timestampSchema } from './timestamp-schema';
 const INSUFFICIENT_PRIVILEGE = '42501';
 /** Postgres: `raise_exception`, with the application code as the message (spec §3.7). */
 const RAISE_EXCEPTION = 'P0001';
-const CHECK_VIOLATION = '23514';
-const STRING_DATA_RIGHT_TRUNCATION = '22001';
 /** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
 const DATA_EXCEPTION_CLASS = '22';
 const NOT_FOUND_MESSAGE = 'NOT_FOUND';
@@ -237,7 +238,7 @@ const invalidPosition = (code: string) =>
   );
 
 export type ProcessRepositoryOptions = {
-  readonly logger: Pick<Logger, 'warn'>;
+  readonly logger: Pick<Logger, 'warn' | 'error'>;
 };
 
 /**
@@ -291,11 +292,12 @@ export function createSupabaseProcessRepository(
     if (error.code === RAISE_EXCEPTION && error.message === PROCESS_NOT_ACTIVE_MESSAGE) {
       return new ProcessNotActiveError({ cause: { code: error.code } });
     }
-    if (
-      (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) ||
-      error.code === CHECK_VIOLATION ||
-      error.code === STRING_DATA_RIGHT_TRUNCATION
-    ) {
+    // Only `INVALID_INPUT` is the caller's fault. A check violation (23514) or a value that is too long
+    // (22001) cannot come from the input of these two functions: `private.visible_text` is stricter
+    // than every CHECK of the tables they write, so one of those is a defect (a template row, a CHECK
+    // that drifted) and answers 500, never a 400 that blames the CEO (F-86). It falls to the
+    // unexpected-error branch below, with only the SQLSTATE and the status as cause.
+    if (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) {
       return invalidInput(error.code);
     }
     if (error.code !== undefined && ROLLED_BACK_TRANSIENTLY.has(error.code)) {
@@ -324,6 +326,24 @@ export function createSupabaseProcessRepository(
     return upstreamFailure('list the processes', safeCause(error, status), status);
   }
 
+  /**
+   * A process that does not hold its invariants (I1 to I5) is corrupt data, and the panel must not
+   * show it: the read fails closed (500). The error log names the process and the invariants that
+   * broke, and nothing else (no title, no stage name: SEC-16 keeps them out of the logs too). The two
+   * functions are the only writers, so this only fires for a row made by hand (a fixture, an operator
+   * with the secret key) or a defect; one such process fails the whole list of its client, which is the
+   * price of never showing a broken one (spec §3.7.2, F-81).
+   */
+  function failOnViolations(processId: string, violations: readonly InvariantViolation[]): void {
+    if (violations.length === 0) return;
+    const invariants = [...new Set(violations.map((violation) => violation.invariant))].sort();
+    options.logger.error(
+      { event: 'tracking.process_invariant_violated', processId, invariants },
+      'tracking.process_invariant_violated',
+    );
+    throw new Error('a process read from the database breaks its invariants');
+  }
+
   async function find(processId: string): Promise<Process | null> {
     const { data, error, status } = await supabase
       .from('processes')
@@ -337,7 +357,9 @@ export function createSupabaseProcessRepository(
 
     const row = processDetailRowSchema.safeParse(data);
     if (!row.success) throw new Error('the processes table returned a row that is not understood');
-    return toProcess(row.data);
+    const process = toProcess(row.data);
+    failOnViolations(process.id, invariantViolations(process));
+    return process;
   }
 
   /** The process a write just committed, read again: gone means 404, as for any vanished row. */
@@ -425,7 +447,9 @@ export function createSupabaseProcessRepository(
         rows.length > limit && last !== undefined
           ? { createdAt: last.created_at, id: last.id }
           : null;
-      return { items: pageRows.map(toSummary), next };
+      const items = pageRows.map(toSummary);
+      for (const item of items) failOnViolations(item.id, summaryViolations(item));
+      return { items, next };
     },
 
     async defaultStageTemplate(): Promise<StageTemplate> {

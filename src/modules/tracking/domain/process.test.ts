@@ -10,6 +10,7 @@ import {
   requireProcessChange,
   startProcess,
   summarize,
+  summaryViolations,
   type Approver,
   type Process,
 } from './process';
@@ -637,5 +638,91 @@ describe('what the panel reads of a process', () => {
       cancelledAt: null,
     });
     expect(summary).not.toHaveProperty('stages');
+  });
+});
+
+describe('summaryViolations (the invariants a row of the list can show)', () => {
+  const summaryOf = (process: Process) => summarize(process);
+  const invariantsOfSummary = (summary: ReturnType<typeof summarize>) =>
+    [...new Set(summaryViolations(summary).map((violation) => violation.invariant))].sort();
+
+  it('a process walked from start to completion, and one that was cancelled, are healthy at every step', () => {
+    let process = started(4);
+    expect(summaryViolations(summaryOf(process))).toEqual([]);
+    while (process.status === 'active') {
+      process = approved(process);
+      expect(summaryViolations(summaryOf(process))).toEqual([]);
+    }
+
+    const cancelled = applyProcessPatch(approved(started(4)), { cancel: true }, LATER);
+    expect(cancelled.ok && summaryViolations(summaryOf(cancelled.value))).toEqual([]);
+  });
+
+  it('a summary and the snapshot of the same process agree: both healthy for every state of a walk', () => {
+    let process = started(3);
+    for (let step = 0; step < 4; step += 1) {
+      expect(invariantViolations(process)).toEqual([]);
+      expect(summaryViolations(summaryOf(process))).toEqual([]);
+      if (process.status === 'active') process = approved(process);
+    }
+  });
+
+  it('I1: refuses a process with no stage, with 31, or with more completed stages than stages', () => {
+    const base = summaryOf(started(3));
+
+    expect(invariantsOfSummary({ ...base, totalStages: 0, currentStage: null })).toContain('I1');
+    expect(invariantsOfSummary({ ...base, totalStages: MAX_STAGES_PER_PROCESS + 1 })).toContain(
+      'I1',
+    );
+    expect(invariantsOfSummary({ ...base, completedStages: 4 })).toContain('I1');
+  });
+
+  it('I2: refuses an active process with no current stage, or whose progress does not add up', () => {
+    const base = summaryOf(approved(started(3)));
+
+    expect(invariantsOfSummary({ ...base, currentStage: null })).toEqual(['I2']);
+    expect(invariantsOfSummary({ ...base, completedStages: 0 })).toEqual(['I2']);
+    expect(invariantsOfSummary({ ...base, completedStages: 2 })).toEqual(['I2']);
+    expect(
+      invariantsOfSummary({
+        ...base,
+        currentStage: base.currentStage === null ? null : { ...base.currentStage, position: 9 },
+      }),
+    ).toContain('I2');
+  });
+
+  it('I2: refuses an active process that already has a completion or cancellation date', () => {
+    const base = summaryOf(started(3));
+
+    expect(invariantsOfSummary({ ...base, completedAt: AT })).toEqual(['I2']);
+    expect(invariantsOfSummary({ ...base, cancelledAt: AT })).toEqual(['I2']);
+  });
+
+  it('I3: refuses a completed process with a stage left, a current stage or no date', () => {
+    let process = started(2);
+    while (process.status === 'active') process = approved(process);
+    const base = summaryOf(process);
+
+    expect(invariantsOfSummary(base)).toEqual([]);
+    expect(invariantsOfSummary({ ...base, completedStages: 1 })).toEqual(['I3']);
+    expect(
+      invariantsOfSummary({
+        ...base,
+        currentStage: { id: stageId(2), position: 2, name: 'Fase 2' },
+      }),
+    ).toEqual(['I3']);
+    expect(invariantsOfSummary({ ...base, completedAt: null })).toEqual(['I3']);
+    expect(invariantsOfSummary({ ...base, cancelledAt: AT })).toEqual(['I3']);
+  });
+
+  it('I4: refuses a cancelled process whose progress does not add up, or with the wrong dates', () => {
+    const result = applyProcessPatch(approved(started(3)), { cancel: true }, LATER);
+    if (!result.ok) throw new Error('the fixture cancellation must pass');
+    const base = summaryOf(result.value);
+
+    expect(invariantsOfSummary(base)).toEqual([]);
+    expect(invariantsOfSummary({ ...base, completedStages: 0 })).toEqual(['I4']);
+    expect(invariantsOfSummary({ ...base, cancelledAt: null })).toEqual(['I4']);
+    expect(invariantsOfSummary({ ...base, completedAt: AT })).toEqual(['I4']);
   });
 });

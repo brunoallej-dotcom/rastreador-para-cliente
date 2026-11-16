@@ -38,6 +38,10 @@ const failure = (code: string, message: string, status = 400): Outcome => ({
 });
 
 const AT = '2026-11-16T11:30:24.984084+00:00';
+/** Creation instants of the rows of a list, newest first. */
+const FIRST = '2026-11-16T11:00:00.000003+00:00';
+const SECOND = '2026-11-16T10:00:00.000002+00:00';
+const THIRD = '2026-11-16T09:00:00.000001+00:00';
 
 /** A bare process row, as `create_process` and `update_process` return it. */
 const writeRowOf = (id: string, title = 'Processo') => ({
@@ -83,14 +87,27 @@ const detailRowOf = (id: string, stages: unknown[]) => ({
 const summaryRowOf = (
   id: string,
   createdAt: string,
-  extra: { total?: number; completed?: number; current?: unknown[] } = {},
+  extra: {
+    total?: number;
+    completed?: number;
+    current?: unknown[];
+    status?: string;
+    completedAt?: string | null;
+    cancelledAt?: string | null;
+  } = {},
 ) => ({
   ...writeRowOf(id, `Processo ${id.slice(-1)}`),
+  status: extra.status ?? 'active',
+  completed_at: extra.completedAt ?? null,
+  cancelled_at: extra.cancelledAt ?? null,
   created_at: createdAt,
   updated_at: createdAt,
   total_stages: [{ count: extra.total ?? 3 }],
   completed_stages: [{ count: extra.completed ?? 0 }],
-  current_stage: extra.current ?? [{ id: S1, position: 1, name: 'Fase 1' }],
+  // a healthy active process: the stage after the completed ones is the current one
+  current_stage: extra.current ?? [
+    { id: S1, position: (extra.completed ?? 0) + 1, name: 'Fase 1' },
+  ],
 });
 
 /**
@@ -140,7 +157,7 @@ function fakeSupabase(outcomes: Outcome[]) {
   return { supabase, queries, remaining: () => queue.length };
 }
 
-const logger = () => ({ warn: vi.fn() });
+const logger = () => ({ warn: vi.fn(), error: vi.fn() });
 const repositoryOver = (outcomes: Outcome[]) => {
   const warn = logger();
   const fake = fakeSupabase(outcomes);
@@ -326,13 +343,6 @@ describe('create', () => {
     ],
     ['an unknown client', failure('P0001', 'NOT_FOUND'), NotFoundError, 'NOT_FOUND'],
     ['invalid input', failure('P0001', 'INVALID_INPUT'), ValidationError, 'VALIDATION_ERROR'],
-    [
-      'a check violation',
-      failure('23514', 'new row violates a check'),
-      ValidationError,
-      'VALIDATION_ERROR',
-    ],
-    ['a value too long', failure('22001', 'value too long'), ValidationError, 'VALIDATION_ERROR'],
     ['a denial', failure('42501', 'FORBIDDEN'), ForbiddenError, 'FORBIDDEN'],
   ])('maps %s to its domain error and reads nothing back', async (_label, outcome, type, code) => {
     const { repository, queries } = repositoryOver([outcome]);
@@ -365,6 +375,40 @@ describe('create', () => {
     );
     expect(!result.ok && result.error.detail).toBe('Access denied.');
   });
+
+  it.each([
+    [
+      '23514',
+      'a check violation',
+      'new row for relation "process_stages" violates a check: Cliente Acme',
+    ],
+    ['22001', 'a value too long', 'value too long for type character varying(120): Cliente Acme'],
+  ])(
+    'F-86: %s (%s) is an unexpected error (500), not a 400 that blames the CEO, with only code and status as cause',
+    async (code, _label, message) => {
+      const create = repositoryOver([failure(code, message)]);
+      const update = repositoryOver([failure(code, message)]);
+
+      const failures = await Promise.all([
+        create.repository.create({ clientId: CLIENT, title: 'Loja', stages: null }).then(
+          () => undefined,
+          (error: unknown) => error as Error,
+        ),
+        update.repository.update(P1, { title: 'Novo' }).then(
+          () => undefined,
+          (error: unknown) => error as Error,
+        ),
+      ]);
+
+      for (const failed of failures) {
+        expect(failed).toBeInstanceOf(Error);
+        expect(failed).not.toBeInstanceOf(ValidationError);
+        expect(failed).not.toBeInstanceOf(ServiceUnavailableError);
+        expect(failed?.cause).toEqual({ code, status: 400 });
+        expect(JSON.stringify(failed?.cause)).not.toContain('Acme');
+      }
+    },
+  );
 
   it.each(['40P01', '40001'])(
     'E-21: %s (the transaction was rolled back) is a 503 whatever the HTTP status, with only code and status as cause',
@@ -518,10 +562,6 @@ describe('update', () => {
 });
 
 describe('listByClient', () => {
-  const FIRST = '2026-11-16T11:00:00.000003+00:00';
-  const SECOND = '2026-11-16T10:00:00.000002+00:00';
-  const THIRD = '2026-11-16T09:00:00.000001+00:00';
-
   it('AC-15: the first page is one query, explicit columns, newest first, with a lookahead row', async () => {
     const { repository, queries } = repositoryOver([
       answer([summaryRowOf(P1, FIRST, { completed: 1 })]),
@@ -549,7 +589,7 @@ describe('listByClient', () => {
         clientId: CLIENT,
         title: 'Processo 1',
         status: 'active',
-        currentStage: { id: S1, position: 1, name: 'Fase 1' },
+        currentStage: { id: S1, position: 2, name: 'Fase 1' },
         totalStages: 3,
         completedStages: 1,
         version: 1,
@@ -569,9 +609,17 @@ describe('listByClient', () => {
     expect(queries[0]).toContainEqual(['eq', 'status', 'cancelled']);
   });
 
-  it('a process with no stage in progress has no current stage', async () => {
+  it('a completed process has no current stage', async () => {
     const { repository } = repositoryOver([
-      answer([summaryRowOf(P1, FIRST, { total: 2, completed: 2, current: [] })]),
+      answer([
+        summaryRowOf(P1, FIRST, {
+          total: 2,
+          completed: 2,
+          current: [],
+          status: 'completed',
+          completedAt: FIRST,
+        }),
+      ]),
     ]);
 
     const page = await repository.listByClient(CLIENT, { limit: 10 });
@@ -726,6 +774,206 @@ describe('listByClient', () => {
     const { repository } = repositoryOver([answer([row])]);
 
     await expect(repository.listByClient(CLIENT, { limit: 5 })).rejects.toThrow(/not understood/);
+  });
+});
+
+describe('F-81: what is read must hold the invariants, not only the shape', () => {
+  const SECRET_TITLE = 'Titulo Secreto Acme';
+  const withTitle = (row: object) => ({ ...row, title: SECRET_TITLE });
+  const approved = [approvalRow];
+
+  /** Rows that Zod understands and I1 to I5 refuse, with the invariants each one breaks. */
+  const BROKEN_DETAILS: [string, object, string[]][] = [
+    [
+      'an active process with no stage in progress (I2)',
+      detailRowOf(P1, [stageRowOf(S1, 1, 'pending'), stageRowOf(S2, 2, 'pending')]),
+      ['I2'],
+    ],
+    [
+      'an active process with two stages in progress (I2)',
+      detailRowOf(P1, [stageRowOf(S1, 1, 'in_progress'), stageRowOf(S2, 2, 'in_progress')]),
+      ['I2'],
+    ],
+    [
+      'a gap in the stage positions (I1)',
+      detailRowOf(P1, [stageRowOf(S1, 1, 'in_progress'), stageRowOf(S2, 3, 'pending')]),
+      ['I1'],
+    ],
+    [
+      'a completed stage with no approval (I5)',
+      detailRowOf(P1, [stageRowOf(S1, 1, 'completed'), stageRowOf(S2, 2, 'in_progress')]),
+      ['I5'],
+    ],
+    [
+      'a completed process that still has a stage to do (I3)',
+      {
+        ...detailRowOf(P1, [
+          stageRowOf(S1, 1, 'completed', approved),
+          stageRowOf(S2, 2, 'pending'),
+        ]),
+        status: 'completed',
+        completed_at: AT,
+      },
+      ['I3'],
+    ],
+    [
+      'a cancelled process whose stages are out of order (I4)',
+      {
+        ...detailRowOf(P1, [
+          stageRowOf(S1, 1, 'pending'),
+          stageRowOf(S2, 2, 'completed', approved),
+        ]),
+        status: 'cancelled',
+        cancelled_at: AT,
+      },
+      ['I4'],
+    ],
+  ];
+
+  it.each(BROKEN_DETAILS)(
+    'find fails closed on %s, and the log names the process and the invariant only',
+    async (_label, row, invariants) => {
+      const { repository, warn } = repositoryOver([answer(withTitle(row))]);
+
+      const failed = await repository.find(P1).then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      );
+
+      expect(failed).toBeInstanceOf(Error);
+      expect(failed).not.toBeInstanceOf(ServiceUnavailableError);
+      expect(failed?.message).toMatch(/breaks its invariants/);
+      expect(warn.error).toHaveBeenCalledTimes(1);
+      expect(warn.error).toHaveBeenCalledWith(
+        { event: 'tracking.process_invariant_violated', processId: P1, invariants },
+        'tracking.process_invariant_violated',
+      );
+      const logged = JSON.stringify(warn.error.mock.calls);
+      expect(logged).not.toContain('Secreto');
+      expect(logged).not.toContain('Fase');
+    },
+  );
+
+  it('a healthy process, of any status, logs nothing', async () => {
+    const rows = [
+      detailRowOf(P1, [stageRowOf(S1, 1, 'in_progress')]),
+      {
+        ...detailRowOf(P1, [stageRowOf(S1, 1, 'completed', approved)]),
+        status: 'completed',
+        completed_at: AT,
+      },
+      {
+        ...detailRowOf(P1, [
+          stageRowOf(S1, 1, 'completed', approved),
+          stageRowOf(S2, 2, 'in_progress'),
+        ]),
+        status: 'cancelled',
+        cancelled_at: AT,
+      },
+    ];
+    for (const row of rows) {
+      const { repository, warn } = repositoryOver([answer(row)]);
+
+      expect(await repository.find(P1)).not.toBeNull();
+      expect(warn.error).not.toHaveBeenCalled();
+    }
+  });
+
+  it('the re-read after a write checks too: a process that breaks an invariant is 500 and is logged', async () => {
+    const broken = detailRowOf(P1, [stageRowOf(S1, 1, 'pending')]);
+    const create = repositoryOver([answer(writeRowOf(P1)), answer(broken)]);
+    const update = repositoryOver([answer(writeRowOf(P1)), answer(broken)]);
+
+    await expect(
+      create.repository.create({ clientId: CLIENT, title: 'Loja', stages: null }),
+    ).rejects.toThrow(/breaks its invariants/);
+    await expect(update.repository.update(P1, { title: 'Novo' })).rejects.toThrow(
+      /breaks its invariants/,
+    );
+    expect(create.warn.error).toHaveBeenCalledTimes(1);
+    expect(update.warn.error).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      'an active process whose progress does not add up (I2)',
+      summaryRowOf(P1, FIRST, {
+        total: 3,
+        completed: 2,
+        current: [{ id: S1, position: 1, name: 'Fase 1' }],
+      }),
+      ['I2'],
+    ],
+    [
+      'an active process with no current stage (I2)',
+      summaryRowOf(P1, FIRST, { total: 3, completed: 0, current: [] }),
+      ['I2'],
+    ],
+    [
+      'a completed process with a stage left (I3)',
+      summaryRowOf(P1, FIRST, {
+        total: 3,
+        completed: 2,
+        current: [],
+        status: 'completed',
+        completedAt: FIRST,
+      }),
+      ['I3'],
+    ],
+    [
+      'a cancelled process with no date (I4)',
+      summaryRowOf(P1, FIRST, { total: 3, completed: 1, status: 'cancelled' }),
+      ['I4'],
+    ],
+  ])('the list fails closed on %s', async (_label, row, invariants) => {
+    const { repository, warn } = repositoryOver([answer([withTitle(row)])]);
+
+    await expect(repository.listByClient(CLIENT, { limit: 5 })).rejects.toThrow(
+      /breaks its invariants/,
+    );
+    expect(warn.error).toHaveBeenCalledWith(
+      { event: 'tracking.process_invariant_violated', processId: P1, invariants },
+      'tracking.process_invariant_violated',
+    );
+    expect(JSON.stringify(warn.error.mock.calls)).not.toContain('Secreto');
+  });
+
+  it('one broken process fails the whole page of its client: the healthy ones are not shown either', async () => {
+    const { repository, warn } = repositoryOver([
+      answer([
+        summaryRowOf(P1, FIRST, { total: 3, completed: 1 }),
+        summaryRowOf(P2, SECOND, { total: 3, completed: 2, current: [] }),
+      ]),
+    ]);
+
+    await expect(repository.listByClient(CLIENT, { limit: 5 })).rejects.toThrow(
+      /breaks its invariants/,
+    );
+    expect(warn.error).toHaveBeenCalledTimes(1);
+    expect(warn.error).toHaveBeenCalledWith(
+      expect.objectContaining({ processId: P2, invariants: ['I2'] }),
+      'tracking.process_invariant_violated',
+    );
+  });
+
+  it('a healthy page logs nothing', async () => {
+    const { repository, warn } = repositoryOver([
+      answer([
+        summaryRowOf(P1, FIRST, { total: 3, completed: 1 }),
+        summaryRowOf(P2, SECOND, {
+          total: 2,
+          completed: 2,
+          current: [],
+          status: 'completed',
+          completedAt: SECOND,
+        }),
+      ]),
+    ]);
+
+    const page = await repository.listByClient(CLIENT, { limit: 5 });
+
+    expect(page?.items).toHaveLength(2);
+    expect(warn.error).not.toHaveBeenCalled();
   });
 });
 

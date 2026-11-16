@@ -195,6 +195,65 @@ export function invariantViolations(process: Process): readonly InvariantViolati
   return found;
 }
 
+/**
+ * `invariantViolations` for a row of the list, which has no stages to look at: only what the summary
+ * carries of them (how many there are, how many are completed, which one is current). It cannot see
+ * everything the snapshot check sees (an out-of-order stage that keeps the counts right), but it
+ * catches the corruption a list can show: no stage, a process whose progress does not add up, a state
+ * without its date.
+ * - I1: from 1 to 30 stages, and no more completed than there are.
+ * - I2: `active` has a current stage, and exactly the stages before it are completed.
+ * - I3: `completed` has every stage completed and no current stage.
+ * - I4: `cancelled` stopped where its stages were: if one is current, the ones before it are completed.
+ * - the dates: `completedAt` exactly when `completed`, `cancelledAt` exactly when `cancelled`.
+ */
+export function summaryViolations(summary: ProcessSummary): readonly InvariantViolation[] {
+  const found: InvariantViolation[] = [];
+  const add = (invariant: Invariant, message: string) => found.push({ invariant, message });
+  const { totalStages, completedStages, currentStage } = summary;
+
+  if (totalStages < MIN_STAGES_PER_PROCESS || totalStages > MAX_STAGES_PER_PROCESS) {
+    add('I1', `a process has from ${MIN_STAGES_PER_PROCESS} to ${MAX_STAGES_PER_PROCESS} stages`);
+  }
+  if (completedStages > totalStages)
+    add('I1', 'a process cannot have more completed stages than stages');
+
+  const progressAddsUp =
+    currentStage !== null &&
+    currentStage.position <= totalStages &&
+    completedStages === currentStage.position - 1;
+  switch (summary.status) {
+    case 'active':
+      if (!progressAddsUp) {
+        add('I2', 'an active process has a current stage, after exactly the completed ones');
+      }
+      if (summary.completedAt !== null || summary.cancelledAt !== null) {
+        add('I2', 'an active process has neither completedAt nor cancelledAt');
+      }
+      break;
+    case 'completed':
+      if (completedStages !== totalStages || currentStage !== null) {
+        add('I3', 'a completed process has every stage completed and no current stage');
+      }
+      if (summary.completedAt === null || summary.cancelledAt !== null) {
+        add('I3', 'a completed process has completedAt and no cancelledAt');
+      }
+      break;
+    case 'cancelled':
+      if (currentStage !== null && !progressAddsUp) {
+        add(
+          'I4',
+          'a cancelled process stopped after exactly the stages completed before the current one',
+        );
+      }
+      if (summary.cancelledAt === null || summary.completedAt !== null) {
+        add('I4', 'a cancelled process has cancelledAt and no completedAt');
+      }
+      break;
+  }
+  return found;
+}
+
 // ------------------------------------------------------------------------------ transitions ----
 
 export type StartProcessInput = {
