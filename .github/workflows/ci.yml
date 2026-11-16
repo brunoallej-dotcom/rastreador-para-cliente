@@ -36,7 +36,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm format:check
       - run: pnpm typecheck
-      - run: pnpm test
+      # The unit suite, with the 80% coverage gate of tracking domain and application (RNF-06).
+      - run: pnpm test:coverage
       - run: pnpm test:hooks
       - run: pnpm contract:lint
       - run: pnpm build

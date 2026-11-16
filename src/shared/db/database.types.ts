@@ -165,6 +165,24 @@ isOneToOne: false
         isOneToOne: true
         isSetofReturn: false
       } },
+"create_process":
+{ Args: { "p_client_id": string,"p_stages"?: Json,"p_title": string }; Returns: {
+              "cancelled_at": string | null,
+"client_id": string,
+"completed_at": string | null,
+"created_at": string,
+"id": string,
+"status": Database["public"]['Enums']["process_status"],
+"title": string,
+"updated_at": string,
+"version": number
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "processes"
+        isOneToOne: true
+        isSetofReturn: false
+      } },
 "current_principal":
 { Args: Record<PropertyKey, never>; Returns: {
               "aal": string,"client_id": string,"display_name": string,"has_verified_totp": boolean,"must_change_password": boolean,"role": Database["public"]['Enums']["app_role"],"user_id": string
@@ -217,6 +235,24 @@ isOneToOne: false
                           SetofOptions: {
         from: "*"
         to: "clients"
+        isOneToOne: true
+        isSetofReturn: false
+      } },
+"update_process":
+{ Args: { "p_cancel"?: boolean,"p_process_id": string,"p_title"?: string }; Returns: {
+              "cancelled_at": string | null,
+"client_id": string,
+"completed_at": string | null,
+"created_at": string,
+"id": string,
+"status": Database["public"]['Enums']["process_status"],
+"title": string,
+"updated_at": string,
+"version": number
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "processes"
         isOneToOne: true
         isSetofReturn: false
       } }

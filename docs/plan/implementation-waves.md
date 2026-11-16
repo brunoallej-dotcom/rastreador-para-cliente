@@ -16,10 +16,11 @@
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
-| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
+| 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
-| 11 | Hardening e go-live | 7, 9, 10 | — | ⬜ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, auditoria de intenção e reversão no provisionamento (F-81, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 ```
 0 ─┬─ 1 ─┐
@@ -59,7 +60,8 @@ tempo):
 | 6 | 6.1 (depois do merge da 6 e do contrato, que mexe no mesmo verify de TOTP) | subagente, com revisão reforçada na sessão principal |
 | 7 | 7 ∥ 8 | um subagente para cada; a sessão principal coordena a fila de gates de banco |
 | 8 | 9 ∥ 10 | 9 na sessão principal; 10 em subagente |
-| 9 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
+| 9 | 10.1 | subagente, com revisão na sessão principal |
+| 10 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
 
 ### Pré-requisitos do paralelismo com subagentes
 
@@ -342,6 +344,23 @@ tempo):
 - **Critérios de aceite**: AC-09 (parte da API), AC-20, AC-21; E-05, E-06, E-07. A validação de
   contrato falha se o DTO tiver campo extra (`additionalProperties: false`).
 - **Goal command**: `/goal pnpm verify && pnpm test:api terminam com exit 0 e pnpm test:api -t "AC-(09|2[01])|E-0[567]" executa pelo menos 6 testes, todos verdes, stop after 10 tries`
+
+## Onda 10.1 — Endurecimento do banco
+
+- **Origem**: revisões das Ondas 7 e 8 (threat model F-81, F-92b, F-93), em 2026-11-16. Não depende
+  da configuração de produção.
+- **Escopo**:
+  - revogar o DML do `service_role` em `clients`, `processes`, `process_stages` e
+    `stage_approvals` (F-81). As fixtures dos testes passam a usar `tests/helpers/db.ts` (psql no
+    container), e só as funções `SECURITY DEFINER` escrevem;
+  - `begin_client_login_admin(client_id, user_id, action)`: confere `is_ceo`, dono e papel e grava
+    uma auditoria de intenção antes de cada escrita no Auth (F-92b);
+  - `record_account_provisioned` devolve a linha do login, sem releitura, mais o evento
+    `account.provision_reverted` antes da compensação e o registro tardio no reset de recuperação
+    (F-93).
+- **Depende de / paralela com**: 7, 9, 10 / —.
+- **Critérios de aceite**: pgTAP provando que o `service_role` não escreve nas tabelas de
+  rastreamento; suítes verdes com as fixtures novas; testes de API dos eventos novos.
 
 ## Onda 11 — Hardening e go-live
 

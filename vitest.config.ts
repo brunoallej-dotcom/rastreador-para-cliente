@@ -27,9 +27,20 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/modules/*/domain/**', 'src/modules/*/application/**'],
-      exclude: ['**/*.test.ts'],
+      // The in-memory fakes and the fixtures that only tests import are not code under test: counting
+      // them would let an easy 100% in a fake pay for an untested use case.
+      exclude: ['**/*.test.ts', '**/fake-*.ts', '**/*-fixtures.ts'],
       reporter: ['text-summary', 'lcov'],
-      // Thresholds arrive in Wave 8.
+      // RNF-06: at least 80% in the domain and application layers of tracking (Wave 8). The glob
+      // matches a threshold per pattern: a drop below it fails `pnpm test:coverage`.
+      thresholds: {
+        'src/modules/tracking/{domain,application}/**': {
+          statements: 80,
+          branches: 80,
+          functions: 80,
+          lines: 80,
+        },
+      },
     },
     projects: [
       {
@@ -54,6 +65,9 @@ export default defineConfig({
           ...dbProject,
           name: 'api',
           include: ['tests/api/**/*.api.test.ts'],
+          // Files run one at a time (`fileParallelism: false` above), so each can start from an empty
+          // global login budget: see the header of the setup file.
+          setupFiles: [...dbProject.setupFiles, 'tests/setup/reset-login-budget.ts'],
         },
       },
     ],

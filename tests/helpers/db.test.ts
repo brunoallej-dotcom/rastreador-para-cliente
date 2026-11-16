@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { dbContainerName, parseProjectId, parseRowsOutput } from './db';
+import { LOGIN_GLOBAL_BUDGET } from '@/modules/identity/presentation/rate-limit-budgets';
+import { rateLimitBucket } from '@/shared/http/rate-limit/group';
+import { dbContainerName, globalBudgetResetSql, parseProjectId, parseRowsOutput } from './db';
 
 describe('parseRowsOutput (what psql prints inside the db container)', () => {
   it('reads one JSON array of rows, however it is wrapped over lines', () => {
@@ -55,5 +57,50 @@ describe('the name of the db container (it depends on nothing but the db contain
     ['a commented-out project_id', '# project_id = "x"\n'],
   ])('refuses %s', (_label, toml) => {
     expect(() => parseProjectId(toml)).toThrow(/no usable project_id/);
+  });
+});
+
+describe('globalBudgetResetSql (what empties a global budget between test files)', () => {
+  it('deletes the counters of the global login budget: its bucket prefix, compared without LIKE', () => {
+    expect(globalBudgetResetSql(LOGIN_GLOBAL_BUDGET.group)).toBe(
+      "DELETE FROM private.rate_limit_counters WHERE left(bucket, 13) = 'global:login:' RETURNING bucket",
+    );
+  });
+
+  it('uses the prefix the rate limiter really writes: `<scope>:<group>:` of the same budget', () => {
+    const sql = globalBudgetResetSql(LOGIN_GLOBAL_BUDGET.group);
+    const bucket = rateLimitBucket({ scope: 'global', group: LOGIN_GLOBAL_BUDGET.group });
+
+    expect(sql).toContain(`'${bucket}:'`);
+    expect(sql).toContain(`left(bucket, ${bucket.length + 1})`);
+  });
+
+  it('never touches the counters of a user, an account or an ip', () => {
+    const sql = globalBudgetResetSql('login');
+
+    expect(sql).toMatch(/'global:login:'/);
+    expect(sql).not.toMatch(/user:|account:|ip:/);
+    expect(sql).not.toContain('LIKE');
+  });
+
+  it.each([
+    ['an empty group', ''],
+    ['a quote', "login'"],
+    ['a statement after the group', "login'; DROP TABLE private.rate_limit_counters; --"],
+    ['a LIKE wildcard', 'log%'],
+    ['an underscore', 'a_b'],
+    ['an uppercase letter', 'Login'],
+    ['a colon (it would widen the prefix)', 'login:x'],
+    ['a space', 'login x'],
+    ['a newline', 'login\nx'],
+    ['a name that starts with a digit', '1login'],
+    ['a name over 40 characters', 'a'.repeat(41)],
+  ])('refuses %s before it reaches the SQL text', (_label, group) => {
+    expect(() => globalBudgetResetSql(group)).toThrow(/not a plain counter group name/);
+  });
+
+  it('accepts the plain names the groups use, hyphens included', () => {
+    expect(globalBudgetResetSql('totp-verify-daily')).toContain("'global:totp-verify-daily:'");
+    expect(globalBudgetResetSql('a'.repeat(40))).toContain(`'global:${'a'.repeat(40)}:'`);
   });
 });

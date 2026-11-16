@@ -20,7 +20,7 @@ const MAX_OFFSET_HOURS = 15;
 const OFFSET_PATTERN = /[+-](\d{2}):\d{2}$/;
 const YEAR_LENGTH = 4;
 
-function isPlausibleInstant(value: string): boolean {
+export function isPlausibleInstant(value: string): boolean {
   if (Number(value.slice(0, YEAR_LENGTH)) < MIN_CURSOR_YEAR) return false;
   const offsetHours = OFFSET_PATTERN.exec(value)?.[1];
   return offsetHours === undefined || Number(offsetHours) <= MAX_OFFSET_HOURS;
