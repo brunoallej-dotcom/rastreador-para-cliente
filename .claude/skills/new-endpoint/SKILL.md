@@ -113,6 +113,7 @@ API do `withRoute(policy, handler)` (`@/shared/http`):
   | `login` | `POST /auth/login` (regras `ip` 20/15 min e `account` 10/15 min) |
   | `totp-enroll` | `POST /auth/mfa/totp/enroll` (user 10/15 min, vem do contrato) |
   | `totp-verify` | `POST /auth/mfa/totp/verify` (user 5/5 min) |
+  | `totp-verify-daily` | nenhuma regra de rota: o teto diário do `verify` (user 20 / 86.400 s), gasto pelo handler com `consumeUserBudget`, além da regra do contrato (F-22) |
   | `password-change` | `POST /auth/password` (user 5/15 min) |
   | `client-user-admin` | provisionar e resetar senha de login de cliente, juntos (user 20/h) |
   | `writes` | as demais escritas autenticadas (user 60/min), `logout` inclusive |
@@ -129,7 +130,11 @@ API do `withRoute(policy, handler)` (`@/shared/http`):
   `encodeCursor(kind, payload)`/`decodeCursor(cursor, kind, schema)` de `@/shared/http` (o `kind`
   amarra o cursor ao endpoint: um cursor de outro `kind` vira 400); para texto digitado pelo
   usuário, `visibleText({ min, max })`.
-- **Contexto do handler**: `{ request, requestId, principal, params, query, body, cookies, logger }`.
+- **Contexto do handler**: `{ request, requestId, principal, params, query, body, cookies, logger,
+  consumeGlobalBudget, consumeUserBudget }`. Os dois últimos gastam um orçamento programático que não
+  está na política da rota: `consumeGlobalBudget` (escopo `global`, uma chave só, ex.: todos os logins)
+  e `consumeUserBudget` (escopo `user`, sujeito o `userId` da sessão, só em rota autenticada, ex.: o
+  teto diário do `verify`). Acima do orçamento: 429 com `Retry-After`; limitador que falha: 503.
   `cookies` grava na resposta final, inclusive nas respostas de erro, e é o **único** caminho para
   cookies: um `Set-Cookie` escrito direto no `Response` do handler é erro de programação (500).
   `logger` já carrega o `requestId`; o que ele escreve passa pelo redator de logs.

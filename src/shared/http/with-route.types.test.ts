@@ -198,6 +198,7 @@ describe('withRoute: invalid policies fail when the route is defined, not on the
       'login',
       'totp-enroll',
       'totp-verify',
+      'totp-verify-daily',
       'password-change',
       'client-user-admin',
       'writes',

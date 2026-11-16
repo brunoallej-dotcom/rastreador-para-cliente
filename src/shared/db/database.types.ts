@@ -145,7 +145,10 @@ isOneToOne: false
             [_ in never]: never
           }
           Functions: {
-            "current_principal":
+            "consume_totp_code":
+{ Args: { "p_code_digest": string,"p_factor_id": string }; Returns: boolean
+                           },
+"current_principal":
 { Args: Record<PropertyKey, never>; Returns: {
               "aal": string,"client_id": string,"display_name": string,"has_verified_totp": boolean,"must_change_password": boolean,"role": Database["public"]['Enums']["app_role"],"user_id": string
             }[]

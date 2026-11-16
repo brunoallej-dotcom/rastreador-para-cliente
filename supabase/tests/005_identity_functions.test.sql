@@ -24,6 +24,9 @@ SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo', NULL, 'C
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c2', 'ceo', NULL, 'Carla CEO');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c3', 'ceo', NULL, 'Cesar Desativado');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c4', 'ceo', NULL, 'Celia Sem Sessão');
+-- c3 (desativado) e c4 (sem sessão) têm fator verificado: o que os nega é só o perfil e a sessão
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c3');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c4');
 
 UPDATE public.profiles SET disabled_at = now() WHERE id IN ('00000000-0000-4000-8000-0000000000a3', '00000000-0000-4000-8000-0000000000c3');
 UPDATE auth.sessions SET not_after = now() - interval '1 hour' WHERE id = '00000000-0000-4000-8000-0000000000a5';

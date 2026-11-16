@@ -68,6 +68,8 @@ const GROUP_NUMBERS: Record<RateLimitGroup, readonly Omit<RateLimitRule, 'group'
   ],
   'totp-enroll': [{ scope: 'user', limit: 10, windowSeconds: 900 }],
   'totp-verify': [{ scope: 'user', limit: 5, windowSeconds: 300 }],
+  // not a contract rule: the daily cap the verify handler spends with `consumeUserBudget` (F-22)
+  'totp-verify-daily': [{ scope: 'user', limit: 20, windowSeconds: 86_400 }],
   'password-change': [{ scope: 'user', limit: 5, windowSeconds: 900 }],
   'client-user-admin': [{ scope: 'user', limit: 20, windowSeconds: 3600 }],
   writes: [{ scope: 'user', limit: 60, windowSeconds: 60 }],
@@ -78,12 +80,13 @@ const GROUP_NUMBERS: Record<RateLimitGroup, readonly Omit<RateLimitRule, 'group'
 };
 
 describe('rate-limit groups (spec §3.9)', () => {
-  it('the named groups are exactly those of spec §3.9 (plus totp-enroll, which the contract adds, and session-upstream, which is no route)', () => {
+  it('the named groups are exactly those of spec §3.9 (plus totp-enroll, which the contract adds, and session-upstream and totp-verify-daily, which are no route rules)', () => {
     expect([...RATE_LIMIT_GROUPS].sort()).toEqual(
       [
         'login',
         'totp-enroll',
         'totp-verify',
+        'totp-verify-daily',
         'password-change',
         'client-user-admin',
         'writes',

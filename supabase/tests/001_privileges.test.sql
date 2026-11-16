@@ -279,6 +279,7 @@ SELECT is_empty(
 );
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
+SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT throws_ok(
   $$ SELECT * FROM public.rate_limit_hit('authenticated-bucket', 60, 5) $$,

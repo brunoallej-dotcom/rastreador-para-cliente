@@ -33,4 +33,5 @@ export {
   type RateLimitGroup,
   type RateLimitRule,
   type RateLimitScope,
+  type UserBudget,
 } from './rate-limit/rate-limiter';

@@ -64,7 +64,7 @@ flowchart LR
 | T-19 | Aprovação | R | CEO nega ter aprovado | `stage_approvals` + `audit_events` append-only na mesma transação, com `request_id` | SEC-16 |
 | T-20 | Auditoria | T | Alterar ou apagar a trilha | `REVOKE UPDATE/DELETE/TRUNCATE` + trigger que bloqueia | AC-24 |
 | T-21 | API | D | Payload gigante ou paginação sem limite | Corpo ≤ 16 KiB, tamanhos máximos, `limit` ≤ 100, rate limit por usuário | SEC-17, SEC-09 |
-| T-22 | MFA | S | Força bruta de TOTP | 5 tentativas / 5 min por usuário | SEC-09 |
+| T-22 | MFA | S/E | Força bruta e replay de TOTP, sondagem de ids de fator, fator extra para subir a `aal2`, fator removido com JWT `aal2` vivo, sequestro do primeiro cadastro (F-20 a F-24) | **Força bruta:** 5 / 5 min por usuário (da rota, cobra toda requisição, a que acerta também, antes de olhar o código; por usuário, não por IP) e **teto diário de 20 por usuário** (`totp-verify-daily`, orçamento do handler: sem ele 5 / 5 min dão 1.440 tentativas por dia, cerca de 8 meses até acertar; com ele, décadas) (F-22). **Replay (F-21, RFC 6238 seção 5.2):** o Auth aceita o mesmo código mais de uma vez na janela (~90 s); `consume_totp_code` queima o código (SHA-256 de `<fator>:<código>`) por 120 s, antes de o Auth ver o código, e só o dono do fator consome. **Sondagem:** código errado, vencido, já usado e fator de outro usuário ou inexistente respondem o mesmo 422 `INVALID_MFA_CODE`; o log distingue (`invalid_code`, `code_reused`, `factor_not_found`). **Fator extra:** quem já tem fator verificado leva 409, e o próprio Auth exige `aal2` para criar um fator (`insufficient_aal`), então uma sessão `aal1` roubada não se promove; um fator só (sem `friendly_name`). **Fator removido (F-24):** `private.is_ceo()` exige também um fator TOTP verificado, então remover o fator tira o acesso de CEO (RLS e funções) na hora, mesmo com um JWT `aal2` ainda válido. **Primeiro cadastro (F-20):** quem tem a senha (ou um cookie `aal1`) antes de o CEO cadastrar o TOTP pode substituir o fator candidato do CEO e verificar o próprio; quando um verify **ativa** o primeiro fator, as outras sessões do CEO são derrubadas (`signOut` com escopo `others`), e o CEO que tentar o fator antigo deixa `auth.mfa.failed` com `factor_not_found` no log (e `auth.mfa.enrolled` leva `replacedFactors`). Resíduos: ver §7 e §8 | SEC-09, SEC-11 |
 | T-23 | Erros | I | Stack trace ou erro SQL vazando estrutura | problem+json com `code` estável; mapeamento explícito; 500 genérico | SEC-13 |
 | T-24 | Exceções | E | Falha numa checagem libera acesso (fail open) | Toda exceção em auth, authz ou rate limit nega a requisição | SEC-13, E-22 |
 | T-25 | Segredos | I | Secret key no bundle do browser ou em log | Sem `NEXT_PUBLIC_`; `server-only`; uso restrito a um arquivo; redação de logs; gitleaks; hook. **F-12:** o singleton do admin client não é exportado: só uma fachada estreita (a Auth Admin API e o RPC `rate_limit_hit`), sem `.from`, `.rpc` genérico nem `.auth.signIn*`; o ESLint só deixa o rate limiter e a infraestrutura de identity importá-la | SEC-15, SEC-16 |
@@ -114,6 +114,12 @@ flowchart LR
 | Cliente A chama o PostgREST direto com o próprio JWT em `processes` de B e tenta `INSERT` | pgTAP (AC-09, AC-10) |
 | Cliente chama `approve_current_stage` via RPC | pgTAP: 42501 |
 | CEO com sessão `aal1` chama uma função de CEO | pgTAP: 42501 (AC-08) |
+| CEO com JWT `aal2` ainda válido, mas sem fator TOTP verificado (removido, só candidato ou só de telefone), lê ou chama função de CEO | pgTAP: nega (F-24) |
+| O mesmo código TOTP é enviado duas vezes, na mesma sessão ou em outra sessão do mesmo CEO | API: 422 na segunda vez, com o mesmo corpo de um código errado e `auth.mfa.failed` com `code_reused`; pgTAP: `consume_totp_code` recusa dentro de 120 s e aceita depois (F-21) |
+| Usuário queima os códigos do fator de outro, ou verifica com o fator de outro | pgTAP: `NOT_FOUND`; API: 422 igual a um código errado (F-21, E-28) |
+| 20 tentativas de código no dia e a 21ª | API: 429 com `Retry-After`, sem chamar o Auth (F-22) |
+| Candidato a fator substituído e sessão paralela aberta só com a senha | API: a ativação do primeiro fator derruba a outra sessão (401); o fator antigo dá `factor_not_found` no log (F-20) |
+| Cookie `aal1` copiado, o CEO verifica na sessão dele e o refresh token antigo é usado | API: ainda devolve a sessão `aal2` dentro do intervalo de reuso do Auth (resíduo conhecido, F-23) |
 | Duas aprovações simultâneas | API: 1 × 200 e 1 × 409 (AC-17) |
 | POST de aprovação vindo de outra origem | API: 403 `ORIGIN_NOT_ALLOWED` (AC-23) |
 | 11 logins errados para a mesma conta | API: 429 (AC-03) |
@@ -140,6 +146,27 @@ flowchart LR
 - **Login sobre uma sessão existente (F-10):** a sessão anterior não é revogada; expira pelo
   `timebox` de 12 h (ADR 0009).
 - **Enumeração por `/otp` (T-02):** ver T-02.
+- **Refresh token anterior ao verify (F-23, confirmado por teste e à mão):** o Auth deixa o refresh token
+  que o navegador tinha **antes** de um verify bom ser usado de novo por `refresh_token_reuse_interval`
+  (10 s no local) e responde com a sessão atual, já `aal2`. Quem copiou o cookie `aal1` antes de o CEO
+  verificar, e age nesses 10 s, recebe um token `aal2` (o mesmo que o CEO tem: a sessão é a mesma). Passado
+  o intervalo, o mesmo token dá `refresh_token_already_used`. Rotacionar a sessão de novo depois do verify
+  **não** ajuda (testado: com uma rotação a mais, o resultado foi o mesmo), e o app não
+  encurta o intervalo, que é configuração do Auth (`[auth.sessions] refresh_token_reuse_interval`). **Onda 11:**
+  baixar o intervalo no projeto hospedado, pesando o custo (dois refreshes concorrentes do mesmo cookie
+  passam a falhar). O teste de API fixa o resíduo e exige que o intervalo configurado não passe de 10 s.
+- **Esgotar o limite de verificação (F-22, lado B):** quem tem a senha pode gastar os 5 / 5 min e os
+  20 / dia do CEO com códigos errados e impedir o CEO de verificar até a janela passar. É a mesma classe do
+  T-04 (bloqueio direcionado) e fica no mesmo item. A janela do teto diário é fixa: na virada do dia cabem
+  até 40 tentativas seguidas.
+- **Chamada extra ao Auth no enroll (F-26, aceito):** o enroll lista os fatores (`listFactors`, um
+  `getUser` no Auth) antes de criar o novo, e o verify faz `challenge` e `verify`. Essas chamadas não
+  entram no orçamento `session-upstream` (que só cobre a resolução do principal) e são limitadas pelas
+  regras da rota (10 / 15 min no enroll, 5 / 5 min mais 20 / dia no verify).
+- **Revogação das outras sessões sem confirmação (F-20):** o cliente do Auth trata 401, 403 e 404 da
+  revogação como "já desconectado", então uma revogação que o Auth recusou por esses status não é
+  vista pelo app (o `auth.mfa.followup_failed` só cobre os demais erros). O teste de API prova o efeito
+  real no Auth local.
 - **Logout que falha (BAIXO 6):** quando o logout falha (503), os cookies são devolvidos ao navegador com
   `maxAge` de 12 h de novo, então o cookie pode viver além do `timebox`. Aceito: o banco aplica 12 h de
   vida e 4 h sem uso à sessão (`private.session_is_alive()`, F-08), então o cookie estendido não
@@ -163,6 +190,9 @@ flowchart LR
 |------|----------|
 | F-03 (bloqueio direcionado, T-04) | **Decisão do usuário**, muda o §3.9 da spec: limite por e-mail mais prefixo de IP, contador global por conta só de falhas, ou cookie de dispositivo. Não mitigado |
 | F-04 (T-01) | Adiado para a Onda 11 |
+| F-20 (c) (T-22) | **Onda 11:** (1) amarrar o cadastro do TOTP à sessão que limpou o `CHANGE_PASSWORD` (hoje qualquer sessão `aal1` do CEO cadastra); (2) script operacional de reset de MFA (E-25), que também é como o CEO recupera um fator substituído por outra pessoa. Não implementados nesta onda |
+| F-23 (T-22) | **Onda 11:** baixar `refresh_token_reuse_interval` no projeto hospedado (ver o §7). Mudança de `supabase/config.toml`, fora da Onda 5 |
+| `factorId` depois do cadastro (T-22, E-25) | **Decisão do usuário, muda o contrato:** `TotpVerifyRequest` exige `factorId`, e nenhuma resposta o devolve depois do enroll (`GET /auth/session` não o traz; o enroll recusa quem já tem fator verificado). Um CEO que entra em outro dispositivo (`VERIFY_MFA`) não consegue chamar o verify. Opções: (a) tornar `factorId` opcional e o servidor resolver o fator TOTP verificado do usuário; (b) incluir o `factorId` no DTO de `Session`. Não alterado nesta onda |
 | F-13 | **Decidido na Onda 4 (ADR 0010): ligado** (`secure_password_change = true` em `config.toml`). Com sessões de no máximo 12 h (ADR 0009) o Auth nunca pede o nonce no fluxo do app (só o pede para sessão com mais de 24 h), então a chave não muda nada para o usuário; ela fecha o `PUT /auth/v1/user` direto com a sessão velha enquanto o `timebox` não estiver no projeto hospedado (Onda 11). A chave **não prova a senha atual**: isso é do app, que a confere por um sign-in descartável (ADR 0010). No Supabase local só vale depois de recriar o container do Auth |
 | F-40 (ALTO) | **GATE DE GO-LIVE (Onda 11): nenhum ambiente hospedado com contas reais antes de `security_update_password_require_current_password` estar ligado** (Management API; não existe em `config.toml`, e o local não a liga). Até lá, quem tem o token de acesso de uma sessão com menos de 24 h e a publishable key (que não é segredo) troca a senha direto no Auth, sem a senha atual que `POST /auth/password` exige. O token só existe no cookie `HttpOnly` e no servidor (ADR 0002) e vale 15 min, mas o gate é a única mitigação completa. O app já envia `current_password` ao `updateUser`, então ligar a chave não quebra o fluxo. Registrado também no §3.11 da spec. **Candidatos da Onda 11, ainda não decididos:** (a) um job do `pg_cron` que apague de `auth.sessions` as sessões que `session_is_alive()` já nega (hoje elas só deixam de autenticar nas rotas do app e continuam existindo no Auth, e o `PUT /auth/v1/user` direto não passa pelo banco); (b) um trigger de detecção em `auth.users` que registre toda troca de `encrypted_password` que não veio de `mark_password_changed()`, para alertar |
 | F-41 (decisão do usuário) | **Senha temporária sem validade:** a senha temporária de um CEO ou de um cliente vale até ser trocada, por tempo indefinido (ela foi vista por quem a entregou). Proposta: validade de, por exemplo, 72 h, aplicada em `current_active_user_id()` (conta com `must_change_password` e senha mais velha que o prazo deixa de ter principal) e um caminho de reset por um CEO para reabrir a conta. Exige mudança de spec (RF-04, SEC-10, §3.5) e é **decisão do usuário**; não implementado |

@@ -149,6 +149,21 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
         logger,
         fingerprint: deps.subjectFingerprint,
       }),
+    consumeUserBudget: (budget) => {
+      // The subject is the authenticated user, never anything the caller sends.
+      const { principal } = state;
+      if (principal === null) {
+        return Promise.reject(new Error('consumeUserBudget needs an authenticated route'));
+      }
+      return enforceRateLimits({
+        limiter: deps.rateLimiter,
+        rules: [{ scope: 'user', ...budget }],
+        scope: 'user',
+        subject: principal.userId,
+        logger,
+        fingerprint: deps.subjectFingerprint,
+      });
+    },
   });
   if (output instanceof DomainError) throw output;
   if (!(output instanceof Response)) {

@@ -3,7 +3,12 @@ import type { z } from 'zod';
 import type { DomainError, PendingAction, Principal, Role } from '@/shared/kernel';
 import type { Logger } from '@/shared/observability/logger';
 import type { CookieJar } from './cookies';
-import type { GlobalBudget, PolicyRateLimitRule, RateLimitRule } from './rate-limit/rate-limiter';
+import type {
+  GlobalBudget,
+  PolicyRateLimitRule,
+  RateLimitRule,
+  UserBudget,
+} from './rate-limit/rate-limiter';
 import type { InputSchema } from './validation';
 
 /** Output type of an optional schema; `undefined` when the policy declares none. */
@@ -87,6 +92,13 @@ export type HandlerContext<Pr extends Principal | null, Pa, Q, B> = {
    * spends a global budget: `global` is never a route-policy scope.
    */
   readonly consumeGlobalBudget: (budget: GlobalBudget) => Promise<void>;
+  /**
+   * Consumes a budget of the AUTHENTICATED user (scope `user`, subject the user id) that is not in
+   * the route policy, e.g. a daily cap on top of the contract's `x-rate-limit` (F-22). Over budget
+   * it throws `RateLimitedError` (429 with `Retry-After`); a failing limiter denies with 503 (fail
+   * closed). Calling it on a public route is a programming error and fails closed (500).
+   */
+  readonly consumeUserBudget: (budget: UserBudget) => Promise<void>;
 };
 
 /** A response, or a `DomainError` to be turned into problem+json (returned or thrown). */

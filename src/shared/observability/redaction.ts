@@ -41,6 +41,8 @@ const SENSITIVE_KEYS: ReadonlySet<string> = new Set([
   'mfacode',
   'otpcode',
   'verificationcode',
+  // the QR code of a TOTP enrollment is an image of the otpauth URI, so it carries the secret too
+  'qrcode',
 ]);
 
 /** Compound names that end in one of these are sensitive too (`newPassword`, `csrf-token`...). */
@@ -72,14 +74,18 @@ const POSTGRES_KEY_DETAIL =
 const JWT = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]{0,512})?/g;
 const AUTH_SCHEME = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,512}/gi;
 const SUPABASE_KEY = /\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{8,128}/g;
+// An `otpauth://` URI carries the TOTP secret (`secret=`) and the e-mail of the account (its label).
+// The whole URI goes, up to the next whitespace; only a key named `uri` would be too broad to redact.
+const OTPAUTH_URI = /otpauth:\/\/\S+/gi;
 // The last label must be alphabetic (a TLD), so `vitest@5.1.0` in a pnpm path of a stack frame is
 // not mistaken for an address and stacks stay readable.
 const EMAIL =
   /[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,7}\.[A-Za-z]{2,24}/g;
 
-/** Cuts e-mail addresses and token-looking strings out of free text. */
+/** Cuts e-mail addresses, token-looking strings and `otpauth://` URIs out of free text. */
 export function scrubText(text: string): string {
   return text
+    .replace(OTPAUTH_URI, REDACTED)
     .replace(POSTGRES_KEY_DETAIL, '($1)=([REDACTED])')
     .replace(JWT, REDACTED_TOKEN)
     .replace(AUTH_SCHEME, `$1 ${REDACTED_TOKEN}`)

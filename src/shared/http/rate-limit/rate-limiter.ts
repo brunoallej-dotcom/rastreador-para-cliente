@@ -2,7 +2,8 @@
  * What the key of a rule is made of (spec §3.9). `ip`, `account` and `user` are what a route policy
  * may declare. `global` has ONE subject for the whole app (an aggregate budget, e.g. all logins
  * together); it exists only for programmatic budgets (`HandlerContext.consumeGlobalBudget`, or a
- * component of the pipeline) and is never accepted in a route policy.
+ * component of the pipeline) and is never accepted in a route policy. A handler can also spend a
+ * `user` budget that is not in its policy (`HandlerContext.consumeUserBudget`).
  */
 export type RateLimitScope = 'ip' | 'account' | 'user' | 'global';
 
@@ -20,7 +21,10 @@ export const GLOBAL_SUBJECT = 'global';
  *
  * - `login`             POST /auth/login: by IP and by account
  * - `totp-enroll`       POST /auth/mfa/totp/enroll (contract: user 10 / 15 min)
- * - `totp-verify`       POST /auth/mfa/totp/verify
+ * - `totp-verify`       POST /auth/mfa/totp/verify (contract: user 5 / 5 min)
+ * - `totp-verify-daily` not a route rule: the daily cap per user (20 / 86,400 s) that the verify
+ *                       handler spends with `consumeUserBudget`, on top of the contract's rule,
+ *                       against slow guessing of TOTP codes (F-22)
  * - `password-change`   POST /auth/password
  * - `client-user-admin` provision a client login and reset its password (share one budget)
  * - `writes`            every other authenticated write
@@ -36,6 +40,7 @@ export const RATE_LIMIT_GROUPS = [
   'login',
   'totp-enroll',
   'totp-verify',
+  'totp-verify-daily',
   'password-change',
   'client-user-admin',
   'writes',
@@ -65,6 +70,12 @@ export type PolicyRateLimitRule = RateLimitRule & { readonly scope: PolicyRateLi
 
 /** An aggregate budget (scope `global`): everything but the scope, which is implied. */
 export type GlobalBudget = Omit<RateLimitRule, 'scope'>;
+
+/**
+ * A per-user budget a handler spends by itself (scope `user`, subject the user id), in addition to
+ * the rules of its route policy: everything but the scope, which is implied.
+ */
+export type UserBudget = Omit<RateLimitRule, 'scope'>;
 
 /** Identifies one counter. */
 export type RateLimitKey = {
