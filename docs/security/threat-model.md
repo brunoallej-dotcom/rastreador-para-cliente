@@ -119,6 +119,9 @@ flowchart LR
 | 11 logins errados para a mesma conta | API: 429 (AC-03) |
 | Cookie reaproveitado após logout | API: 401 (AC-04) |
 | Logout quando o Auth responde 403 sem revogar | API: 503 e cookie mantido; a sessão continua viva (AC-04) |
+| Troca de senha com a senha atual errada (6 tentativas em 15 min) | API: 422 `INVALID_CURRENT_PASSWORD` nas 5 primeiras, 429 na 6ª, mesmo com a senha certa; nada muda (AC-06) |
+| Chamar `mark_password_changed()` direto no PostgREST, sem trocar a senha | API: `PASSWORD_UNCHANGED`, a pendência continua (AC-05, ADR 0007) |
+| Cliente manda `role` (ou `app_metadata`) em qualquer corpo, ou escreve `role: ceo` em `user_metadata` | API: 400 pelo `.strict()`; a sessão segue `client` e `/admin/*` segue 403 (AC-31) |
 | 75 requisições com um cookie forjado do mesmo IP | API: no máximo 60 chamadas ao Auth, o resto 401 sem `Set-Cookie` (F-01) |
 | 63 requisições do mesmo IP para cada variante de cookie forjado (`expires_at` estranho, chunks, token simétrico, sem `kid`, `kid` desconhecido ou real com assinatura falsa, ES384) | API: no máximo 60 chamadas ao Auth por variante, nenhuma depois de esgotado o orçamento, sempre 401 e nunca 5xx (F-01) |
 | Token ES384 forjado com o `kid` real | API: 401, não 500, e nenhuma chamada ao Auth (MÉDIO 2) |
@@ -160,7 +163,7 @@ flowchart LR
 |------|----------|
 | F-03 (bloqueio direcionado, T-04) | **Decisão do usuário**, muda o §3.9 da spec: limite por e-mail mais prefixo de IP, contador global por conta só de falhas, ou cookie de dispositivo. Não mitigado |
 | F-04 (T-01) | Adiado para a Onda 11 |
-| F-13 | `[auth.email] secure_password_change` (trocar a senha exige login recente) entra na Onda 4, com a troca de senha |
+| F-13 | **Decidido na Onda 4 (ADR 0010): ligado** (`secure_password_change = true` em `config.toml`). Com sessões de no máximo 12 h (ADR 0009) o Auth nunca pede o nonce no fluxo do app (só o pede para sessão com mais de 24 h), então a chave não muda nada para o usuário; ela fecha o `PUT /auth/v1/user` direto com a sessão velha enquanto o `timebox` não estiver no projeto hospedado (Onda 11). A chave **não prova a senha atual**: isso é do app, que a confere por um sign-in descartável (ADR 0010). **Aberto, Onda 11:** ligar `security_update_password_require_current_password` no projeto hospedado (Management API; não existe em `config.toml`), porque quem tem o token de acesso de uma sessão com menos de 24 h e a chave publicável troca a senha direto no Auth, sem a senha atual. Também fica a troca que falha no meio (a senha nova vale e a pendência segue de pé até o usuário repetir com a senha nova como atual; log `auth.password_change.incomplete`) e o limite de adivinhação da senha atual: 5 / 15 min na troca, somados aos 10 / 15 min por conta do login (contadores separados) |
 | F-14 | Registrado pelo threat-modeler como observação, sem ação nesta onda |
 | MÉDIO 4 (T-02) | O piso de 400 ms do login recusado pode não cobrir o caminho "conta desativada" em produção: são cerca de 3 idas ao Auth, de gru1 a sa-east-1, e o piso foi medido com o Supabase local. **Onda 11:** medir o p95 dos três caminhos recusados em produção e subir `REFUSED_LOGIN_FLOOR_MS` acima dele; até lá a diferença de tempo é um canal lateral possível, não confirmado |
 | BAIXO 6 | Aceito, ver o §7 (logout que falha devolve o cookie com `maxAge` de 12 h; o banco aplica 12 h e 4 h) |

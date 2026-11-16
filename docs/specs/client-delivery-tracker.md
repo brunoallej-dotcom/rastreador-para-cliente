@@ -227,7 +227,24 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   existir em `auth.sessions` e o perfil não estiver desativado. Logout, desativação e reset de
   senha apagam sessões, e a próxima requisição recebe 401 mesmo com um JWT ainda válido.
 - **Contas de CEO:** `pnpm ceo:create --email … --name …` roda localmente com a secret key do
-  ambiente alvo, gera uma senha temporária e cria o usuário com `app_metadata.role = 'ceo'`.
+  ambiente alvo, gera uma senha temporária e cria o usuário com `app_metadata.role = 'ceo'`, já com
+  a senha (ADR 0007), de modo que nasce com `CHANGE_PASSWORD` e `ENROLL_MFA` pendentes. Valida os
+  argumentos como a API (e-mail normalizado, nome de 1 a 120 caracteres visíveis) e o ambiente com o
+  mesmo schema do app. Imprime a senha temporária **uma única vez**, em uma linha do stdout, e mais
+  nada sensível em lugar algum (o resto, inclusive o host do ambiente alvo e o id do usuário, vai
+  para o stderr). Um e-mail que já tem conta (de qualquer papel) é recusado sem alterar nada
+  (código de saída 3); qualquer outra falha sai com código diferente de zero e sem repetir o que o
+  Auth respondeu. A criação de um CEO não grava `audit_events` (não há função de banco para isso e o
+  script não escreve na tabela): o registro fica no log de auditoria do próprio Auth.
+- **Troca de senha** (`POST /auth/password`, ADR 0010): valida a política da nova senha (12
+  caracteres a 72 bytes, E-12) e que difere da atual (E-13) antes de chamar o Auth; prova a senha
+  atual por um sign-in descartável, que gasta o orçamento global de logins e cuja sessão é revogada
+  na hora (nada dela vai para a resposta); grava a nova senha com a sessão do usuário (o Auth
+  derruba as outras sessões) e chama `mark_password_changed()`, que prova a troca, limpa
+  `CHANGE_PASSWORD` e revoga as outras sessões de novo, mantendo a da requisição (AC-06). Senha
+  atual errada: 422 `INVALID_CURRENT_PASSWORD`. Um CEO sem TOTP verificado ainda fica com
+  `ENROLL_MFA` depois da troca; um CEO com TOTP verificado precisa de `aal2` (com `aal1` o pipeline
+  responde 403 `MFA_VERIFICATION_REQUIRED`, e a função recusa com 42501 por baixo).
 - **Contas de cliente:** `auth.admin.createUser` com `email_confirm: true` e
   `app_metadata = { role: 'client', client_id }`. O trigger `private.handle_new_auth_user` cria o
   `profile` **na mesma transação** a partir de `raw_app_meta_data`, que só a secret key consegue
