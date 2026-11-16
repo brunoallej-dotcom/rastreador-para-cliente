@@ -11,7 +11,7 @@
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ✅ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
-| 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
+| 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6 | 8 | ⬜ |
@@ -304,6 +304,22 @@ tempo):
   em `sa-east-1`, HIBP ligado, chaves JWT assimétricas, `supabase config push`; Vercel com
   domínio, env de produção e Deployment Protection nos previews); skill `security-scan`; ADRs
   `accepted`.
+- **Gates de go-live herdados das ondas 3–5** (threat model §8). Nenhum ambiente hospedado recebe
+  contas reais antes de cumpri-los:
+  - **F-40:** `security_update_password_require_current_password` ligado no Auth hospedado.
+  - Auth hospedado:
+    - `disable_signup` ligado;
+    - provider de e-mail ativo;
+    - `[auth.sessions]` com timebox de 12 h e inatividade de 4 h (plano Pro);
+    - `sign_in_sign_ups` acima do teto global de login (300 por 5 min);
+    - `token_refresh` dimensionado;
+    - assinatura assimétrica, com o segredo HS256 legado revogado.
+  - p95 da recusa de conta desativada medido. Se passar de 400 ms, subir `REFUSED_LOGIN_FLOOR_MS`.
+  - Candidatos de implementação:
+    - `pg_cron` que apaga as sessões que `session_is_alive()` já nega;
+    - trigger que detecta troca de senha feita direto no Auth;
+    - enroll de TOTP amarrado à sessão que limpou `CHANGE_PASSWORD` (F-20);
+    - script de reset de MFA de CEO (E-25).
 - **Depende de / paralela com**: 7, 9, 10 / —.
 - **Critérios de aceite**: AC-30 completo; k6 dentro do RNF-02; ZAP sem alertas High;
   `GET https://<domínio>/api/v1/health` → 200; `security-scan` sem achados críticos ou altos;

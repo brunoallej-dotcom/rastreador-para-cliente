@@ -81,7 +81,7 @@ internacionalização. Os itens com chance de entrar depois estão em §8.
 | RF-11 | CEO renomeia ou cancela um processo ativo. | `PATCH /admin/processes/{processId}` | AC-19 |
 | RF-12 | CEO vê a linha do tempo do processo, com quem fez o quê e quando. | `GET /admin/processes/{processId}/events` | AC-28 |
 | RF-13 | Cliente lista e detalha **somente** os próprios processos, sem dados internos. | `GET /me/processes`, `GET /me/processes/{processId}` | AC-09, AC-20, AC-21 |
-| RF-14 | Contas de CEO são criadas apenas por script operacional auditado, nunca pela API. | `pnpm ceo:create` (fora do contrato) | AC-31 |
+| RF-14 | Contas de CEO são criadas apenas por script operacional auditado, nunca pela API. A criação grava `account.provisioned` na trilha de auditoria, na mesma transação, sem ator. | `pnpm ceo:create` (fora do contrato) | AC-31 |
 | RF-15 | Health check público e sem detalhes internos. | `GET /health` | AC-29 |
 
 ### 2.2 Não funcionais
@@ -226,8 +226,39 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
 - **Revogação efetiva:** `current_principal()` só retorna o principal se a `session_id` do JWT
   existir em `auth.sessions` e o perfil não estiver desativado. Logout, desativação e reset de
   senha apagam sessões, e a próxima requisição recebe 401 mesmo com um JWT ainda válido.
-- **Contas de CEO:** `pnpm ceo:create --email … --name …` roda localmente com a secret key do
-  ambiente alvo, gera uma senha temporária e cria o usuário com `app_metadata.role = 'ceo'`.
+- **Contas de CEO:** `pnpm -s ceo:create --target <host> --email … --name …` (o `-s` é parte do
+  comando: sem ele o pnpm escreve o próprio cabeçalho no stdout) roda localmente, por uma pessoa, num
+  terminal, com a secret key do ambiente alvo. Gera uma senha temporária e cria o usuário com
+  `app_metadata.role = 'ceo'`, já com a senha (ADR 0007), de modo que nasce com `CHANGE_PASSWORD` e
+  `ENROLL_MFA` pendentes. O trigger de perfil grava `account.provisioned` na auditoria na mesma
+  transação (RF-14), com `actor_id` e `request_id` nulos e `{"role":"ceo","channel":"auth_admin"}` nos
+  metadados; uma falha da auditoria derruba a criação (fail closed). O script valida os argumentos
+  como a API (e-mail normalizado, nome de 1 a 120 caracteres visíveis) e exige só `SUPABASE_URL` e
+  `SUPABASE_SECRET_KEY`, lidas do shell e do arquivo de ambiente (`--env-file`, padrão `.env.local`;
+  o que já está no shell vence o arquivo, e o stderr diz qual arquivo foi lido ou que nenhum foi).
+  As proteções valem antes de qualquer chamada: `--target` precisa ser o host de `SUPABASE_URL`,
+  `http:` só vale para loopback, URL e chave precisam vir do mesmo lugar (as duas do shell ou as duas
+  do arquivo, para uma chave nunca encontrar a URL de outro projeto), o script recusa rodar com `CI`
+  definido e recusa um stdout que não seja um terminal, a não ser com `--allow-non-tty` (a senha não
+  pode ir parar num log por acidente). O stdout leva **só** a senha temporária, **uma única vez**, em
+  uma linha; todo o resto (rótulos, o host alvo, o id do usuário) vai para o stderr. Um e-mail que já
+  tem conta (de qualquer papel) é recusado sem alterar nada (código de saída 3); recusas antes da
+  chamada saem com 2; as demais falhas saem com 1 e sem repetir o que o Auth respondeu.
+- **Troca de senha** (`POST /auth/password`, ADR 0010): valida a política da nova senha (12
+  caracteres a 72 bytes, E-12) e que difere da atual (E-13) antes de chamar o Auth; prova a senha
+  atual por um sign-in descartável, que gasta o orçamento global de logins e cuja sessão é revogada
+  na hora (nada dela vai para a resposta); grava a nova senha com a sessão do usuário (o Auth
+  derruba as outras sessões) e chama `mark_password_changed()`, que prova a troca, limpa
+  `CHANGE_PASSWORD` e revoga as outras sessões de novo, mantendo a da requisição (AC-06). Senha
+  atual errada: 422 `INVALID_CURRENT_PASSWORD`. Um CEO sem TOTP verificado ainda fica com
+  `ENROLL_MFA` depois da troca; um CEO com TOTP verificado precisa de `aal2` (com `aal1` o pipeline
+  responde 403 `MFA_VERIFICATION_REQUIRED`, e a função recusa com 42501 por baixo). Duas falhas sem
+  resposta deixam o estado incerto e viram 503 com a orientação "repita; se a senha atual for
+  recusada, use a nova senha como atual": o `updateUser` que não responde (o Auth pode ter gravado a
+  senha) e o `mark_password_changed()` que falha duas vezes depois do `updateUser`. Se a primeira
+  chamada do `mark_password_changed()` gravou e só a resposta se perdeu, o `PASSWORD_UNCHANGED` da
+  segunda é sucesso: depois de um `updateUser` bem-sucedido, a linha de base só iguala o hash se uma
+  chamada anterior gravou.
 - **Contas de cliente:** `auth.admin.createUser` com `email_confirm: true` e
   `app_metadata = { role: 'client', client_id }`. O trigger `private.handle_new_auth_user` cria o
   `profile` **na mesma transação** a partir de `raw_app_meta_data`, que só a secret key consegue
@@ -444,6 +475,14 @@ No Auth do Supabase (`supabase/config.toml`), `[auth] enable_signup = false` blo
 público. `[auth.email] enable_signup` precisa ficar `true`: apesar do nome, no CLI ele liga o provider
 de e-mail e senha, e com `false` o login responde 422 `email_provider_disabled`. O Admin API cria
 usuários nos dois casos.
+
+**Gate de go-live do Auth hospedado (F-40).** Nenhum ambiente hospedado com contas reais pode existir
+antes de `security_update_password_require_current_password` estar ligado no projeto (Management
+API; não é chave do `config.toml`, o Supabase local não a liga). Sem ela, quem tem o token de acesso
+de uma sessão recente e a publishable key troca a senha direto em `PUT /auth/v1/user`, sem a senha
+atual que o app exige em `POST /auth/password` (ADR 0010). Entram no mesmo gate, Onda 11: HIBP,
+chaves JWT assimétricas, `timebox` e `inactivity_timeout` e o `sign_in_sign_ups` do Auth acima do
+orçamento global de logins.
 
 ### 3.12 LGPD
 

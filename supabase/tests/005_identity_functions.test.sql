@@ -2,7 +2,7 @@
 -- de current_principal, mark_password_changed e das funções de conta, E-08, E-19 e a auditoria
 -- (ator, papel, cliente e request_id gravados na mesma transação).
 BEGIN;
-SELECT plan(115);
+SELECT plan(116);
 
 -- arrange (como postgres) -----------------------------------------------------------------------------
 -- Clientes A e B (com logins) e Z (sem logins).
@@ -98,7 +98,11 @@ SELECT throws_ok(
 SELECT tests.clear_authentication();
 
 SELECT is_empty(
-  $$ SELECT id FROM public.audit_events WHERE resource_id::text LIKE '00000000-0000-4000-8000-0000000000__' $$,
+  -- fora o evento que o gatilho de criação grava para cada CEO criado (RF-14, 011_ceo_creation_audit)
+  $$ SELECT id FROM public.audit_events
+      WHERE resource_id::text LIKE '00000000-0000-4000-8000-0000000000__'
+        AND NOT (action = 'account.provisioned' AND actor_id IS NULL
+                 AND metadata @> '{"channel":"auth_admin"}'::jsonb) $$,
   'AC-08: as chamadas negadas não gravaram evento de auditoria'
 );
 
@@ -741,8 +745,20 @@ SELECT throws_ok(
 );
 SELECT tests.clear_authentication();
 SELECT is_empty(
-  $$ SELECT id FROM public.audit_events WHERE action = 'account.provisioned' AND resource_id IN ('00000000-0000-4000-8000-0000000000c2', '00000000-0000-4000-8000-0000000000ee') $$,
+  -- `record_account_provisioned` não grava para CEO nem para usuário inexistente; o único evento de um
+  -- CEO é o do gatilho de criação (canal auth_admin, sem ator), que não vem desta função
+  $$ SELECT id FROM public.audit_events
+      WHERE action = 'account.provisioned'
+        AND resource_id IN ('00000000-0000-4000-8000-0000000000c2', '00000000-0000-4000-8000-0000000000ee')
+        AND NOT (actor_id IS NULL AND metadata @> '{"channel":"auth_admin"}'::jsonb) $$,
   'E-19: nenhum evento account.provisioned foi gravado para CEO ou usuário inexistente'
+);
+SELECT is(
+  (SELECT count(*)::int FROM public.audit_events
+    WHERE action = 'account.provisioned' AND resource_id = '00000000-0000-4000-8000-0000000000c2'
+      AND actor_id IS NULL AND metadata @> '{"channel":"auth_admin"}'::jsonb),
+  1,
+  'RF-14: o filtro acima exclui exatamente o evento do gatilho de criação do CEO, e ele existe'
 );
 
 -- request_id da auditoria: header ausente ou fora do formato vira NULL ------------------------------------------------------------------------

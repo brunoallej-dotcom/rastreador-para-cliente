@@ -4,11 +4,11 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0, 1, 2 e 3 concluídas.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 4 concluídas.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 4 ∥ 5 — troca de senha + `ceo:create` e MFA TOTP (subagentes em worktree).
+- **Próximas ondas:** 5 (MFA TOTP, em revisão) e depois 6 (clientes).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -18,7 +18,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 1 | Plataforma HTTP: `withRoute`, erros, logs, headers, paginação, health, validador de contrato | 0 | 2 | ✅ |
 | 2 | Banco: schema, RLS, funções de identidade, auditoria, rate limit, pgTAP | 0 | 1 | ✅ |
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
-| 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ⬜ |
+| 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ⬜ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ⬜ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6 | 8 | ⬜ |
@@ -35,6 +35,10 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 |-----------|----------|
 | Revisar e aceitar os ADRs 0001–0009 (`docs/adr/`) | Onda 11 (o goal command exige `accepted`) |
 | F-03: bloqueio direcionado de conta (threat model T-04, §8): escolher a mudança no §3.9 da spec | risco aberto até a decisão |
+| F-41: prazo de validade da senha temporária (threat model §8) | decisão de spec; exige caminho de reset de CEO |
+| Proposta de mudança de contrato (threat model §8): limites de `newPassword` × 422, `currentPassword` em bytes, `Set-Cookie` no 204 e 503 de `changePassword`, orçamentos programáticos fora do `x-rate-limit` | OK do usuário (bump minor) |
+| Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
+| Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
 | Ativar branch protection na `main` (o repositório remoto já existe) e restringir o merge a squash | CI da Onda 0 |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
@@ -197,3 +201,42 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 - Verificado (sessão principal, a partir de `pnpm db:reset`): `pnpm verify` → 1349 unit + 459
   pgTAP; `pnpm db:lint` ok; `pnpm test:api` → 75/75 duas vezes; `pnpm test:api -t "AC-0[1-4]"` →
   8 verdes; `pnpm test:int` → 11/11; `build`, `format:check` e `test:hooks` (179) ok.
+
+### 2026-11-16 — Onda 4: troca de senha e `ceo:create`
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 5. Gates de banco em
+  fila por `flock` num lockfile compartilhado.
+- Entregue: `POST /auth/password` e `scripts/create-ceo.ts`.
+  - Troca de senha: re-autenticação por sign-in num cliente descartável, cuja sessão de prova é
+    revogada na hora e nunca chega aos cookies; gasta o orçamento global de login.
+  - Depois do sign-in, `updateUser` e então `mark_password_changed()`, que exige a prova da linha
+    de base. Um retry que recebe `PASSWORD_UNCHANGED` conta como sucesso.
+  - Troca pela metade ou estado incerto: 503 com a orientação de repetir usando a nova senha como
+    atual.
+  - Script: valida só URL e secret key, exige `--target` igual ao host e recusa `http` fora de
+    loopback; recusa URL e chave de fontes diferentes, recusa rodar em CI e recusa stdout fora de
+    terminal sem `--allow-non-tty`. A senha temporária sai uma única vez no stdout.
+- Decisões (ADR 0010): o GoTrue local ignora `current_password`. A opção que o faz valer
+  (`security_update_password_require_current_password`) só existe no Auth hospedado e virou gate de
+  go-live (F-40, ALTO). `secure_password_change = true` (F-13).
+- Nova migration: auditoria da criação de CEO (F-42, RF-14). O gatilho de perfil grava
+  `account.provisioned`, sem ator, com canal e papel da conexão nos metadados; se a auditoria
+  falhar, a criação também falha.
+- Revisões:
+  - code-reviewer: sem CRÍTICO/ALTO; 3 MÉDIOS de código corrigidos (retry, estado incerto, env
+    mínimo do script).
+  - threat-modeler: F-40..F-47, com F-40 como gate de go-live e F-41 como decisão do usuário.
+  - contract-guardian: conforme com ressalvas; as divergências que exigem mudar o contrato estão na
+    proposta pendente do threat model §8.
+  - rls-auditor: aprovado com 3 BAIXOS, corrigidos pela sessão principal (metadado `db_user`,
+    filtros do pgTAP 005 mais estreitos, teste de `user_metadata` forjado).
+- A sessão principal tornou robusto o teste F-05 da Onda 3. Sob a carga da onda paralela, o trabalho
+  do pipeline antes do handler passou da folga de 20 ms; agora a folga é explícita (150 ms).
+- Hook: o secrets-guard também recusa comandos Bash cujo texto contenha o nome do arquivo de env
+  local (inclusive em mensagem de commit). O Write converteu escapes `\uXXXX` em caracteres
+  literais; o agente corrigiu os testes e a sessão principal conferiu que o corpo da função na
+  migration ficou idêntico ao anterior, mais o bloco novo.
+- Verificado (sessão principal, sob o lock, a partir de `pnpm db:reset`): `pnpm verify` → 1522 unit
+  + 481 pgTAP; `pnpm db:lint` ok; `pnpm db:types` sem diff; `pnpm test:api` → 121/121 duas vezes;
+  `pnpm test:api -t "AC-0[56]|AC-31"` → 26 verdes; `pnpm test:int` → 22/22; `build`,
+  `format:check` e `test:hooks` (179) ok. Falta só o `pnpm ceo:create` real, que é do usuário.

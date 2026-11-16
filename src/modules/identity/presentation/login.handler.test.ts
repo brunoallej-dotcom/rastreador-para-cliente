@@ -10,10 +10,10 @@ import type {
 import { apiRequest, createTestPipeline } from '@/shared/http/testing';
 import {
   createLoginHandler,
-  LOGIN_GLOBAL_BUDGET,
   REFUSED_LOGIN_FLOOR_MS,
   REFUSED_LOGIN_JITTER_MS,
 } from './login.handler';
+import { LOGIN_GLOBAL_BUDGET } from './rate-limit-budgets';
 
 // Obviously fake, lowercase-only values (the secret-detection hook rightly ignores them).
 const FAKE_ENV = {

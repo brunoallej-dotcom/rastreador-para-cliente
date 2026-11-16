@@ -6,7 +6,6 @@ import {
   json,
   startResponseFloor,
   withRoute,
-  type GlobalBudget,
   type WithRoute,
 } from '@/shared/http';
 import { ServiceUnavailableError } from '@/shared/kernel';
@@ -15,6 +14,7 @@ import { UnexpectedAuthAnswerError, type CredentialsRefusal } from '../domain/er
 import { createSupabaseAuthGateway } from '../infrastructure/supabase-auth-gateway';
 import { createTrackingClientDirectory } from '../infrastructure/tracking-client-directory';
 import { loginBodySchema } from './login.schema';
+import { LOGIN_GLOBAL_BUDGET } from './rate-limit-budgets';
 import { toSessionDto } from './session.dto';
 
 /**
@@ -27,22 +27,6 @@ type LoginFailureReason = CredentialsRefusal | 'upstream_unavailable' | 'upstrea
 const LOGIN_IP_LIMIT = 20;
 const LOGIN_ACCOUNT_LIMIT = 10;
 const FIFTEEN_MINUTES_SECONDS = 15 * 60;
-
-/**
- * The aggregate budget of ALL logins together, in the `global` scope (F-02): 300 per 300 s, one
- * every second on average. The Auth server counts sign-ins per source IP and, behind this app, it
- * only ever sees the server's IP. A distributed attacker (20 attempts per /64 is allowed, and
- * there are many /64s) could therefore exhaust that quota and turn login into a 503 for everyone.
- * This budget answers 429 first: it must stay STRICTLY BELOW the project's `sign_in_sign_ups`
- * quota of Auth (`[auth.rate_limit]` in `supabase/config.toml`: 1000 per 5 minutes locally; the
- * hosted project must be configured above this, Wave 11), and far above what a real company's
- * logins need (4 CEOs and a handful of clients per client). A unit test compares the two numbers.
- */
-export const LOGIN_GLOBAL_BUDGET = {
-  group: 'login',
-  limit: 300,
-  windowSeconds: 300,
-} as const satisfies GlobalBudget;
 
 /**
  * A refused login (401) answers no sooner than 400 ms after the handler started, plus up to 100 ms
