@@ -788,12 +788,12 @@ describe('hardening of the verification (F-20 to F-23)', () => {
     expect(events('auth.mfa.followup_failed')).toEqual([]);
   });
 
-  it("F-20: a later login that only verifies the same factor leaves the CEO's other sessions alone", async () => {
+  it("F-20: a later login that only verifies the same factor leaves the CEO's other sessions alone (with the deprecated factorId, which is still accepted)", async () => {
     const first = await loginAsCeoWithMfa();
     const second = await signInCeoWithMfa(first, { verify: false });
     const secondEnrollment = { factorId: first.factorId, secret: first.secret };
 
-    await verifyTotp(second, secondEnrollment);
+    await verifyTotp(second, secondEnrollment, { sendFactorId: true });
 
     expect((await callAdmin(first.cookies)).status).toBe(200);
     expect((await callAdmin(second)).status).toBe(200);
@@ -1004,6 +1004,7 @@ describe('POST /api/v1/auth/mfa/totp/verify without a factorId (contract 1.0.0-d
         userId: first.ceo.id,
         factorId: first.factorId,
         factorSource: 'session',
+        candidateCount: 1,
         activated: false,
       }),
     ]);
@@ -1170,6 +1171,11 @@ describe('POST /api/v1/auth/mfa/totp/verify without a factorId (contract 1.0.0-d
       'factor_ambiguous',
       'factor_ambiguous',
     ]);
+    // F-60: the app never creates this state, so it also raises a stable event at error level
+    expect(events('auth.mfa.factor_ambiguous')).toEqual([
+      expect.objectContaining({ level: 'error', userId: ceo.id, candidateCount: 2 }),
+      expect.objectContaining({ level: 'error', userId: ceo.id, candidateCount: 2 }),
+    ]);
     // nothing was tried: both factors are still unverified, the session still aal1
     expect((await factorsOf(ceo.id)).map((factor) => factor.status)).toEqual([
       'unverified',
@@ -1184,6 +1190,56 @@ describe('POST /api/v1/auth/mfa/totp/verify without a factorId (contract 1.0.0-d
     });
     expect(named.status).toBe(200);
     expect((await callAdmin(cookies)).status).toBe(200);
+  });
+
+  it('F-61: a verified factor planted straight at Auth makes the CEO code fail as invalid_code; what the log can show is a factorId that is not the one the backend enrolled', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const own = await enrollTotp(cookies);
+    // the attacker (password and publishable key) plants a second factor and verifies it at Auth:
+    // with no verified factor yet, Auth asks for no aal2
+    const direct = publishableClient();
+    const signedIn = await direct.auth.signInWithPassword({
+      email: ceo.email,
+      password: ceo.password,
+    });
+    expect(signedIn.error).toBeNull();
+    const planted = await direct.auth.mfa.enroll({ factorType: 'totp', friendlyName: 'planted' });
+    if (planted.error) throw new Error(`planting failed: ${planted.error.message}`);
+    const challenge = await direct.auth.mfa.challenge({ factorId: planted.data.id });
+    if (challenge.error) throw new Error(`challenge failed: ${challenge.error.message}`);
+    const activated = await direct.auth.mfa.verify({
+      factorId: planted.data.id,
+      challengeId: challenge.data.id,
+      code: nextTotpCode(planted.data.totp.secret),
+    });
+    expect(activated.error).toBeNull();
+    // the CEO signs in again (Auth ended the aal1 session of the old login): a verified factor
+    // exists, so VERIFY_MFA is pending, and the code the CEO has is the one of THEIR factor
+    const fresh = await loginViaApi(ceo);
+    expect(await getSession(fresh).then(bodyOf)).toMatchObject({ pendingActions: ['VERIFY_MFA'] });
+    logged.lines.length = 0;
+
+    const response = await verifyTotpViaApi(fresh, { code: nextTotpCode(own.secret) });
+
+    expect(response.status).toBe(422);
+    expectToMatchContract('verifyTotp', 422, await bodyOf(response), response);
+    // "verified first" resolved the planted factor. Verifying it at Auth made Auth DELETE the CEO's
+    // unverified candidate, so the account has ONE factor and `candidateCount` is 1: the count
+    // cannot show this takeover. What can is the factor of the failure line: it is not the one the
+    // backend enrolled for this user (`auth.mfa.enrolled`), the correlation an alert is built on
+    expect(await factorsOf(ceo.id)).toEqual([
+      { id: planted.data.id, type: 'totp', status: 'verified' },
+    ]);
+    expect(events('auth.mfa.failed')).toEqual([
+      expect.objectContaining({
+        reason: 'invalid_code',
+        factorId: planted.data.id,
+        factorSource: 'session',
+        candidateCount: 1,
+      }),
+    ]);
+    expect(planted.data.id).not.toBe(own.factorId);
+    expect(events('auth.mfa.factor_ambiguous')).toEqual([]);
   });
 
   it('E-28: the 5 / 5 min limit counts a request without a factorId like any other: the 6th is 429 with Retry-After, even with the right code', async () => {
