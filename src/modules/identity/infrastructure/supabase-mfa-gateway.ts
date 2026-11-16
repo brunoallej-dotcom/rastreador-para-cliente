@@ -76,6 +76,12 @@ const enrollmentSchema = z.object({
 
 const challengeSchema = z.object({ id: z.guid() });
 
+/** `public.list_backend_totp_factors()`: the ids of the factors the backend enrolled for the user. */
+const backendFactorsSchema = z.array(z.object({ factor_id: z.guid() }));
+
+/** The `session_id` claim of an access token the client has verified. */
+const sessionIdSchema = z.guid();
+
 const errorCodeOf = (error: unknown): string | undefined => {
   const { code } = error as { code?: unknown };
   return typeof code === 'string' ? code : undefined;
@@ -146,7 +152,33 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         .array(totpFactorSchema)
         .safeParse(envelope.data.filter((factor) => factor.factor_type === 'totp'));
       if (!totp.success) throw new Error('list the factors: an answer that is not understood');
-      return totp.data.map((factor) => ({ id: factor.id, verified: factor.status === 'verified' }));
+
+      // Which of them the backend enrolled (F-60, F-61). The user's own session reads it: the
+      // database function answers only for the principal of that session.
+      const registry = await attempt(
+        'list the backend factors',
+        async () => await supabase.rpc('list_backend_totp_factors'),
+      );
+      if (registry.error) {
+        if (registry.status === UNAUTHORIZED_STATUS) {
+          throw new UnauthenticatedError('list the backend factors: the session was rejected', {
+            cause: registry.error,
+            detail: 'Authentication required.',
+          });
+        }
+        throw upstreamFailure('list the backend factors', registry.error, registry.status);
+      }
+      const enrolled = backendFactorsSchema.safeParse(registry.data);
+      if (!enrolled.success) {
+        throw new Error('list the backend factors: an answer that is not understood');
+      }
+      const backendIds = new Set(enrolled.data.map((row) => row.factor_id.toLowerCase()));
+
+      return totp.data.map((factor) => ({
+        id: factor.id,
+        verified: factor.status === 'verified',
+        backendEnrolled: backendIds.has(factor.id.toLowerCase()),
+      }));
     },
 
     async removeUnverifiedTotp(factorId) {
@@ -192,7 +224,7 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       return ok({ factorId: id, uri: totp.uri, secret: totp.secret, qrCode: totp.qr_code });
     },
 
-    async verifyTotp({ factorId, code }) {
+    async verifyTotp({ factorId, code, recordChallenge }) {
       // 1. Burn the code BEFORE the Auth server sees it (F-21): the Auth server accepts the same
       //    code again inside its window, the database does not. A wrong code is burned too, which
       //    costs nothing (a code is single-use whatever its fate). The database also checks that
@@ -243,6 +275,12 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         throw new Error('challenge a factor: an answer that is not understood');
       }
 
+      // 2b. The backend records the challenge it just made BEFORE the Auth server can verify it:
+      //     the attestation tells these challenges from the ones made straight at Auth (F-63). If it
+      //     cannot, the code is never tried (a throw is a 503, fail closed).
+      const recorded = await recordChallenge(challengeId.data.id);
+      if (!recorded.ok) return recorded;
+
       const verified = await attempt('verify a factor', () =>
         supabase.auth.mfa.verify({ factorId, challengeId: challengeId.data.id, code }),
       );
@@ -258,7 +296,24 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         }
         throw failure('verify a factor', verified.error);
       }
-      return ok(undefined);
+      return ok({ challengeId: challengeId.data.id });
+    },
+
+    async currentSessionId() {
+      // The claims of the access token the client holds NOW (after a verification, the new one),
+      // verified against the project's signing keys; the id is not read from an unverified cookie.
+      let result: Awaited<ReturnType<typeof supabase.auth.getClaims>>;
+      try {
+        result = await supabase.auth.getClaims();
+      } catch (cause) {
+        throw upstreamFailure('read the session claims', cause);
+      }
+      if (result.error) throw failure('read the session claims', result.error);
+      const sessionId = sessionIdSchema.safeParse(result.data?.claims.session_id);
+      if (!sessionId.success) {
+        throw new Error('read the session claims: no session id in the token');
+      }
+      return sessionId.data;
     },
 
     async revokeOtherSessions() {

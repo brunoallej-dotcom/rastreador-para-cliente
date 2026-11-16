@@ -7,6 +7,7 @@ import {
 import { clientIpFingerprint, json, withRoute, type WithRoute } from '@/shared/http';
 import { verifyTotp } from '../application/verify-totp';
 import { InvalidMfaCodeError } from '../domain/mfa-errors';
+import { createSupabaseMfaAttestor } from '../infrastructure/supabase-mfa-attestor';
 import { createSupabaseMfaGateway } from '../infrastructure/supabase-mfa-gateway';
 import { createTrackingClientDirectory } from '../infrastructure/tracking-client-directory';
 import { VERIFY_DAILY_BUDGET } from './rate-limit-budgets';
@@ -44,6 +45,13 @@ const FIVE_MINUTES_SECONDS = 5 * 60;
  * factor from the session itself, with the same request client (no admin client). Both budgets are
  * spent before that, so leaving the field out buys no extra attempt.
  *
+ * The session the verification elevates is only a CEO's once the backend ATTESTS it (ADR 0013): the
+ * use case records the challenge before the Auth server answers it, and attests the session after.
+ * A refused attestation (a code that was also verified straight at Auth inside the TOTP window, or a
+ * factor the backend never activated) is the same 422 as a wrong code, deletes every session of the
+ * CEO in the database and is an ALERT in the log (`auth.mfa.attestation_refused`, error level, with the
+ * reason and no PII). A failure to record or attest is a 503 and the session stays at `VERIFY_MFA`.
+ *
  * When the verification activated the FIRST factor, the use case signs the CEO out of their other
  * sessions. It is best effort: a failure is logged at warn level and the verification stands.
  *
@@ -75,7 +83,12 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
       const gateway = createSupabaseMfaGateway(supabase);
 
       const result = await verifyTotp(
-        { mfa: gateway, principals: gateway, clients: createTrackingClientDirectory(supabase) },
+        {
+          mfa: gateway,
+          attestor: createSupabaseMfaAttestor(),
+          principals: gateway,
+          clients: createTrackingClientDirectory(supabase),
+        },
         principal,
         body,
       );
@@ -87,25 +100,51 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
             factorId: result.error.factorId,
             factorSource: factorSourceOf(body),
             candidateCount: result.error.candidateCount,
+            foreignFactorCount: result.error.foreignFactorCount,
             ipHash: clientIpFingerprint(request),
           };
           logger.warn(
             { event: 'auth.mfa.failed', ...details, reason: result.error.reason },
             'auth.mfa.failed',
           );
-          // The app keeps ONE TOTP factor per CEO: a second one was planted straight at the Auth
-          // server (F-60). A stable event name, at error level, so an alert can be built on it.
+          // The app keeps ONE TOTP factor per CEO: more than one the backend enrolled is a state it
+          // never produces. A stable event name, at error level, so an alert can be built on it.
           if (result.error.reason === 'factor_ambiguous') {
             logger.error(
               { event: 'auth.mfa.factor_ambiguous', ...details },
               'auth.mfa.factor_ambiguous',
             );
           }
+          // A TOTP factor the backend did not enroll exists on this account: someone with the
+          // password planted it straight at the Auth server (F-60, F-61). The app never makes one.
+          if ((result.error.foreignFactorCount ?? 0) > 0) {
+            logger.error(
+              { event: 'auth.mfa.foreign_factor', ...details },
+              'auth.mfa.foreign_factor',
+            );
+          }
+          // The Auth server took the code and the database refused to attest the session: the
+          // password and a valid code are with someone else (F-50 b), or a factor the backend never
+          // activated was used (F-61). Every session of the CEO is already gone. The response is the
+          // same 422; this line is how the people find out.
+          if (result.error.reason === 'attestation_refused') {
+            logger.error(
+              {
+                event: 'auth.mfa.attestation_refused',
+                userId: principal.userId,
+                factorId: result.error.factorId,
+                factorSource: factorSourceOf(body),
+                attestationReason: result.error.attestationReason,
+                ipHash: clientIpFingerprint(request),
+              },
+              'auth.mfa.attestation_refused',
+            );
+          }
         }
         return result.error;
       }
 
-      const { session, activated, otherSessionsRevoked } = result.value;
+      const { session, activated, otherSessionsRevoked, foreignFactorCount } = result.value;
 
       // The id of the session the verification elevated: the same one as before, with new tokens.
       const accessToken = readAccessToken(snapshotSessionCookies(cookies));
@@ -116,12 +155,24 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
           factorId: result.value.factorId,
           factorSource: factorSourceOf(body),
           candidateCount: result.value.candidateCount,
+          foreignFactorCount,
           sessionId: accessToken === undefined ? undefined : sessionIdOfToken(accessToken),
           activated,
           ipHash: clientIpFingerprint(request),
         },
         'auth.mfa.verified',
       );
+      if ((foreignFactorCount ?? 0) > 0) {
+        logger.error(
+          {
+            event: 'auth.mfa.foreign_factor',
+            userId: principal.userId,
+            factorId: result.value.factorId,
+            foreignFactorCount,
+          },
+          'auth.mfa.foreign_factor',
+        );
+      }
       // Best effort: a failed revocation is a warning, and the verification stands.
       if (otherSessionsRevoked === false) {
         logger.warn(

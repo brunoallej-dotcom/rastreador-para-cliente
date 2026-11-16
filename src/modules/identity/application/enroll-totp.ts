@@ -7,9 +7,9 @@ import {
   type Result,
 } from '@/shared/kernel';
 import { MfaAlreadyEnrolledError } from '../domain/mfa-errors';
-import type { MfaGateway, TotpEnrollment } from '../domain/mfa-ports';
+import type { MfaAttestor, MfaGateway, TotpEnrollment } from '../domain/mfa-ports';
 
-export type EnrollTotpDeps = { readonly mfa: MfaGateway };
+export type EnrollTotpDeps = { readonly mfa: MfaGateway; readonly attestor: MfaAttestor };
 
 export type EnrollTotpOutcome = {
   readonly enrollment: TotpEnrollment;
@@ -28,10 +28,13 @@ export type EnrollTotpOutcome = {
  * 3. Unverified factors are leftovers of an enrollment that was never finished. They are removed
  *    (E-26), so there is never more than one candidate and the secret the user sees is the only
  *    one that can still be activated.
- * 4. A new factor is created.
+ * 4. A new factor is created and recorded as the backend's own (F-60, F-61): only a recorded factor
+ *    can be resolved as the candidate of a verification, and only a factor the backend activated is
+ *    ever attested. The record carries the id of the session that enrolled.
  *
- * If step 4 fails after step 3, the CEO simply enrolls again: nothing is left half done that a
- * retry cannot repair.
+ * If step 4 fails after step 3, or the record cannot be written, the CEO simply enrolls again: the
+ * unrecorded factor is a candidate like any other, removed by the next enrollment, and nothing is
+ * left half done that a retry cannot repair.
  */
 export async function enrollTotp(
   deps: EnrollTotpDeps,
@@ -48,5 +51,13 @@ export async function enrollTotp(
 
   const enrolled = await deps.mfa.enrollTotp();
   if (!enrolled.ok) return enrolled;
+
+  const recorded = await deps.attestor.registerEnrollment({
+    userId: principal.userId,
+    factorId: enrolled.value.factorId,
+    sessionId: await deps.mfa.currentSessionId(),
+  });
+  if (!recorded.ok) return recorded;
+
   return ok({ enrollment: enrolled.value, replacedFactors: factors.length });
 }

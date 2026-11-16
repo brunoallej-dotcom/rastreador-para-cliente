@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConflictError, ServiceUnavailableError, type Principal } from '@/shared/kernel';
 import { MfaAlreadyEnrolledError } from '../domain/mfa-errors';
-import { createFakeMfa } from './fake-mfa';
+import { createFakeMfa, FAKE_SESSION_ID } from './fake-mfa';
 import { enrollTotp } from './enroll-totp';
 
 const FACTOR_A = '00000000-0000-4000-8000-0000000000a1';
@@ -20,7 +20,7 @@ describe('enrollTotp', () => {
   it('creates a factor for a CEO who has none', async () => {
     const mfa = createFakeMfa();
 
-    const result = await enrollTotp({ mfa }, ceo);
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -33,14 +33,20 @@ describe('enrollTotp', () => {
   it('E-26: removes the unverified factor of an unfinished enrollment and creates a new one', async () => {
     const mfa = createFakeMfa({ factors: [{ id: FACTOR_A, verified: false }] });
 
-    const result = await enrollTotp({ mfa }, ceo);
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.replacedFactors).toBe(1);
     expect(result.value.enrollment.factorId).not.toBe(FACTOR_A);
     expect(mfa.factors().map((factor) => factor.id)).toEqual([result.value.enrollment.factorId]);
-    expect(mfa.calls).toEqual(['list', `remove:${FACTOR_A}`, 'enroll']);
+    expect(mfa.calls).toEqual([
+      'list',
+      `remove:${FACTOR_A}`,
+      'enroll',
+      'session',
+      `register:${result.value.enrollment.factorId}`,
+    ]);
   });
 
   it('E-26: removes every unverified factor, not only the first', async () => {
@@ -51,7 +57,7 @@ describe('enrollTotp', () => {
       ],
     });
 
-    const result = await enrollTotp({ mfa }, ceo);
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value.replacedFactors).toBe(2);
@@ -61,7 +67,10 @@ describe('enrollTotp', () => {
   it('E-27: a verified factor is a 409 MFA_ALREADY_ENROLLED and nothing is touched', async () => {
     const mfa = createFakeMfa({ factors: [{ id: FACTOR_A, verified: true }] });
 
-    const result = await enrollTotp({ mfa }, { ...ceo, aal: 'aal2', pendingActions: [] });
+    const result = await enrollTotp(
+      { mfa, attestor: mfa.attestor },
+      { ...ceo, aal: 'aal2', pendingActions: [] },
+    );
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(MfaAlreadyEnrolledError);
@@ -77,7 +86,7 @@ describe('enrollTotp', () => {
       ],
     });
 
-    const result = await enrollTotp({ mfa }, ceo);
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
 
     expect(result.ok).toBe(false);
     expect(mfa.factors()).toHaveLength(2);
@@ -87,7 +96,10 @@ describe('enrollTotp', () => {
   it('SEC-11: only a CEO enrolls; for a client the gateway is never called', async () => {
     const mfa = createFakeMfa();
 
-    const result = await enrollTotp({ mfa }, { ...ceo, role: 'client', clientId: 'c1' });
+    const result = await enrollTotp(
+      { mfa, attestor: mfa.attestor },
+      { ...ceo, role: 'client', clientId: 'c1' },
+    );
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('FORBIDDEN');
@@ -98,7 +110,7 @@ describe('enrollTotp', () => {
     const mfa = createFakeMfa();
     mfa.conflictOnNextEnroll(new ConflictError('raced'));
 
-    const result = await enrollTotp({ mfa }, ceo);
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(ConflictError);
@@ -108,14 +120,124 @@ describe('enrollTotp', () => {
     const mfa = createFakeMfa();
     mfa.failWith('list');
 
-    await expect(enrollTotp({ mfa }, ceo)).rejects.toBeInstanceOf(ServiceUnavailableError);
+    await expect(enrollTotp({ mfa, attestor: mfa.attestor }, ceo)).rejects.toBeInstanceOf(
+      ServiceUnavailableError,
+    );
   });
 
   it('an outage while removing the old factor stops before a new one is created', async () => {
     const mfa = createFakeMfa({ factors: [{ id: FACTOR_A, verified: false }] });
     mfa.failWith('remove');
 
-    await expect(enrollTotp({ mfa }, ceo)).rejects.toBeInstanceOf(ServiceUnavailableError);
+    await expect(enrollTotp({ mfa, attestor: mfa.attestor }, ceo)).rejects.toBeInstanceOf(
+      ServiceUnavailableError,
+    );
     expect(mfa.calls).not.toContain('enroll');
+  });
+});
+
+describe('enrollTotp: the backend records the factor it enrolled (ADR 0013, F-60, F-61)', () => {
+  const PLANTED = '00000000-0000-4000-8000-0000000000c3';
+
+  it("F-60: the new factor is registered as the backend's, after the session that enrolls it was read", async () => {
+    const mfa = createFakeMfa();
+
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(mfa.attestor.registrations()).toEqual([result.value.enrollment.factorId]);
+    expect(mfa.backendFactors()).toEqual([result.value.enrollment.factorId]);
+    expect(mfa.calls.indexOf('session')).toBeLessThan(
+      mfa.calls.indexOf(`register:${result.value.enrollment.factorId}`),
+    );
+  });
+
+  it('F-60: the registration is made for the user of the principal and the session of the request', async () => {
+    const mfa = createFakeMfa();
+    const calls: unknown[] = [];
+    const attestor = {
+      ...mfa.attestor,
+      registerEnrollment: (input: Parameters<typeof mfa.attestor.registerEnrollment>[0]) => {
+        calls.push(input);
+        return mfa.attestor.registerEnrollment(input);
+      },
+    };
+
+    const result = await enrollTotp({ mfa, attestor }, ceo);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(calls).toEqual([
+      {
+        userId: ceo.userId,
+        factorId: result.value.enrollment.factorId,
+        sessionId: FAKE_SESSION_ID,
+      },
+    ]);
+  });
+
+  it('F-60: a candidate planted straight at Auth is removed by the next enrollment like any other candidate', async () => {
+    const mfa = createFakeMfa();
+    mfa.plant({ id: PLANTED, verified: false });
+
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.replacedFactors).toBe(1);
+    expect(mfa.calls).toContain(`remove:${PLANTED}`);
+    expect(mfa.factors().map((factor) => factor.id)).toEqual([result.value.enrollment.factorId]);
+  });
+
+  it('F-61: a verified factor planted straight at Auth is a 409 like any verified factor, and nothing is registered', async () => {
+    const mfa = createFakeMfa();
+    mfa.plant({ id: PLANTED, verified: true });
+
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBeInstanceOf(MfaAlreadyEnrolledError);
+    expect(mfa.attestor.registrations()).toEqual([]);
+  });
+
+  it('a factor that vanished before it was recorded (a parallel enrollment) is a ConflictError: retrying is safe', async () => {
+    const mfa = createFakeMfa();
+    mfa.attestor.conflictOnNextRegistration();
+
+    const result = await enrollTotp({ mfa, attestor: mfa.attestor }, ceo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBeInstanceOf(ConflictError);
+  });
+
+  it('fail closed: if the record cannot be written the answer is a 503 and the secret is not returned', async () => {
+    const mfa = createFakeMfa();
+    mfa.attestor.failWith('register');
+
+    await expect(enrollTotp({ mfa, attestor: mfa.attestor }, ceo)).rejects.toBeInstanceOf(
+      ServiceUnavailableError,
+    );
+  });
+
+  it('fail closed: a session id that cannot be read stops the enrollment before anything is registered', async () => {
+    const mfa = createFakeMfa();
+    mfa.failWith('session');
+
+    await expect(enrollTotp({ mfa, attestor: mfa.attestor }, ceo)).rejects.toBeInstanceOf(
+      ServiceUnavailableError,
+    );
+    expect(mfa.attestor.registrations()).toEqual([]);
+  });
+
+  it('the factor of a failed record stays a plain candidate, not the one of the backend: nothing resolves it', async () => {
+    const mfa = createFakeMfa();
+    mfa.attestor.failWith('register');
+    await expect(enrollTotp({ mfa, attestor: mfa.attestor }, ceo)).rejects.toBeInstanceOf(
+      ServiceUnavailableError,
+    );
+    const stale = mfa.factors();
+    expect(stale).toHaveLength(1);
+    expect(mfa.backendFactors()).toEqual([]);
   });
 });
