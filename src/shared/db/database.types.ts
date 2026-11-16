@@ -148,6 +148,20 @@ isOneToOne: false
             "consume_totp_code":
 { Args: { "p_code_digest": string,"p_factor_id": string }; Returns: boolean
                            },
+"create_client":
+{ Args: { "p_name": string }; Returns: {
+              "archived_at": string | null,
+"created_at": string,
+"id": string,
+"name": string,
+"updated_at": string
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "clients"
+        isOneToOne: true
+        isSetofReturn: false
+      } },
 "current_principal":
 { Args: Record<PropertyKey, never>; Returns: {
               "aal": string,"client_id": string,"display_name": string,"has_verified_totp": boolean,"must_change_password": boolean,"role": Database["public"]['Enums']["app_role"],"user_id": string
@@ -177,7 +191,21 @@ isOneToOne: false
                            },
 "set_account_display_name":
 { Args: { "p_display_name": string,"p_user_id": string }; Returns: undefined
-                           }
+                           },
+"update_client":
+{ Args: { "p_archived"?: boolean,"p_client_id": string,"p_name"?: string }; Returns: {
+              "archived_at": string | null,
+"created_at": string,
+"id": string,
+"name": string,
+"updated_at": string
+            }
+                          SetofOptions: {
+        from: "*"
+        to: "clients"
+        isOneToOne: true
+        isSetofReturn: false
+      } }
           }
           Enums: {
             "app_role": "ceo"|"client","process_status": "active"|"completed"|"cancelled","stage_status": "pending"|"in_progress"|"completed"
