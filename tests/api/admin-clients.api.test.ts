@@ -746,36 +746,77 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
   });
 
   describe('Supabase failing', () => {
-    it('E-21: a read that cannot reach the database is 503 SERVICE_UNAVAILABLE, not a 500', async () => {
-      const spy = spyOnSupabaseFetch((url) =>
-        url.includes('/rest/v1/clients') ? new TypeError('fetch failed') : undefined,
-      );
-      try {
-        const list = await listClientsViaApi(ceo.cookies);
-        const get = await getClientViaApi(ceo.cookies, UNKNOWN_CLIENT_ID);
+    /** Makes the requests whose URL holds `part` fail the way a dead network does. */
+    const failing = (part: string) =>
+      spyOnSupabaseFetch((url) => (url.includes(part) ? new TypeError('fetch failed') : undefined));
 
-        expect([list.status, get.status]).toEqual([503, 503]);
-        expect(await bodyOf(list)).toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
-        expect(list.headers.get('retry-after')).not.toBeNull();
+    /** 503 `SERVICE_UNAVAILABLE` with a `Retry-After` of at least a second, as the contract documents. */
+    async function expectUnavailable(operationId: string, response: Response) {
+      const body = await expectContract<Problem>(operationId, response);
+
+      expect(response.status).toBe(503);
+      expect(body.code).toBe('SERVICE_UNAVAILABLE');
+      expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    }
+
+    it('E-21: listClients that cannot reach the database is 503 SERVICE_UNAVAILABLE, not a 500', async () => {
+      const spy = failing('/rest/v1/clients');
+      try {
+        await expectUnavailable('listClients', await listClientsViaApi(ceo.cookies));
       } finally {
         spy.restore();
       }
     });
 
-    it('E-21: a write that cannot reach the database is 503 and nothing is created', async () => {
-      const name = uniqueClientName('Fora do ar');
-      const spy = spyOnSupabaseFetch((url) =>
-        url.includes('/rest/v1/rpc/create_client') ? new TypeError('fetch failed') : undefined,
-      );
+    it('E-21: getClient that cannot reach the database is 503 SERVICE_UNAVAILABLE', async () => {
+      const spy = failing('/rest/v1/clients');
       try {
-        const response = await createClientViaApi(ceo.cookies, { name });
+        await expectUnavailable('getClient', await getClientViaApi(ceo.cookies, UNKNOWN_CLIENT_ID));
+      } finally {
+        spy.restore();
+      }
+    });
 
-        expect(response.status).toBe(503);
-        expect(await bodyOf(response)).toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+    it('E-21: createClient that cannot reach the database is 503 and nothing is created', async () => {
+      const name = uniqueClientName('Fora do ar');
+      const spy = failing('/rest/v1/rpc/create_client');
+      try {
+        await expectUnavailable('createClient', await createClientViaApi(ceo.cookies, { name }));
       } finally {
         spy.restore();
       }
       expect(await clientsNamed(name)).toBe(0);
+    });
+
+    it('E-21: updateClient that cannot reach the database is 503 and changes nothing', async () => {
+      const created = await createClient();
+      const spy = failing('/rest/v1/rpc/update_client');
+      try {
+        await expectUnavailable(
+          'updateClient',
+          await updateClientViaApi(ceo.cookies, created.id, { name: uniqueClientName('Nada') }),
+        );
+      } finally {
+        spy.restore();
+      }
+      expect(await nameOfClient(created.id)).toBe(created.name);
+    });
+
+    it('E-21: updateClient whose answer cannot be read back is 503 too, and the change is already made', async () => {
+      // the function ran; the read of the counters that follows it is what fails. A repeated PATCH
+      // with the same body is a no-op, so the 503 is safe to retry.
+      const created = await createClient();
+      const name = uniqueClientName('Gravado');
+      const spy = failing('/rest/v1/clients?');
+      try {
+        await expectUnavailable(
+          'updateClient',
+          await updateClientViaApi(ceo.cookies, created.id, { name }),
+        );
+      } finally {
+        spy.restore();
+      }
+      expect(await nameOfClient(created.id)).toBe(name);
     });
   });
 });
