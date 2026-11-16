@@ -38,3 +38,21 @@ describe('DomainError subclasses', () => {
     expect(new ValidationError('invalid').issues).toEqual([]);
   });
 });
+
+describe('DomainError problem members', () => {
+  it('carries a client-safe detail and extensions, separate from the log-only message', () => {
+    const error = new ConflictError('internal text', {
+      detail: 'The stage changed.',
+      extensions: { currentStageId: '8f14e45f-ceea-467a-9575-1a4f2f2a2f00' },
+    });
+    expect(error.message).toBe('internal text');
+    expect(error.detail).toBe('The stage changed.');
+    expect(error.extensions).toEqual({ currentStageId: '8f14e45f-ceea-467a-9575-1a4f2f2a2f00' });
+  });
+
+  it('defaults detail and extensions to undefined', () => {
+    const error = new NotFoundError('x');
+    expect(error.detail).toBeUndefined();
+    expect(error.extensions).toBeUndefined();
+  });
+});

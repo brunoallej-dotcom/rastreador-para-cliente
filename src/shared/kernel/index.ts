@@ -9,6 +9,18 @@ export {
   ServiceUnavailableError,
   UnauthenticatedError,
   ValidationError,
+  type DomainErrorOptions,
+  type ProblemExtensions,
   type ValidationIssue,
 } from './errors';
+export {
+  AALS,
+  PENDING_ACTION_PRIORITY,
+  PENDING_ACTIONS,
+  ROLES,
+  type Aal,
+  type PendingAction,
+  type Principal,
+  type Role,
+} from './principal';
 export { err, ok, type Err, type Ok, type Result } from './result';
