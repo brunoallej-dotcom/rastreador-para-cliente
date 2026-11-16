@@ -90,18 +90,47 @@ describe('generateTemporaryPassword', () => {
         counts.set(character, (counts.get(character) ?? 0) + 1);
       }
     }
-    const total = passwords * TEMPORARY_PASSWORD_LENGTH;
+    // The generator is uniform among the passwords that have every class: a draw without a digit
+    // (about 4.6% of them) is drawn again, so a digit is ~4.8% more frequent than a letter. The
+    // expected count of each symbol is therefore computed per class, by inclusion-exclusion:
+    // E[#c | accepted] = L·p_c·P(the other L-1 positions hold both other classes) / P(accepted).
+    const classes = [/[A-Z]/, /[a-z]/, /[0-9]/].map((pattern) =>
+      Array.from(TEMPORARY_PASSWORD_ALPHABET).filter((character) => pattern.test(character)),
+    );
     const symbols = TEMPORARY_PASSWORD_ALPHABET.length;
-    const expected = total / symbols;
-    // about 3,571 per symbol, standard deviation about 59: six sigma is a bound a healthy
-    // generator never touches, and a bias of even one extra use in the first 32 symbols would show
-    const tolerance = 6 * Math.sqrt(expected * (1 - 1 / symbols));
+    const length = TEMPORARY_PASSWORD_LENGTH;
+    const share = classes.map((members) => members.length / symbols);
+    const allPresent = (positions: number, wanted: readonly number[]): number => {
+      // P(every class in `wanted` appears in `positions` uniform draws)
+      let probability = 0;
+      for (let mask = 0; mask < 1 << wanted.length; mask += 1) {
+        const missing = wanted.filter((_, index) => (mask >> index) & 1);
+        const sign = missing.length % 2 === 0 ? 1 : -1;
+        const left = 1 - missing.reduce((sum, index) => sum + (share[index] ?? 0), 0);
+        probability += sign * Math.max(left, 0) ** positions;
+      }
+      return probability;
+    };
+    const every = classes.map((_, index) => index);
+    const accepted = allPresent(length, every);
+    // about 3,543 per letter and 3,743 per digit, standard deviation about 60: six sigma is a bound
+    // a healthy generator never touches, and modulo bias (the first 32 symbols favored) would show
     expect(counts.size).toBe(symbols);
-    for (const [symbol, count] of counts) {
-      expect(Math.abs(count - expected), `symbol ${symbol}: ${count} of ~${expected}`).toBeLessThan(
-        tolerance,
-      );
-    }
+    classes.forEach((members, index) => {
+      const others = every.filter((other) => other !== index);
+      const perPassword =
+        (length * (share[index] ?? 0) * allPresent(length - 1, others)) / accepted;
+      const perPosition = perPassword / members.length / length;
+      const expected = passwords * length * perPosition;
+      const tolerance = 6 * Math.sqrt(expected * (1 - perPosition));
+      for (const symbol of members) {
+        const count = counts.get(symbol) ?? 0;
+        expect(
+          Math.abs(count - expected),
+          `symbol ${symbol}: ${count} of ~${expected}`,
+        ).toBeLessThan(tolerance);
+      }
+    });
   });
 
   it('distribution: the first symbol of the password is as varied as the others', () => {
