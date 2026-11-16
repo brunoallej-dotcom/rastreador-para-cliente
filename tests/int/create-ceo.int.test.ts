@@ -63,6 +63,74 @@ describe('createCeoAccount against the local stack', () => {
     ).toEqual(['CHANGE_PASSWORD', 'ENROLL_MFA']);
   });
 
+  it('F-42, RF-14: creating a CEO leaves exactly one audit row: account.provisioned, without actor, in auth_admin channel', async () => {
+    const result = await createCeoAccount(
+      { authAdmin: authAdmin() },
+      { email: uniqueEmail('ceo-audit'), name: 'CEO Auditado' },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const { data, error } = await adminClient()
+      .from('audit_events')
+      .select(
+        'action, resource_type, actor_id, actor_role, client_id, process_id, request_id, metadata',
+      )
+      .eq('resource_id', result.value.userId);
+
+    expect(error).toBeNull();
+    expect(data).toEqual([
+      {
+        action: 'account.provisioned',
+        resource_type: 'account',
+        actor_id: null,
+        actor_role: null,
+        client_id: null,
+        process_id: null,
+        request_id: null,
+        metadata: { role: 'ceo', channel: 'auth_admin' },
+      },
+    ]);
+  });
+
+  it('F-42: an e-mail that is refused leaves no audit row for it, and the account it names keeps its own single row', async () => {
+    const email = uniqueEmail('ceo-audit-dup');
+    const first = await createCeoAccount({ authAdmin: authAdmin() }, { email, name: 'CEO Um' });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const before = await adminClient()
+      .from('audit_events')
+      .select('id')
+      .eq('action', 'account.provisioned');
+
+    const again = await createCeoAccount({ authAdmin: authAdmin() }, { email, name: 'CEO Dois' });
+
+    expect(again).toEqual({ ok: false, error: { kind: 'email_taken' } });
+    const after = await adminClient()
+      .from('audit_events')
+      .select('id')
+      .eq('action', 'account.provisioned');
+    expect(after.data?.length).toBe(before.data?.length);
+    const own = await adminClient()
+      .from('audit_events')
+      .select('id', { count: 'exact', head: true })
+      .eq('resource_id', first.value.userId);
+    expect(own.count).toBe(1);
+  });
+
+  it('F-42: a client login created through the same Auth Admin API is NOT audited by the trigger (record_account_provisioned does it, on a CEO call)', async () => {
+    const tenant = await createClient();
+    const login = await createClientUser({ clientId: tenant.id });
+
+    const { count, error } = await adminClient()
+      .from('audit_events')
+      .select('id', { count: 'exact', head: true })
+      .eq('resource_id', login.id);
+
+    expect(error).toBeNull();
+    expect(count).toBe(0);
+  });
+
   it('AC-31: the CEO is created WITH the temporary password, so it is the baseline: clearing the pendency needs a real change (ADR 0007)', async () => {
     const email = uniqueEmail('ceo-baseline');
     const result = await createCeoAccount({ authAdmin: authAdmin() }, { email, name: 'CEO Base' });
@@ -156,10 +224,15 @@ describe('main against the local stack', () => {
   async function runMain(email: string, name: string) {
     let stdout = '';
     let stderr = '';
-    const code = await main(['--email', email, '--name', name], {
+    // the target is the host of the local stack; the env is the shell's (CI cleared: this test may run
+    // in a pipeline) and no env file is read
+    const target = new URL(process.env.SUPABASE_URL ?? '').host;
+    const code = await main(['--target', target, '--email', email, '--name', name], {
       stdout: { write: (text) => void (stdout += text) },
       stderr: { write: (text) => void (stderr += text) },
-      env: process.env,
+      env: { ...process.env, CI: undefined },
+      stdoutIsTTY: true,
+      readEnvFile: () => undefined,
     });
     return { code, stdout, stderr };
   }
@@ -170,7 +243,7 @@ describe('main against the local stack', () => {
     const { code, stdout, stderr } = await runMain(email, 'CEO do Comando');
 
     expect(code).toBe(EXIT.created);
-    const password = /^temporary password: ([A-Za-z0-9]{20})\n$/.exec(stdout)?.[1];
+    const password = /^([A-Za-z0-9]{20})\n$/.exec(stdout)?.[1];
     expect(password, 'stdout carries exactly one line with the password').toBeDefined();
     expect(stderr).not.toContain(password ?? '');
     for (const text of [stdout, stderr]) {
