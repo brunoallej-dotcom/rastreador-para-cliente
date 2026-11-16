@@ -63,6 +63,30 @@ describe('createProcess', () => {
     expect(processes.stored()).toHaveLength(1);
   });
 
+  it('E-63: a blank description is stored as no description, whoever calls the use case', async () => {
+    const processes = repository();
+
+    const result = await createProcess({ processes }, ceoPrincipal, {
+      clientId: CLIENT_A.id,
+      title: 'Loja',
+      stages: [
+        { name: 'A', description: '' },
+        { name: 'B', description: '   ' },
+        { name: 'C', description: null },
+        { name: 'D' },
+        { name: 'E', description: 'Detalhe' },
+      ],
+    });
+
+    expect(result.ok && result.value.stages.map((stage) => stage.description)).toEqual([
+      null,
+      null,
+      null,
+      null,
+      'Detalhe',
+    ]);
+  });
+
   it.each([
     ['an empty list', []],
     [

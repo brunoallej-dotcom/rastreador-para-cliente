@@ -40,6 +40,34 @@ describe('validateStageInputs', () => {
   });
 
   it.each([
+    ['empty', ''],
+    ['made of spaces', '   '],
+    ['a no-break space', String.fromCodePoint(0x00a0)],
+    ['an ideographic space', String.fromCodePoint(0x3000)],
+    ['a byte order mark', String.fromCodePoint(0xfeff)],
+    ['a tab and a line break', '\t\n'],
+  ])(
+    'E-63: a description that is %s is no description (null), so the use case is right for any caller',
+    (_label, description) => {
+      const result = validateStageInputs([{ name: 'A', description }]);
+
+      expect(result.ok && result.value).toEqual([{ name: 'A', description: null }]);
+    },
+  );
+
+  it('E-63: a blank description is not measured: 3000 spaces are null, not a 400', () => {
+    const result = validateStageInputs([{ name: 'A', description: ' '.repeat(3000) }]);
+
+    expect(result.ok && result.value).toEqual([{ name: 'A', description: null }]);
+  });
+
+  it('keeps a real description exactly as it came: trimming real text is the edge validator’s job', () => {
+    const result = validateStageInputs([{ name: 'A', description: ' Detalhe ' }]);
+
+    expect(result.ok && result.value).toEqual([{ name: 'A', description: ' Detalhe ' }]);
+  });
+
+  it.each([
     ['an empty list', 0],
     ['31 stages', MAX_STAGES_PER_PROCESS + 1],
   ])('E-20, I1: %s is a 400 that points at body.stages', (_label, count) => {

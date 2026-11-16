@@ -64,10 +64,23 @@ export type StageTemplate = {
 const codePointLength = (text: string) => Array.from(text).length;
 
 /**
+ * A description that is missing, `null`, empty or only white space (what `String.prototype.trim`
+ * strips: the spaces, the no-break space, U+3000, the BOM...) is "no description": `null`. The database
+ * refuses an empty description on purpose (it is stricter than the contract), so the aggregate, and not
+ * only the HTTP schema, turns it into `null` before anything is stored: every caller of the use case
+ * gets the same answer.
+ */
+const normalizeDescription = (description: string | null | undefined): string | null =>
+  description === undefined || description === null || description.trim() === ''
+    ? null
+    : description;
+
+/**
  * I1 for a list of stages the caller sent: from 1 to 30 of them (E-20), each with a name of 1 to 120
- * characters and a description of up to 2000. Which characters a name may hold (control characters,
- * invisible fillers, "at least one letter or number") is the rule of the edge validator and of the
- * database (E-30), not of the aggregate. Every problem is collected, with the path the 400 shows.
+ * characters and a description of up to 2000 (a blank one is `null`, see `normalizeDescription`). Which
+ * characters a name may hold (control characters, invisible fillers, "at least one letter or number") is
+ * the rule of the edge validator and of the database (E-30), not of the aggregate. Every problem is
+ * collected, with the path the 400 shows.
  */
 export function validateStageInputs(
   stages: readonly StageInput[],
@@ -87,11 +100,8 @@ export function validateStageInputs(
         message: `Must have from 1 to ${STAGE_NAME_MAX_LENGTH} characters`,
       });
     }
-    if (
-      stage.description !== undefined &&
-      stage.description !== null &&
-      codePointLength(stage.description) > STAGE_DESCRIPTION_MAX_LENGTH
-    ) {
+    const description = normalizeDescription(stage.description);
+    if (description !== null && codePointLength(description) > STAGE_DESCRIPTION_MAX_LENGTH) {
       issues.push({
         path: `body.stages[${index}].description`,
         message: `Must have at most ${STAGE_DESCRIPTION_MAX_LENGTH} characters`,
@@ -100,5 +110,10 @@ export function validateStageInputs(
   });
   if (issues.length > 0) return err(new ValidationError('invalid stages', issues));
 
-  return ok(stages.map((stage) => ({ name: stage.name, description: stage.description ?? null })));
+  return ok(
+    stages.map((stage) => ({
+      name: stage.name,
+      description: normalizeDescription(stage.description),
+    })),
+  );
 }

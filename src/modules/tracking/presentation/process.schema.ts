@@ -63,13 +63,17 @@ export const updateProcessBodySchema = z
 export type CreateProcessBody = z.output<typeof createProcessBodySchema>;
 export type UpdateProcessBody = z.output<typeof updateProcessBodySchema>;
 
-/** A blank description (the edge trims it to nothing) is no description. */
+/**
+ * The stages of the body as the use case takes them. The description goes through as the edge parsed it
+ * (trimmed, and `''` when it was blank): turning a blank one into "no description" is the aggregate's
+ * rule (`validateStageInputs`), so it holds for every caller and not only for this schema.
+ */
 export function toStageInputs(stages: NonNullable<CreateProcessBody['stages']>): StageInput[] {
-  return stages.map((stage) => ({
-    name: stage.name,
-    description:
-      stage.description === undefined || stage.description === '' ? null : stage.description,
-  }));
+  return stages.map((stage) =>
+    stage.description === undefined
+      ? { name: stage.name }
+      : { name: stage.name, description: stage.description },
+  );
 }
 
 /** The body of a PATCH as the domain's patch: only the fields it carries. */

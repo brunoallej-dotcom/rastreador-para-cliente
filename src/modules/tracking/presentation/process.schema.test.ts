@@ -140,7 +140,7 @@ describe('createProcessBodySchema', () => {
 });
 
 describe('toStageInputs', () => {
-  it('turns a missing, empty or blank description into null and keeps a real one', () => {
+  it('hands the description over as the edge parsed it: a blank one is `` for the aggregate to turn into null', () => {
     const parsed = createProcessBodySchema.parse({
       title: 'P',
       stages: [
@@ -152,9 +152,9 @@ describe('toStageInputs', () => {
     });
 
     expect(toStageInputs(parsed.stages ?? [])).toEqual([
-      { name: 'A', description: null },
-      { name: 'B', description: null },
-      { name: 'C', description: null },
+      { name: 'A' },
+      { name: 'B', description: '' },
+      { name: 'C', description: '' },
       { name: 'D', description: 'Detalhe' },
     ]);
   });
