@@ -223,7 +223,10 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
 - **Contas de cliente:** `auth.admin.createUser` com `email_confirm: true` e
   `app_metadata = { role: 'client', client_id }`. O trigger `private.handle_new_auth_user` cria o
   `profile` **na mesma transação** a partir de `raw_app_meta_data`, que só a secret key consegue
-  escrever. Se faltar papel ou cliente, o trigger lança erro e o usuário não é criado (fail closed).
+  escrever. O GoTrue faz o `INSERT` em `auth.users` só com `provider`/`providers` e grava o
+  `app_metadata` recebido num `UPDATE` logo depois, na mesma transação; por isso o trigger é um
+  `CONSTRAINT TRIGGER` **adiado** (roda no `COMMIT` e relê a linha). Se faltar papel ou cliente, o
+  trigger lança erro, o `COMMIT` falha e o usuário não é criado (fail closed).
   `raw_user_meta_data`, que o próprio usuário edita, **nunca** é lido. O nome de exibição vem de
   `app_metadata.display_name` (CEO e cliente), e o trigger também recusa cliente arquivado ou com
   10 logins (defesa em profundidade; o caso de uso checa antes para responder 422).
@@ -402,6 +405,11 @@ se faltar alguma:
 
 Previews da Vercel apontam para um projeto Supabase de **staging**, nunca de produção, e ficam
 com Deployment Protection ligado.
+
+No Auth do Supabase (`supabase/config.toml`), `[auth] enable_signup = false` bloqueia o cadastro
+público. `[auth.email] enable_signup` precisa ficar `true`: apesar do nome, no CLI ele liga o provider
+de e-mail e senha, e com `false` o login responde 422 `email_provider_disabled`. O Admin API cria
+usuários nos dois casos.
 
 ### 3.12 LGPD
 
