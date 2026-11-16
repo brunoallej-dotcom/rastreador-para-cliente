@@ -185,7 +185,9 @@ Toda rota é criada com `withRoute(policy, handler)`. O tipo `policy` **não tem
 `{ access: 'public' }` precisa ser escrito explicitamente.
 
 ```
- 1. Gera X-Request-Id (UUID v4). Ignora o valor de entrada se não casar com ^[A-Za-z0-9-]{8,64}$.
+ 1. Gera X-Request-Id (UUID v4), SEMPRE no servidor. Um X-Request-Id enviado pelo cliente nunca vira
+    o id da requisição: se casar com ^[A-Za-z0-9-]{8,64}$, é registrado à parte nos logs como
+    `clientRequestId`; senão é ignorado. Resposta, `problem+json`, logs e auditoria só carregam o id do servidor.
  2. Métodos não seguros: Origin ∈ origens permitidas            → senão 403 ORIGIN_NOT_ALLOWED
  3. Corpo: Content-Type application/json e tamanho ≤ 16 KiB      → 415 / 413
  4. Rate limit do grupo da rota (IP, conta ou usuário)          → 429 + Retry-After
@@ -208,6 +210,12 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
 - **Login** (`POST /auth/login`): normaliza o e-mail (trim + lowercase, NFC) → rate limit por IP
   e por conta (HMAC do e-mail) → `signInWithPassword` num client que grava cookies → carrega
   `current_principal()` → se não houver principal ativo, faz `signOut` e responde 401 genérico.
+  Antes de chamar o Auth, o login gasta o orçamento global de logins (§3.9). Só as respostas do Auth
+  que dizem "estas credenciais não abrem sessão" (`invalid_credentials`, `user_banned`,
+  `email_not_confirmed`) viram o 401 genérico; falha de transporte, timeout, 5xx, 429 e qualquer
+  outro código do Auth viram 503, nunca 401. Toda recusa (401) responde só depois de um piso de
+  400 ms mais até 100 ms de jitter, medido do início do handler, para que senha errada, e-mail
+  inexistente e conta desativada levem o mesmo tempo.
   A resposta traz `user`, `client` (para quem tem papel `client`), `aal` e `pendingActions`, e
   **nunca** tokens.
 - **Cookies:** `@supabase/ssr` com `cookieOptions.name = '__Host-rt-session'`; ao gravar, força
@@ -360,6 +368,8 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
 |-------|-----------------|--------|
 | login | IP (HMAC) | 20 / 15 min |
 | login | conta (HMAC do e-mail normalizado) | 10 / 15 min |
+| login | global (todos os logins juntos, uma única chave) | 300 / 5 min, sempre abaixo da cota `sign_in_sign_ups` do Auth |
+| sessão que faria o servidor chamar o Auth (cookie vencido ou que não se verifica localmente) | IP (HMAC) | 60 / 15 min |
 | verificação TOTP | usuário | 5 / 5 min |
 | troca de senha | usuário | 5 / 15 min |
 | provisionar ou resetar senha de login de cliente | CEO | 20 / hora |
@@ -374,15 +384,30 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   Vercel. Sem o nosso limitador, um atacante poderia esgotar o limite por IP do Supabase e
   bloquear **todos** os usuários.
 - Se o limitador falhar, a requisição é negada (fail closed, 503).
+- **Escopo `global`:** uma chave só para o app inteiro, usada apenas por orçamentos agregados
+  que o código gasta explicitamente (o login). Nunca vale em política de rota. Os limites por IP e
+  por conta não protegem a cota do Auth contra um atacante distribuído; o teto global responde
+  429 antes que o Auth responda 503 a todos.
+- **Sessão que chama o Auth:** antes de `getClaims()`, o servidor decodifica o cookie sem confiar
+  nele; se resolvê-lo chamaria o Auth (token vencido, ou que não se verifica localmente), o IP
+  gasta o orçamento da tabela. Acima dele: 401, sem apagar os cookies e sem chamar o Auth.
+- Cada instância guarda em memória as negações que viu e responde 429 sem consultar o banco até o fim
+  da janela (só deixa o limite mais estrito). `rate_limit_hit` apaga, em cerca de 1% das chamadas,
+  até 500 janelas vencidas há mais de 1 dia; a limpeza diária por `pg_cron` entra na Onda 11.
 
 ### 3.10 Observabilidade e auditoria
 
 - **Logs** (pino, JSON, stdout → Vercel): `requestId`, `route`, `method`, `status`, `durationMs`,
   `userId` (id interno), `role`. Redação de `password`, `email`, `cookie`, `authorization`,
   `temporaryPassword`, `secret` e `token`. Proibido `console.*` em `src/`.
-- **Eventos de auth em log:** `auth.login.succeeded` (userId), `auth.login.failed` (HMAC do
-  e-mail e motivo genérico), `auth.logout`, `auth.mfa.enrolled`, `auth.mfa.verified`,
-  `auth.mfa.failed`, `auth.rate_limited`, `authz.denied` (com motivo).
+- **Eventos de auth em log:** `auth.login.succeeded` (userId, `sessionId`, `ipHash`),
+  `auth.login.failed` (HMAC do e-mail, `ipHash` e uma categoria: `invalid_credentials`,
+  `account_inactive`, `upstream_unavailable` ou `upstream_error`), `auth.logout` (userId,
+  `sessionId`, `ipHash`), `auth.mfa.enrolled`, `auth.mfa.verified`,
+  `auth.mfa.failed`, `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo).
+  `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
+  diferentes dos valores gravados no banco: o log não guarda IP nem e-mail e não se liga às linhas
+  de `rate_limit_counters`.
 - **Auditoria no banco** (`audit_events`): eventos de negócio de §3.7, gravados na mesma
   transação da mudança, com ator, papel, recurso, cliente, processo, `request_id` e `metadata`
   sem PII.

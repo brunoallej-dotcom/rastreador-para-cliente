@@ -245,17 +245,36 @@ describe('withRoute: security envelope on every response', () => {
   });
 });
 
-describe('withRoute: request id', () => {
+describe('withRoute: request id (F-11)', () => {
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
   const run = (headers: Record<string, string>) => {
-    const { withRoute } = createTestPipeline();
-    const route = withRoute(PUBLIC_POLICY, ({ requestId }) => json(200, { requestId }));
-    return route(apiRequest('/x', { headers }));
+    const { withRoute, logs } = createTestPipeline();
+    const route = withRoute(PUBLIC_POLICY, ({ requestId, logger }) => {
+      logger.info({ event: 'probe' }, 'probe');
+      return json(200, { requestId });
+    });
+    return route(apiRequest('/x', { headers })).then((response) => ({ response, logs }));
   };
 
-  it('reuses a valid incoming X-Request-Id and exposes it to the handler', async () => {
-    const response = await run({ 'x-request-id': 'client-trace-0001' });
-    expect(response.headers.get('x-request-id')).toBe('client-trace-0001');
-    expect(await response.json()).toEqual({ requestId: 'client-trace-0001' });
+  it('always generates the request id on the server, even when the client sends a valid one', async () => {
+    const { response } = await run({ 'x-request-id': 'client-trace-0001' });
+    const id = response.headers.get('x-request-id');
+    expect(id).toMatch(UUID_V4);
+    expect(id).not.toBe('client-trace-0001');
+    // the handler, the body and the header all carry the server's id
+    expect(await response.json()).toEqual({ requestId: id });
+  });
+
+  it('logs a valid client id beside the server id, as clientRequestId', async () => {
+    const { response, logs } = await run({ 'x-request-id': 'client-trace-0001' });
+    const id = response.headers.get('x-request-id');
+    const probe = logs.events('probe')[0];
+    expect(probe).toMatchObject({ requestId: id, clientRequestId: 'client-trace-0001' });
+    for (const record of logs.records()) {
+      expect(record['requestId']).toBe(id);
+      expect(record['clientRequestId']).toBe('client-trace-0001');
+    }
   });
 
   it.each([
@@ -263,20 +282,22 @@ describe('withRoute: request id', () => {
     ['too long', 'a'.repeat(65)],
     ['unsafe characters', 'id with spaces!'],
     ['header injection attempt', 'abcdefgh\r\nSet-Cookie: x=1'],
-  ])('replaces an incoming id that is %s with a UUID v4', async (_label, incoming) => {
-    const headers = new Headers();
-    // `Headers` rejects CR/LF, so the injection case is sent without it.
-    headers.set('x-request-id', incoming.replace(/[\r\n]/g, ''));
-    const response = await run(Object.fromEntries(headers));
-    expect(response.headers.get('x-request-id')).not.toBe(incoming);
-    expect(response.headers.get('x-request-id')).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-  });
+  ])(
+    'ignores an incoming id that is %s: no clientRequestId, never in a log',
+    async (_label, incoming) => {
+      const headers = new Headers();
+      // `Headers` rejects CR/LF, so the injection case is sent without it.
+      headers.set('x-request-id', incoming.replace(/[\r\n]/g, ''));
+      const { response, logs } = await run(Object.fromEntries(headers));
+      expect(response.headers.get('x-request-id')).toMatch(UUID_V4);
+      for (const record of logs.records()) expect(record).not.toHaveProperty('clientRequestId');
+      expect(logs.lines.join('\n')).not.toContain(incoming.replace(/[\r\n]/g, ''));
+    },
+  );
 
   it('generates a different UUID for every request without an incoming id', async () => {
-    const first = (await run({})).headers.get('x-request-id');
-    const second = (await run({})).headers.get('x-request-id');
+    const first = (await run({})).response.headers.get('x-request-id');
+    const second = (await run({})).response.headers.get('x-request-id');
     expect(first).not.toBe(second);
   });
 });
@@ -732,6 +753,7 @@ describe('withRoute: a failing logger never changes the answer', () => {
       principalResolver: createFakePrincipalResolver(principal),
       allowedOrigins: [TEST_APP_ORIGIN],
       requireClientIp: false,
+      subjectFingerprint: () => 'fingerprint',
       logger: throwingLogger(),
     }));
 
@@ -799,6 +821,7 @@ describe('withRoute: request setup failures are fail-closed problem responses', 
       principalResolver: createFakePrincipalResolver(null),
       allowedOrigins: [TEST_APP_ORIGIN],
       requireClientIp: false,
+      subjectFingerprint: () => 'fingerprint',
       logger: brokenLogger,
     }));
     const response = await withRoute(PUBLIC_POLICY, handler)(apiRequest('/x'));

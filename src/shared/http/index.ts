@@ -16,6 +16,8 @@ export {
 export { visibleText } from './validation';
 export { bufferCookies, type BufferedCookieJar } from './cookie-buffer';
 export { fingerprintSubject } from './rate-limit/subject-hmac';
+export { clientIpFingerprint } from './request-fingerprint';
+export { startResponseFloor, timing, type ResponseFloor } from './response-floor';
 export type { CookieJar, CookieOptions } from './cookies';
 export type {
   AuthenticatedPolicy,
@@ -27,6 +29,7 @@ export type {
 } from './route-policy';
 export {
   RATE_LIMIT_GROUPS,
+  type GlobalBudget,
   type RateLimitGroup,
   type RateLimitRule,
   type RateLimitScope,

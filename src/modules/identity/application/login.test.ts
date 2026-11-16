@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ServiceUnavailableError, type Principal } from '@/shared/kernel';
 import { InvalidCredentialsError } from '../domain/errors';
-import { createFakeClientDirectory, createFakeIdentity, type FakeAccount } from './fakes';
+import {
+  createFakeClientDirectory,
+  createFakeIdentity,
+  FAKE_SESSION_ID,
+  type FakeAccount,
+} from './fakes';
 import { login } from './login';
 
 const CLIENT = { id: '22222222-2222-4222-8222-222222222222', name: 'Cliente A' };
@@ -49,7 +54,13 @@ describe('login', () => {
 
     const result = await login(deps, { email: maria.email, password: PASSWORD });
 
-    expect(result).toEqual({ ok: true, value: { principal: clientPrincipal, client: CLIENT } });
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        session: { principal: clientPrincipal, client: CLIENT },
+        sessionId: FAKE_SESSION_ID,
+      },
+    });
     expect(identity.sessionOpen()).toBe(true);
   });
 
@@ -58,7 +69,10 @@ describe('login', () => {
 
     const result = await login(deps, { email: ceo.email, password: PASSWORD });
 
-    expect(result).toEqual({ ok: true, value: { principal: ceoPrincipal, client: null } });
+    expect(result).toEqual({
+      ok: true,
+      value: { session: { principal: ceoPrincipal, client: null }, sessionId: FAKE_SESSION_ID },
+    });
     expect(clients.lookups).toEqual([]);
   });
 

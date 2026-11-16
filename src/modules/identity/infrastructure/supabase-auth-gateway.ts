@@ -1,5 +1,6 @@
 import { readCurrentPrincipal } from '@/shared/db/current-principal';
 import type { RequestSupabase } from '@/shared/db/server-client';
+import { sessionIdOfToken } from '@/shared/db/session-cookies';
 import { isUpstreamUnavailable, upstreamFailure } from '@/shared/db/upstream-errors';
 import { err, ok, ServiceUnavailableError } from '@/shared/kernel';
 import {
@@ -77,7 +78,7 @@ export function createSupabaseAuthGateway(
       if (data.session === null) {
         throw new UnexpectedAuthAnswerError('sign in returned no session', {});
       }
-      return ok(undefined);
+      return ok({ sessionId: sessionIdOfToken(data.session.access_token) ?? null });
     },
 
     async signOut() {

@@ -2,9 +2,9 @@
 // The env (URL, keys, HMAC key) comes from the `int` project setup (local Supabase only).
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { getAdminFacade } from '@/shared/db/admin-client';
 import {
   createPostgresRateLimiter,
-  createSupabaseRateLimitHit,
   type RateLimitHit,
   type RateLimitHitInput,
 } from './postgres-rate-limiter';
@@ -28,7 +28,7 @@ const keyFor = (subject: string, forRule: RateLimitRule = rule()): RateLimitKey 
 /** The real RPC, remembering what the database was handed. */
 function spiedLimiter() {
   const sent: RateLimitHitInput[] = [];
-  const realHit = createSupabaseRateLimitHit();
+  const realHit: RateLimitHit = (input) => getAdminFacade().rateLimitHit(input);
   const hit: RateLimitHit = (input) => {
     sent.push(input);
     return realHit(input);
@@ -100,7 +100,7 @@ describe('createPostgresRateLimiter against the local database', () => {
   it('fails closed (throws) when the database refuses the call, instead of allowing', async () => {
     const limiter = createPostgresRateLimiter({
       // the database rejects a window of zero seconds (INVALID_INPUT)
-      hit: (input) => createSupabaseRateLimitHit()({ ...input, windowSeconds: 0 }),
+      hit: (input) => getAdminFacade().rateLimitHit({ ...input, windowSeconds: 0 }),
     });
     await expect(limiter.consume(keyFor(`int-${randomUUID()}`), rule())).rejects.toThrow(
       'rate_limit_hit failed',

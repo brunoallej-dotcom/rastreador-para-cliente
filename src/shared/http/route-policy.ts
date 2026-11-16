@@ -3,7 +3,7 @@ import type { z } from 'zod';
 import type { DomainError, PendingAction, Principal, Role } from '@/shared/kernel';
 import type { Logger } from '@/shared/observability/logger';
 import type { CookieJar } from './cookies';
-import type { RateLimitRule } from './rate-limit/rate-limiter';
+import type { GlobalBudget, PolicyRateLimitRule, RateLimitRule } from './rate-limit/rate-limiter';
 import type { InputSchema } from './validation';
 
 /** Output type of an optional schema; `undefined` when the policy declares none. */
@@ -26,7 +26,9 @@ type SchemaFields<Pa, Q, B> = {
  * public routes and only after the body is validated (see `accountKey`). A public route needs at
  * least one `ip` rule (checked when the route is defined).
  */
-type RateLimited = { readonly rateLimit: readonly [RateLimitRule, ...RateLimitRule[]] };
+type RateLimited = {
+  readonly rateLimit: readonly [PolicyRateLimitRule, ...PolicyRateLimitRule[]];
+};
 
 export type PublicPolicy<Pa, Q, B> = SchemaFields<Pa, Q, B> &
   RateLimited & {
@@ -78,6 +80,13 @@ export type HandlerContext<Pr extends Principal | null, Pa, Q, B> = {
   readonly cookies: CookieJar;
   /** Child logger that already carries the `requestId`. */
   readonly logger: Logger;
+  /**
+   * Consumes an AGGREGATE budget shared by the whole app (scope `global`, one subject), e.g. all
+   * logins together, in the pipeline's rate limiter. Over budget it throws `RateLimitedError`
+   * (429 with `Retry-After`); a failing limiter denies with 503 (fail closed). It is how a handler
+   * spends a global budget: `global` is never a route-policy scope.
+   */
+  readonly consumeGlobalBudget: (budget: GlobalBudget) => Promise<void>;
 };
 
 /** A response, or a `DomainError` to be turned into problem+json (returned or thrown). */

@@ -1,11 +1,13 @@
 // What login and logout write to the logs (spec §3.10, SEC-16): the events exist, they carry the
 // request id and an internal id or an HMAC, and never the e-mail, the password, a token or the
 // cookie. The process logger is replaced by one that captures its lines; everything else is real.
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as LoggerModule from '@/shared/observability/logger';
 import { POST as loginRoute } from '@/app/api/v1/auth/login/route';
 import { POST as logoutRoute } from '@/app/api/v1/auth/logout/route';
+import { sessionIdOfToken } from '@/shared/db/session-cookies';
 import { hmacSubject } from '@/shared/http/rate-limit/subject-hmac';
+import { timing } from '@/shared/http/response-floor';
 import {
   ceoAal2Client,
   createClient,
@@ -13,7 +15,13 @@ import {
   disableAccount,
   uniqueEmail,
 } from '../helpers/fixtures';
-import { createCookieStore, invoke, spyOnSupabaseFetch } from '../helpers/http';
+import {
+  createCookieStore,
+  invoke,
+  newClientIp,
+  readSessionCookie,
+  spyOnSupabaseFetch,
+} from '../helpers/http';
 
 const logged = vi.hoisted(() => ({ lines: [] as string[] }));
 
@@ -50,6 +58,15 @@ async function loginWhileAuthAnswers(answer: () => Response | Error): Promise<Re
 }
 
 describe('auth events in the logs', () => {
+  beforeEach(() => {
+    // a refused login waits for its floor (F-05); these tests do not wait for real
+    vi.spyOn(timing, 'sleep').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('SEC-16: auth.login.failed carries an HMAC of the normalized e-mail and a generic reason, never the e-mail or the password', async () => {
     const email = uniqueEmail('Failing');
     const password = 'Wrong-Password-For-Logs-1';
@@ -71,11 +88,32 @@ describe('auth events in the logs', () => {
     expect(failed?.['accountHash']).toBe(hmacSubject(logKey, email.toLowerCase()));
     // ...and it is NOT the value the rate limiter stores in the database for that account
     expect(failed?.['accountHash']).not.toBe(hmacSubject(secret, email.toLowerCase()));
+    // F-09: a keyed hash of the client IP, never the IP
+    expect(failed?.['ipHash']).toMatch(/^[0-9a-f]{64}$/);
 
     const everything = logged.lines.join('\n');
     expect(everything).not.toContain(password);
     expect(everything.toLowerCase()).not.toContain(email.toLowerCase());
     expect(everything.toLowerCase()).not.toContain(email.split('@')[0]?.toLowerCase());
+  });
+
+  it("F-11: the request id is the server's; a valid X-Request-Id of the client is logged beside it as clientRequestId", async () => {
+    logged.lines.length = 0;
+
+    const response = await invoke(loginRoute, {
+      method: 'POST',
+      path: '/auth/login',
+      body: { email: uniqueEmail('trace'), password: 'any-password-1' },
+      headers: { 'x-request-id': 'client-trace-0001' },
+    });
+
+    const id = response.headers.get('x-request-id');
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect((await response.clone().json()) as { requestId: string }).toMatchObject({
+      requestId: id,
+    });
+    const [failed] = events('auth.login.failed');
+    expect(failed).toMatchObject({ requestId: id, clientRequestId: 'client-trace-0001' });
   });
 
   it('SEC-16: auth.login.failed names the category: invalid_credentials or account_inactive for a refusal of credentials', async () => {
@@ -121,37 +159,59 @@ describe('auth events in the logs', () => {
     expect(failed[0]).not.toHaveProperty('authCode');
   });
 
-  it('SEC-16: auth.login.succeeded carries the user id only; auth.logout the same; no secrets anywhere', async () => {
+  it('SEC-16 / F-09: login and logout events carry the user id, the session id and a keyed hash of the IP, and no secrets anywhere', async () => {
     const client = await createClient();
     const user = await createClientUser({ clientId: client.id });
     const jar = createCookieStore();
+    const ip = newClientIp();
+    // the pipeline aggregates an IPv6 address to its /64: the first four groups
+    const subject = `${ip.split(':').slice(0, 4).join(':')}::/64`;
+    const secret = process.env.RATE_LIMIT_KEY_SECRET ?? '';
+    const expectedIpHash = hmacSubject(hmacSubject(secret, 'log-fingerprint-v1'), subject);
     logged.lines.length = 0;
 
-    const loginResponse = await login(user.email, user.password, jar);
+    const loginResponse = await invoke(loginRoute, {
+      method: 'POST',
+      path: '/auth/login',
+      body: { email: user.email, password: user.password },
+      cookies: jar,
+      ip,
+    });
     const cookieHeader = jar.header() ?? '';
+    const sessionId = sessionIdOfToken(readSessionCookie(jar).access_token);
     const logoutResponse = await invoke(logoutRoute, {
       method: 'POST',
       path: '/auth/logout',
-      cookies: jar,
+      cookies: jar.clone(),
+      ip,
     });
 
     expect(loginResponse.status).toBe(200);
     expect(logoutResponse.status).toBe(204);
+    expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
 
     const [succeeded] = events('auth.login.succeeded');
     expect(succeeded).toMatchObject({
       level: 'info',
       userId: user.id,
+      sessionId,
+      ipHash: expectedIpHash,
       requestId: loginResponse.headers.get('x-request-id'),
     });
     expect(Object.keys(succeeded ?? {}).sort()).toEqual(
-      ['event', 'level', 'msg', 'requestId', 'time', 'userId'].sort(),
+      ['event', 'ipHash', 'level', 'msg', 'requestId', 'sessionId', 'time', 'userId'].sort(),
     );
     const [loggedOut] = events('auth.logout');
     expect(loggedOut).toMatchObject({
       userId: user.id,
+      sessionId,
+      ipHash: expectedIpHash,
       requestId: logoutResponse.headers.get('x-request-id'),
     });
+
+    // the IP itself is nowhere, in any form
+    expect(logged.lines.join('\n')).not.toContain(ip);
+    expect(logged.lines.join('\n')).not.toContain(subject);
 
     const everything = logged.lines.join('\n');
     expect(everything).not.toContain(user.password);

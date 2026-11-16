@@ -2,6 +2,9 @@ import type { Principal, Result } from '@/shared/kernel';
 import type { InvalidCredentialsError } from './errors';
 import type { ClientSummary } from './session';
 
+/** What a successful sign-in opened. The id is the session's own, for log lines (never a secret). */
+export type SignedIn = { readonly sessionId: string | null };
+
 export type Credentials = {
   /** Already normalized (`normalizeEmail`) and validated. */
   readonly email: string;
@@ -20,7 +23,7 @@ export interface AuthGateway {
    * Opens a session. `err(InvalidCredentialsError)` for credentials the backend refuses, whatever
    * the reason (unknown e-mail, wrong password, unconfirmed or banned account: SEC-12).
    */
-  signInWithPassword(credentials: Credentials): Promise<Result<void, InvalidCredentialsError>>;
+  signInWithPassword(credentials: Credentials): Promise<Result<SignedIn, InvalidCredentialsError>>;
 
   /**
    * Ends THIS session (scope `local`, E-09: the user's other devices stay signed in) and revokes it

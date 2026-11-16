@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { ipAddress } from '@vercel/functions';
+import { ServiceUnavailableError } from '@/shared/kernel';
 
 /** Subject used outside production when the platform gives no IP: all such requests share it. */
 export const UNKNOWN_IP = 'unknown';
@@ -88,4 +89,17 @@ export function ipSubject(raw: string): string | undefined {
 export function clientIp(request: Request): string | undefined {
   const raw = ipAddress(request);
   return raw === undefined ? undefined : ipSubject(raw);
+}
+
+/**
+ * Subject of the `ip` rate-limit rules. Without an IP from the platform helper the request falls
+ * into the shared `unknown` bucket in dev and tests, but in production it is refused (503): there
+ * every request must come through Vercel's proxy, so a missing IP is a platform fault, and a shared
+ * bucket would let one noisy client lock everyone out.
+ */
+export function resolveIpSubject(request: Request, requireClientIp: boolean): string {
+  const ip = clientIp(request);
+  if (ip !== undefined) return ip;
+  if (requireClientIp) throw new ServiceUnavailableError('the platform provided no client IP');
+  return UNKNOWN_IP;
 }

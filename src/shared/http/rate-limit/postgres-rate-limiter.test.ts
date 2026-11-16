@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { createGroupRoutedRateLimiter } from './group-routed-rate-limiter';
 import {
   createPostgresRateLimiter,
-  createSupabaseRateLimitHit,
   type RateLimitHit,
   type RateLimitHitInput,
 } from './postgres-rate-limiter';
@@ -179,45 +178,6 @@ describe('createPostgresRateLimiter: failures throw, so the pipeline answers 503
   });
 });
 
-describe('createSupabaseRateLimitHit', () => {
-  const rpcReturning = (outcome: { data: unknown; error: unknown }) => {
-    const calls: { name: string; args: unknown }[] = [];
-    const admin = {
-      rpc(name: string, args: unknown) {
-        calls.push({ name, args });
-        return Promise.resolve(outcome);
-      },
-    };
-    return { admin: admin as unknown as Parameters<typeof createSupabaseRateLimitHit>[0], calls };
-  };
-
-  it('calls rate_limit_hit with the typed parameters and returns its data', async () => {
-    const { admin, calls } = rpcReturning({ data: ALLOWED, error: null });
-    const result = await createSupabaseRateLimitHit(admin)({
-      bucket: 'ip:login:abc',
-      windowSeconds: 900,
-      max: 20,
-    });
-    expect(result).toBe(ALLOWED);
-    expect(calls).toEqual([
-      {
-        name: 'rate_limit_hit',
-        args: { p_bucket: 'ip:login:abc', p_window_seconds: 900, p_max: 20 },
-      },
-    ]);
-  });
-
-  it('throws when the RPC reports an error, without echoing it', async () => {
-    const { admin } = rpcReturning({
-      data: null,
-      error: { message: 'internal detail', code: '57P01' },
-    });
-    const rejection = createSupabaseRateLimitHit(admin)({ bucket: 'b', windowSeconds: 1, max: 1 });
-    await expect(rejection).rejects.toThrow('rate_limit_hit failed');
-    await expect(rejection).rejects.not.toThrow('internal detail');
-  });
-});
-
 describe('createGroupRoutedRateLimiter', () => {
   const recording = (name: string, seen: string[]): RateLimiter => ({
     consume: (key) => {
@@ -243,5 +203,107 @@ describe('createGroupRoutedRateLimiter', () => {
     await consume('reads');
 
     expect(seen).toEqual(['memory:health', 'postgres:login', 'postgres:reads']);
+  });
+});
+
+describe('createPostgresRateLimiter: remembered denials (F-06)', () => {
+  const DENIED = [{ allowed: false, retry_after_seconds: 120 }];
+
+  /** A clock the test moves by hand, in milliseconds. */
+  const clock = (startMs = 1_000_000) => {
+    let nowMs = startMs;
+    return { now: () => nowMs, advance: (ms: number) => void (nowMs += ms) };
+  };
+
+  it('answers a denied counter from memory: no database call while the denial lasts', async () => {
+    const time = clock();
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit, now: time.now });
+
+    const first = await limiter.consume(keyFor('flooded'), loginAccountRule);
+    time.advance(10_000);
+    const second = await limiter.consume(keyFor('flooded'), loginAccountRule);
+    const third = await limiter.consume(keyFor('flooded'), loginAccountRule);
+
+    expect(first).toEqual({ allowed: false, retryAfterSeconds: 120 });
+    // 10 s later the same denial is answered with the time that is left
+    expect(second).toEqual({ allowed: false, retryAfterSeconds: 110 });
+    expect(third).toEqual({ allowed: false, retryAfterSeconds: 110 });
+    expect(received).toHaveLength(1);
+  });
+
+  it('asks the database again when the remembered denial has ended', async () => {
+    const time = clock();
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit, now: time.now });
+
+    await limiter.consume(keyFor('flooded'), loginAccountRule);
+    time.advance(120_000);
+    await limiter.consume(keyFor('flooded'), loginAccountRule);
+
+    expect(received).toHaveLength(2);
+  });
+
+  it('never invents an allowance: an allowed answer is not remembered, so every call is counted', async () => {
+    const { hit, received } = fakeHit(ALLOWED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit });
+
+    for (let n = 0; n < 5; n += 1) await limiter.consume(keyFor('fine'), loginAccountRule);
+
+    expect(received).toHaveLength(5);
+  });
+
+  it('remembers per counter: another subject, scope, group or window still reaches the database', async () => {
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit });
+    const otherWindow: RateLimitRule = { ...loginAccountRule, windowSeconds: 60 };
+    const otherGroup: RateLimitRule = { ...loginAccountRule, scope: 'ip', group: 'writes' };
+
+    await limiter.consume(keyFor('a'), loginAccountRule);
+    await limiter.consume(keyFor('b'), loginAccountRule);
+    await limiter.consume(keyFor('a', otherWindow), otherWindow);
+    await limiter.consume(keyFor('a', otherGroup), otherGroup);
+    await limiter.consume(keyFor('a'), loginAccountRule); // this one IS remembered
+
+    expect(received).toHaveLength(4);
+  });
+
+  it('keeps failing closed: a failure is never remembered as an allowance', async () => {
+    const limiter = createPostgresRateLimiter({
+      secret: HMAC_KEY,
+      hit: () => Promise.reject(new Error('connection refused')),
+    });
+    await expect(limiter.consume(keyFor('a'), loginAccountRule)).rejects.toThrow();
+    await expect(limiter.consume(keyFor('a'), loginAccountRule)).rejects.toThrow();
+  });
+
+  it('is bounded: past the limit the oldest denial is forgotten, never the newest', async () => {
+    const time = clock();
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({
+      secret: HMAC_KEY,
+      hit,
+      now: time.now,
+      maxDenials: 2,
+    });
+
+    await limiter.consume(keyFor('one'), loginAccountRule);
+    await limiter.consume(keyFor('two'), loginAccountRule);
+    await limiter.consume(keyFor('three'), loginAccountRule); // evicts 'one'
+    expect(received).toHaveLength(3);
+
+    await limiter.consume(keyFor('three'), loginAccountRule); // still remembered
+    await limiter.consume(keyFor('two'), loginAccountRule); // still remembered
+    expect(received).toHaveLength(3);
+
+    await limiter.consume(keyFor('one'), loginAccountRule); // forgotten: back to the database
+    expect(received).toHaveLength(4);
+  });
+
+  it('the memory holds the HMAC bucket, never the subject (nothing to leak from a heap dump)', async () => {
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit });
+    await limiter.consume(keyFor('maria@cliente.test'), loginAccountRule);
+    expect(received[0]?.bucket).not.toContain('maria');
   });
 });

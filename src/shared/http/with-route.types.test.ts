@@ -22,6 +22,7 @@ const BAD_SCOPE_RULE = { scope: 'org', group: 'reads', limit: 1, windowSeconds: 
 const BAD_GROUP_RULE = { scope: 'ip', group: 'misc', limit: 1, windowSeconds: 1 } as const;
 const NO_GROUP_RULE = { scope: 'ip', limit: 1, windowSeconds: 1 } as const;
 const ACCOUNT_RULE = { scope: 'account', group: 'login', limit: 10, windowSeconds: 900 } as const;
+const GLOBAL_RULE = { scope: 'global', group: 'login', limit: 300, windowSeconds: 300 } as const;
 
 describe('withRoute: the policy is mandatory and typed', () => {
   it('does not compile without a policy or with an incomplete one', () => {
@@ -66,6 +67,8 @@ describe('withRoute: the policy is mandatory and typed', () => {
       withRoute({ ...PUBLIC_POLICY, rateLimit: [BAD_GROUP_RULE] }, ok);
       // @ts-expect-error every rate-limit rule needs its group
       withRoute({ ...PUBLIC_POLICY, rateLimit: [NO_GROUP_RULE] }, ok);
+      // @ts-expect-error the global scope is a programmatic budget, never a route policy (F-02)
+      withRoute({ ...PUBLIC_POLICY, rateLimit: [TEST_IP_RULE, GLOBAL_RULE] }, ok);
     });
     expect(true).toBe(true);
   });
@@ -200,11 +203,21 @@ describe('withRoute: invalid policies fail when the route is defined, not on the
       'writes',
       'reads',
       'health',
+      'session-upstream',
     ]) {
       expect(
         define({ ...pub, rateLimit: [{ scope: 'ip', group, limit: 5, windowSeconds: 60 }] }),
       ).not.toThrow();
     }
+  });
+
+  it('F-02: rejects the global scope in a route policy, with a message that points to the right API', () => {
+    // past the types, as a JavaScript caller or a cast could
+    expect(define({ ...pub, rateLimit: [TEST_IP_RULE, GLOBAL_RULE] })).toThrow(/global/);
+    expect(define({ ...pub, rateLimit: [TEST_IP_RULE, GLOBAL_RULE] })).toThrow(
+      /consumeGlobalBudget/,
+    );
+    expect(define({ ...ceo, rateLimit: [TEST_USER_RULE, GLOBAL_RULE] })).toThrow(/global/);
   });
 
   it('rejects a user rule on a public route and an account rule on an authenticated one', () => {

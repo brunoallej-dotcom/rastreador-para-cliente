@@ -3,13 +3,13 @@ import type { RateLimitGroup, RateLimitKey, RateLimitRule } from './rate-limit/r
 
 // The secret-key client is replaced, so the test can see what would reach the database.
 const database = vi.hoisted(() => ({
-  rpc: vi.fn(),
+  rateLimitHit: vi.fn(),
 }));
 vi.mock('@/shared/db/admin-client', () => ({
-  getAdminClient: () => ({ rpc: database.rpc }),
+  getAdminFacade: () => ({ rateLimitHit: database.rateLimitHit }),
 }));
 
-const ALLOWED = { data: [{ allowed: true, retry_after_seconds: 0 }], error: null };
+const ALLOWED = [{ allowed: true, retry_after_seconds: 0 }];
 
 const keyFor = (group: RateLimitGroup): RateLimitKey => ({
   scope: 'ip',
@@ -37,8 +37,8 @@ describe('production wiring of the rate limiter (pipeline-deps)', () => {
     vi.stubEnv('SUPABASE_PUBLISHABLE_KEY', 'fake-publishable-key-for-unit-tests');
     vi.stubEnv('SUPABASE_SECRET_KEY', 'fake-secret-key-for-unit-tests');
     vi.stubEnv('RATE_LIMIT_KEY_SECRET', 'unit-test-only-rate-limit-key-not-a-real-value');
-    database.rpc.mockReset();
-    database.rpc.mockResolvedValue(ALLOWED);
+    database.rateLimitHit.mockReset();
+    database.rateLimitHit.mockResolvedValue(ALLOWED);
   });
 
   afterEach(() => {
@@ -52,11 +52,11 @@ describe('production wiring of the rate limiter (pipeline-deps)', () => {
       allowed: true,
     });
 
-    expect(database.rpc).not.toHaveBeenCalled();
+    expect(database.rateLimitHit).not.toHaveBeenCalled();
   });
 
   it('a database outage cannot turn the liveness probe into an undocumented 503', async () => {
-    database.rpc.mockRejectedValue(new TypeError('fetch failed'));
+    database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
     const limiter = await productionLimiter();
 
     await expect(limiter.consume(keyFor('health'), ruleFor('health'))).resolves.toEqual({
@@ -71,18 +71,18 @@ describe('production wiring of the rate limiter (pipeline-deps)', () => {
       await limiter.consume(keyFor(group), ruleFor(group));
     }
 
-    expect(database.rpc).toHaveBeenCalledTimes(3);
-    const buckets = database.rpc.mock.calls.map(
-      ([name, args]) => `${String(name)} ${(args as { p_bucket: string }).p_bucket}`,
+    expect(database.rateLimitHit).toHaveBeenCalledTimes(3);
+    const buckets = database.rateLimitHit.mock.calls.map(
+      ([input]) => (input as { bucket: string }).bucket,
     );
-    expect(buckets[0]).toMatch(/^rate_limit_hit ip:login:[0-9a-f]{64}$/);
-    expect(buckets[1]).toMatch(/^rate_limit_hit ip:writes:[0-9a-f]{64}$/);
-    expect(buckets[2]).toMatch(/^rate_limit_hit ip:reads:[0-9a-f]{64}$/);
+    expect(buckets[0]).toMatch(/^ip:login:[0-9a-f]{64}$/);
+    expect(buckets[1]).toMatch(/^ip:writes:[0-9a-f]{64}$/);
+    expect(buckets[2]).toMatch(/^ip:reads:[0-9a-f]{64}$/);
     expect(buckets.join()).not.toContain('203.0.113.9');
   });
 
   it('E-22: a database outage fails the other groups closed (the pipeline answers 503)', async () => {
-    database.rpc.mockRejectedValue(new TypeError('fetch failed'));
+    database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
     const limiter = await productionLimiter();
 
     await expect(limiter.consume(keyFor('login'), ruleFor('login'))).rejects.toThrow();

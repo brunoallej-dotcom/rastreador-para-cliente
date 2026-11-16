@@ -4,6 +4,7 @@ import { resolveAllowedOrigins } from './origin';
 import { createGroupRoutedRateLimiter } from './rate-limit/group-routed-rate-limiter';
 import { createInMemoryRateLimiter } from './rate-limit/in-memory-rate-limiter';
 import { createPostgresRateLimiter } from './rate-limit/postgres-rate-limiter';
+import { fingerprintSubject } from './rate-limit/subject-hmac';
 import type { RateLimiter } from './rate-limit/rate-limiter';
 import type { PrincipalResolver } from './principal-resolver';
 import { createSupabasePrincipalResolver } from './supabase-principal-resolver';
@@ -21,6 +22,11 @@ export type PipelineDeps = {
   readonly requireClientIp: boolean;
   /** Root logger; the pipeline derives a per-request child with the `requestId`. */
   readonly logger: Logger;
+  /**
+   * Keyed, non-reversible fingerprint of a rate-limit subject (an IP, an e-mail, a user id), for
+   * log lines: `auth.rate_limited` carries it as `subjectHash`, never the subject itself.
+   */
+  readonly subjectFingerprint: (subject: string) => string;
 };
 
 /**
@@ -35,15 +41,24 @@ export type PipelineDeps = {
  */
 function buildPipelineDeps(): PipelineDeps {
   const env = getEnv();
+  const requireClientIp = env.VERCEL_ENV === 'production';
+  const rateLimiter = createGroupRoutedRateLimiter({
+    routes: { health: createInMemoryRateLimiter() },
+    fallback: createPostgresRateLimiter(),
+  });
   return {
-    rateLimiter: createGroupRoutedRateLimiter({
-      routes: { health: createInMemoryRateLimiter() },
-      fallback: createPostgresRateLimiter(),
+    rateLimiter,
+    // The resolver spends the `session-upstream` budget of the client IP before it lets the Auth
+    // client call the Auth server for a session cookie it cannot verify locally (F-01).
+    principalResolver: createSupabasePrincipalResolver({
+      rateLimiter,
+      requireClientIp,
+      fingerprint: fingerprintSubject,
     }),
-    principalResolver: createSupabasePrincipalResolver(),
     allowedOrigins: resolveAllowedOrigins(env),
-    requireClientIp: env.VERCEL_ENV === 'production',
+    requireClientIp,
     logger: getLogger(),
+    subjectFingerprint: fingerprintSubject,
   };
 }
 

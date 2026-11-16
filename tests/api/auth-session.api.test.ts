@@ -3,11 +3,12 @@
 // limiter, Supabase resolver), the local Supabase (Auth + PostgREST), and every response checked
 // against the OpenAPI contract, headers included.
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { POST as loginRoute } from '@/app/api/v1/auth/login/route';
 import { POST as logoutRoute } from '@/app/api/v1/auth/logout/route';
 import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import type { Database } from '@/shared/db/database.types';
+import { timing } from '@/shared/http/response-floor';
 import { expectToMatchContract } from '../helpers/contract';
 import {
   ceoAal2Client,
@@ -39,6 +40,25 @@ const SESSION_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60;
 /** `Max-Age` of one `Set-Cookie` line (NaN when it has none, which fails every comparison). */
 const maxAgeOf = (setCookie: string): number =>
   Number(/;\s*Max-Age=(\d+)/i.exec(setCookie)?.[1] ?? Number.NaN);
+
+/**
+ * A refused login waits for its floor (400 ms and a little jitter, F-05). The tests do not wait for
+ * real: `sleep` is replaced by a recorder, and the tests that care about the floor read what it
+ * recorded. Every other test just runs faster.
+ */
+const floorSleeps: number[] = [];
+
+beforeEach(() => {
+  floorSleeps.length = 0;
+  vi.spyOn(timing, 'sleep').mockImplementation((ms) => {
+    floorSleeps.push(ms);
+    return Promise.resolve();
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const login = (
   body: unknown,
@@ -204,8 +224,10 @@ describe('POST /api/v1/auth/login', () => {
       password: user.password,
     });
 
+    const body = await bodyOf(response);
     expect(response.status).toBe(200);
-    expect(await bodyOf(response)).toMatchObject({ user: { id: user.id } });
+    expect(body).toMatchObject({ user: { id: user.id } });
+    expectToMatchContract('login', 200, body, response);
   });
 
   it('AC-03: the 11th attempt for the same account within the window is 429 with Retry-After', async () => {
@@ -320,6 +342,53 @@ describe('POST /api/v1/auth/login', () => {
   it('E-12: a password of exactly 72 bytes passes validation (and is then refused as credentials)', async () => {
     const response = await login({ email: uniqueEmail('limit'), password: 'x'.repeat(72) });
     expect(response.status).toBe(401);
+    expectToMatchContract('login', 401, await bodyOf(response), response);
+  });
+
+  it('F-05: every refused login answers only after the floor, and the disabled-account path fits under it', async () => {
+    const client = await createClient();
+    const target = await createClientUser({ clientId: client.id });
+    const disabled = await createClientUser({ clientId: client.id });
+    await disableAccount(await ceoAal2Client(), disabled.id);
+
+    const refusals: [string, () => Promise<Response>][] = [
+      ['a wrong password', () => login({ email: target.email, password: `${target.password}-x` })],
+      [
+        'an unknown e-mail',
+        () => login({ email: uniqueEmail('nobody'), password: target.password }),
+      ],
+      // ~3 calls to Auth: sign in, read the principal, revoke the session
+      ['a disabled account (right password)', () => login(credentialsOf(disabled))],
+    ];
+    for (const [label, refuse] of refusals) {
+      floorSleeps.length = 0;
+      const startedAt = performance.now();
+      const response = await refuse();
+      const workMs = performance.now() - startedAt; // the waiting itself is replaced by a recorder
+
+      expect(response.status, label).toBe(401);
+      // the work fits under the floor, so the handler had to wait for the rest of it...
+      expect(workMs, `${label}: the work took ${Math.round(workMs)} ms`).toBeLessThan(400);
+      expect(floorSleeps, label).toHaveLength(1);
+      // ...and work plus wait is the floor (400 ms) plus at most its jitter (100 ms)
+      const totalMs = workMs + (floorSleeps[0] ?? 0);
+      expect(totalMs, label).toBeGreaterThanOrEqual(400);
+      expect(totalMs, label).toBeLessThan(520);
+    }
+  });
+
+  it('F-05: a login that succeeds, and one that is refused by the rate limit, are not delayed', async () => {
+    const client = await createClient();
+    const user = await createClientUser({ clientId: client.id });
+
+    expect((await login(credentialsOf(user))).status).toBe(200);
+    expect(floorSleeps).toEqual([]);
+
+    const email = uniqueEmail('throttled');
+    for (let n = 0; n < 10; n += 1) await login({ email, password: 'any-password-1' });
+    floorSleeps.length = 0;
+    expect((await login({ email, password: 'any-password-1' })).status).toBe(429);
+    expect(floorSleeps).toEqual([]);
   });
 });
 
@@ -432,8 +501,11 @@ describe('GET /api/v1/auth/session', () => {
     const { ceo } = await ceoAal2Client();
     const jar = await signIn(ceo); // a new session: aal1, while the factor is verified
 
-    const body = await bodyOf(await getSession(jar));
+    const response = await getSession(jar);
+    const body = await bodyOf(response);
 
+    expect(response.status).toBe(200);
+    expectToMatchContract('getSession', 200, body, response);
     expect(body).toMatchObject({
       aal: 'aal1',
       client: null,
@@ -464,6 +536,97 @@ describe('GET /api/v1/auth/session', () => {
 
     expect(response.status).toBe(401);
     expectToMatchContract('getSession', 401, await bodyOf(response), response);
+  });
+
+  it('F-01: N forged-cookie requests from one IP make at most 60 calls to Auth, then 401 without touching the cookie', async () => {
+    const ip = newClientIp();
+    const forged = createCookieStore();
+    // the cookie of the finding: no real token, only an `expires_at` in the past
+    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+    const spy = spyOnSupabaseFetch();
+
+    const responses: Response[] = [];
+    try {
+      for (let n = 0; n < 75; n += 1) {
+        responses.push(
+          await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip }),
+        );
+      }
+    } finally {
+      spy.restore();
+    }
+
+    const authCalls = spy.calls.filter((call) => call.includes('/auth/v1/'));
+    expect(authCalls.length).toBeGreaterThan(0);
+    expect(authCalls.length).toBeLessThanOrEqual(60);
+    // every request is the documented 401, forged or over budget
+    for (const response of responses) {
+      expect(response.status).toBe(401);
+      expectToMatchContract('getSession', 401, await bodyOf(response), response);
+    }
+    // the last ones were refused by the budget: no call to Auth, and no Set-Cookie at all
+    for (const response of responses.slice(-10)) {
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+  });
+
+  it('F-01: a forger from one IP does not use up the budget of a legitimate user from another', async () => {
+    const forgerIp = newClientIp();
+    const forged = createCookieStore();
+    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+    for (let n = 0; n < 62; n += 1) {
+      await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip: forgerIp });
+    }
+
+    const client = await createClient();
+    const jar = await signIn(await createClientUser({ clientId: client.id }));
+
+    expect((await getSession(jar)).status).toBe(200);
+  });
+
+  it('F-01: on an address whose budget a forger used up, a browser whose token is verified locally is not affected', async () => {
+    const client = await createClient();
+    const user = await createClientUser({ clientId: client.id });
+    const ip = newClientIp();
+    const legitimate = await signIn(user);
+    // the first token of a signing key makes the server fetch the keys; after that it is local
+    expect((await getSession(legitimate)).status).toBe(200);
+    const forged = createCookieStore();
+    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+    for (let n = 0; n < 62; n += 1) {
+      await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
+    }
+
+    // the address is over its session-upstream budget, and this request does not spend any
+    const response = await invoke(sessionRoute, { path: '/auth/session', cookies: legitimate, ip });
+
+    expect(response.status).toBe(200);
+    expectToMatchContract('getSession', 200, await bodyOf(response), response);
+  });
+
+  it('F-01: over budget a browser that needs a token refresh gets a 401 and KEEPS its cookie, then refreshes from a clean address', async () => {
+    const client = await createClient();
+    const user = await createClientUser({ clientId: client.id });
+    const ip = newClientIp();
+    const forged = createCookieStore();
+    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+    for (let n = 0; n < 62; n += 1) {
+      await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
+    }
+    const legitimate = await signIn(user);
+    // its access token has expired: the server would have to call Auth to refresh it
+    writeSessionCookie(legitimate, { ...readSessionCookie(legitimate), expires_at: 1 });
+    const before = legitimate.clone();
+
+    const response = await invoke(sessionRoute, { path: '/auth/session', cookies: legitimate, ip });
+
+    expect(response.status).toBe(401);
+    expectToMatchContract('getSession', 401, await bodyOf(response), response);
+    // refused by the budget: no Set-Cookie at all, so nothing was deleted
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(legitimate.names()).toEqual(before.names());
+    // and from an address with budget left the very same cookie is refreshed
+    expect((await getSession(before)).status).toBe(200);
   });
 
   it('SEC-07: garbage in the session cookie is 401, not a crash', async () => {
@@ -585,7 +748,9 @@ describe('POST /api/v1/auth/logout', () => {
     }
     // the session is still alive and the browser still holds it, so the user can try again
     expect((await getSession(jar)).status).toBe(200);
-    expect((await logout(jar)).status).toBe(204);
+    const retry = await logout(jar);
+    expect(retry.status).toBe(204);
+    expectToMatchContract('logout', 204, undefined, retry);
     expect((await getSession(jar)).status).toBe(401);
   });
 
@@ -606,7 +771,9 @@ describe('POST /api/v1/auth/logout', () => {
     expect(response.status).toBe(503);
     expect(await bodyOf(response)).toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
     expect((await getSession(jar)).status).toBe(200);
-    expect((await logout(jar)).status).toBe(204);
+    const retry = await logout(jar);
+    expect(retry.status).toBe(204);
+    expectToMatchContract('logout', 204, undefined, retry);
   });
 
   it('AC-26: a CEO with every pending action can log out, and the old cookie is dead', async () => {
@@ -620,6 +787,7 @@ describe('POST /api/v1/auth/logout', () => {
     const response = await logout(jar);
 
     expect(response.status).toBe(204);
+    expectToMatchContract('logout', 204, undefined, response);
     expect((await getSession(oldCookie)).status).toBe(401);
   });
 
@@ -653,7 +821,9 @@ describe('POST /api/v1/auth/logout', () => {
     const phone = await signIn(user);
     const laptopBeforeLogout = laptop.clone(); // `logout` empties `laptop`: keep what a thief would hold
 
-    expect((await logout(laptop)).status).toBe(204);
+    const loggedOut = await logout(laptop);
+    expect(loggedOut.status).toBe(204);
+    expectToMatchContract('logout', 204, undefined, loggedOut);
 
     expect((await getSession(phone)).status).toBe(200);
     expect((await getSession(laptopBeforeLogout)).status).toBe(401);
@@ -672,6 +842,7 @@ describe('POST /api/v1/auth/logout', () => {
     });
 
     expect(response.status).toBe(204);
+    expectToMatchContract('logout', 204, undefined, response);
     expect(await textOf(response)).toBe('');
   });
 });

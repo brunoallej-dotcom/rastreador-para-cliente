@@ -118,6 +118,7 @@ API do `withRoute(policy, handler)` (`@/shared/http`):
   | `writes` | as demais escritas autenticadas (user 60/min), `logout` inclusive |
   | `reads` | as leituras autenticadas (user 300/min), `GET /auth/session` inclusive |
   | `health` | `GET /health` (ip 60/min) |
+  | `session-upstream` | nenhuma rota: o orçamento por IP (60 / 15 min) de cookies de sessão que fariam o servidor chamar o Auth; é do resolvedor de principal, nunca de uma política |
 
 - **Corpo e query.** Rota sem schema de `body` **ignora o corpo**: não o lê nem checa Content-Type
   ou tamanho (o contrato não documenta 400, 413 nem 415 para ela); o Origin de métodos não seguros

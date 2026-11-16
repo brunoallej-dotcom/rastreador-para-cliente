@@ -322,7 +322,7 @@ describe('src/shared/ never imports modules', () => {
 describe('the admin client (secret key, bypasses RLS) has exactly two doors', () => {
   const ADMIN = '@/shared/db/admin-client';
   const importAdmin = (source = ADMIN) =>
-    `import { getAdminClient } from '${source}';\nexport const admin = getAdminClient;`;
+    `import { getAdminFacade } from '${source}';\nexport const admin = getAdminFacade;`;
 
   it.each([
     ['the rate limiter', 'src/shared/http/rate-limit/postgres-rate-limiter.ts', importAdmin()],
@@ -376,11 +376,11 @@ describe('the admin client (secret key, bypasses RLS) has exactly two doors', ()
     ['the alias with an extension', importAdmin('@/shared/db/admin-client.ts')],
     ['a relative path inside shared/db', importAdmin('./admin-client')],
     ['a relative path from a sibling folder', importAdmin('../db/admin-client')],
-    ['a re-export', `export { getAdminClient } from '${ADMIN}';`],
+    ['a re-export', `export { getAdminFacade } from '${ADMIN}';`],
     ['export *', `export * from '${ADMIN}';`],
     [
       'a type-only import',
-      `import type { AdminSupabase } from '${ADMIN}';\nexport type T = AdminSupabase;`,
+      `import type { AdminFacade } from '${ADMIN}';\nexport type T = AdminFacade;`,
     ],
     ['a ".." segment that hides the path', importAdmin('@/shared/kernel/../db/admin-client')],
   ])('refuses %s, wherever it is not a door', async (_label, code) => {

@@ -5,6 +5,7 @@
 // values for the rest and hands everything to the workers through provide()/inject().
 // tests/setup/apply-local-env.ts (setupFiles) copies it into process.env inside each worker.
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { TestProject } from 'vitest/node';
@@ -18,7 +19,16 @@ const LOCAL_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost'])
 
 // Fixed, obviously fake values: tests never need real ones.
 const TEST_APP_ORIGIN = 'http://localhost:3000';
-const TEST_RATE_LIMIT_KEY_SECRET = 'local-test-only-rate-limit-hmac-key-not-a-real-one';
+const RATE_LIMIT_KEY_BYTES = 24;
+
+/**
+ * A NEW HMAC key for every test run (every `vitest run` calls the global setup once). The rate-limit
+ * counters live in the database and survive between runs; with the key different each run, every
+ * counter (an IP, an account, the global login budget) is a fresh one, so a run never inherits the
+ * budget another run spent. 24 random bytes as hex are 48 characters (the minimum is 32). Nothing
+ * else depends on its value: it only keys an HMAC.
+ */
+const newTestRateLimitKey = (): string => randomBytes(RATE_LIMIT_KEY_BYTES).toString('hex');
 
 export type LocalEnv = {
   APP_ORIGIN: string;
@@ -107,7 +117,7 @@ export function buildLocalEnv(status: Record<string, string>): LocalEnv {
     SUPABASE_URL: url,
     SUPABASE_PUBLISHABLE_KEY: publishableKey,
     SUPABASE_SECRET_KEY: secretKey,
-    RATE_LIMIT_KEY_SECRET: TEST_RATE_LIMIT_KEY_SECRET,
+    RATE_LIMIT_KEY_SECRET: newTestRateLimitKey(),
   };
 }
 

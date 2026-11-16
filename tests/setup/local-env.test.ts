@@ -64,6 +64,14 @@ describe('buildLocalEnv', () => {
     expect(env.RATE_LIMIT_KEY_SECRET.length).toBeGreaterThanOrEqual(32);
   });
 
+  it('gives every run its own rate-limit key, so counters never carry over between runs', () => {
+    const status = parseStatusEnv(STATUS_OUTPUT);
+    const first = buildLocalEnv(status).RATE_LIMIT_KEY_SECRET;
+    const second = buildLocalEnv(status).RATE_LIMIT_KEY_SECRET;
+    expect(first).toMatch(/^[0-9a-f]{48}$/);
+    expect(second).not.toBe(first);
+  });
+
   it('produces a set the app env schema accepts', () => {
     expect(() => parseEnv(buildLocalEnv(parseStatusEnv(STATUS_OUTPUT)))).not.toThrow();
   });

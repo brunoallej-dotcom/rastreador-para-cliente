@@ -4,6 +4,9 @@ import type { AuthGateway, ClientDirectory, Credentials, PrincipalQuery } from '
 import type { SessionView } from '../domain/session';
 import { loadSessionView } from './load-session-view';
 
+/** The session view plus the id of the session the login opened (for the log; never in a response). */
+export type LoginOutcome = { readonly session: SessionView; readonly sessionId: string | null };
+
 export type LoginDeps = {
   readonly auth: AuthGateway;
   readonly principals: PrincipalQuery;
@@ -26,7 +29,7 @@ export type LoginDeps = {
 export async function login(
   deps: LoginDeps,
   credentials: Credentials,
-): Promise<Result<SessionView, InvalidCredentialsError>> {
+): Promise<Result<LoginOutcome, InvalidCredentialsError>> {
   const signedIn = await deps.auth.signInWithPassword(credentials);
   if (!signedIn.ok) return signedIn;
 
@@ -36,7 +39,10 @@ export async function login(
       await revokeQuietly(deps.auth);
       return err(new InvalidCredentialsError('account_inactive'));
     }
-    return ok(await loadSessionView(deps.clients, principal));
+    return ok({
+      session: await loadSessionView(deps.clients, principal),
+      sessionId: signedIn.value.sessionId,
+    });
   } catch (error) {
     await revokeQuietly(deps.auth);
     throw error;

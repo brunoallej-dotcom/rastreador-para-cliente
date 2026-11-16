@@ -4,6 +4,9 @@ import { InvalidCredentialsError } from '../domain/errors';
 import type { AuthGateway, ClientDirectory, Credentials, PrincipalQuery } from '../domain/ports';
 import type { ClientSummary } from '../domain/session';
 
+/** The session id every fake sign-in opens. */
+export const FAKE_SESSION_ID = '99999999-9999-4999-8999-999999999999';
+
 export type FakeAccount = {
   readonly email: string;
   readonly password: string;
@@ -43,7 +46,7 @@ export function createFakeIdentity(accounts: readonly FakeAccount[]): FakeIdenti
         return Promise.resolve(err(new InvalidCredentialsError()));
       }
       signedInAs = account;
-      return Promise.resolve(ok(undefined));
+      return Promise.resolve(ok({ sessionId: FAKE_SESSION_ID }));
     },
     signOut() {
       calls.push('signOut');

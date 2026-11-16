@@ -56,8 +56,26 @@ describe('SupabaseAuthGateway.signInWithPassword', () => {
   it('signs in with the credentials as given (already normalized by the caller)', async () => {
     const { supabase, signInWithPassword } = fakeSupabase();
     const result = await createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
-    expect(result).toEqual({ ok: true, value: undefined });
+    expect(result.ok).toBe(true);
     expect(signInWithPassword).toHaveBeenCalledWith(CREDENTIALS);
+  });
+
+  it('F-09: returns the id of the session it opened, read from the new access token (for the log)', async () => {
+    const sessionId = '12345678-1234-4234-8234-123456789abc';
+    const accessToken = `h.${Buffer.from(JSON.stringify({ session_id: sessionId })).toString('base64url')}.s`;
+    const { supabase } = fakeSupabase({
+      signIn: { data: { session: { access_token: accessToken } }, error: null },
+    });
+
+    const result = await createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
+
+    expect(result).toEqual({ ok: true, value: { sessionId } });
+  });
+
+  it('F-09: the session id is null when the token carries none, never a guess', async () => {
+    const { supabase } = fakeSupabase();
+    const result = await createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
+    expect(result).toEqual({ ok: true, value: { sessionId: null } });
   });
 
   it.each([

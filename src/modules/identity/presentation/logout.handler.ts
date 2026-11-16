@@ -2,9 +2,10 @@ import { getRequestSupabase } from '@/shared/db/server-client';
 import {
   readAccessToken,
   restoreSessionCookies,
+  sessionIdOfToken,
   snapshotSessionCookies,
 } from '@/shared/db/session-cookies';
-import { noContent, withRoute } from '@/shared/http';
+import { clientIpFingerprint, noContent, withRoute } from '@/shared/http';
 import { logout } from '../application/logout';
 import { createSupabaseAuthGateway } from '../infrastructure/supabase-auth-gateway';
 
@@ -54,7 +55,17 @@ export const logoutHandler = withRoute(
       throw error;
     }
 
-    logger.info({ event: 'auth.logout', userId: principal.userId }, 'auth.logout');
+    // The id of the session that was ended (an internal id, not a secret) and a keyed fingerprint of
+    // the IP: enough to follow one session across the log without the log holding the IP (F-09).
+    logger.info(
+      {
+        event: 'auth.logout',
+        userId: principal.userId,
+        sessionId: sessionIdOfToken(accessToken),
+        ipHash: clientIpFingerprint(request),
+      },
+      'auth.logout',
+    );
     return noContent();
   },
 );

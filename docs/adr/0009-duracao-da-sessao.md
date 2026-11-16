@@ -33,6 +33,15 @@ Credenciais efêmeras, com dois limites no servidor e um no navegador:
   O teto é aplicado no `setAll` do client de requisição (`src/shared/db/server-client.ts`), no último
   passo antes do cookie jar, porque o `@supabase/ssr` ignora a opção `maxAge` ao gravar a sessão.
   O jar do pipeline repassa o `maxAge` e continua forçando `HttpOnly; Secure; SameSite=Lax; Path=/`.
+- O banco repete os dois limites, porque o `timebox` e o `inactivity_timeout` do Auth só valem
+  onde estiverem configurados (no projeto hospedado, só depois da Onda 11): `private.session_is_alive()`
+  exige `created_at` há menos de 12 h e a última atividade há menos de 4 h. A última atividade é a
+  mais recente de três marcas: `refreshed_at` (`timestamp` sem fuso, em UTC, que o GoTrue nem sempre
+  grava), o `created_at` do refresh token mais novo da sessão (cada renovação rotaciona o token) e
+  o `created_at` da sessão. Uma sessão vencida deixa de
+  ter principal em `current_principal()`, a RLS nega tudo e a API responde 401, mesmo com um JWT
+  ainda válido. Os valores de 12 h e 4 h existem em quatro lugares e mudam juntos: `config.toml`,
+  `SESSION_COOKIE_MAX_AGE_SECONDS`, a migration `session_time_limits_in_db` e este ADR.
 - Quando o limite vence, a próxima requisição recebe 401 e o usuário faz login de novo. Não há
   "lembrar de mim".
 - No Supabase hospedado, `timebox` e `inactivity_timeout` exigem o plano Pro, que a produção já

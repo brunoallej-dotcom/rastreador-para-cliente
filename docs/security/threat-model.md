@@ -1,6 +1,6 @@
 # Threat model — Rastreador de entregas (backend + banco)
 
-> **Data:** 2026-11-15 · **Escopo:** API `/api/v1`, Supabase (Auth + Postgres), CI/CD e ferramentas
+> **Data:** 2026-11-15 (atualizado em 2026-11-16, Onda 3) · **Escopo:** API `/api/v1`, Supabase (Auth + Postgres), CI/CD e ferramentas
 > de desenvolvimento · **Spec:** [`docs/specs/client-delivery-tracker.md`](../specs/client-delivery-tracker.md)
 >
 > Os controles citados (SEC-xx) estão definidos em §2.3 da spec. Atualize este documento sempre
@@ -43,13 +43,13 @@ flowchart LR
 
 | # | Elemento | STRIDE | Ameaça | Mitigação | Controles |
 |---|----------|--------|--------|-----------|-----------|
-| T-01 | Login | S | Força bruta e credential stuffing | Rate limit por IP e por conta, senha forte, HIBP, MFA de CEO | SEC-09, SEC-10, SEC-11 |
-| T-02 | Login | I | Enumeração de e-mails | Resposta 401 idêntica, sem cadastro público. Com o provider de e-mail ligado, `/otp` e `/recover` do GoTrue seguem acessíveis a quem tiver a publishable key, que só existe no servidor (o browser nunca fala com o Supabase, ADR 0002); `/otp` e `/magiclink` não criam usuário (teste de integração); **risco residual aceito**: `/otp` diferencia e-mail conhecido de desconhecido. Outro residual aceito: "senha certa, conta desativada" faz cerca de 3 idas ao Auth contra 1 de "senha errada" (status, corpo e headers são idênticos); só quem já tem a senha correta nota a diferença de tempo | SEC-12, SEC-20 |
-| T-03 | Login | D | Esgotar o limite por IP do Supabase Auth (todos chegam pelo IP da Vercel) e bloquear todo mundo | Nosso limitador na frente e mais restritivo que o do Supabase | SEC-09 |
-| T-04 | Login | D | Bloqueio direcionado: errar a senha de um CEO de propósito | Janela curta (15 min), sem bloqueio permanente, alerta; **risco residual aceito** | SEC-09 |
+| T-01 | Login | S | Força bruta e credential stuffing | Rate limit por IP (IPv6 agregado ao /64) e por conta, senha forte, HIBP, MFA de CEO. **Lacunas conhecidas:** o limite por IP só enxerga o /64, então um atacante com muitos prefixos escapa dele (o limite por conta e o teto global de T-03 cobrem o resto); o papel `client` não tem MFA (só CEO, SEC-11); o achado F-04 do threat-modeler fica para a Onda 11 | SEC-09, SEC-10, SEC-11 |
+| T-02 | Login | I | Enumeração de e-mails | Resposta 401 idêntica (status, corpo e headers), sem cadastro público. **Tempo (F-05):** toda recusa de login responde só depois de um piso de 400 ms mais até 100 ms de jitter, medido do início do handler; o piso fica acima do caminho mais lento ("senha certa, conta desativada", cerca de 3 idas ao Auth), então senha errada, e-mail inexistente e conta desativada levam o mesmo tempo (se o Auth demorar mais que o piso, nada é somado). Com o provider de e-mail ligado, `/otp` e `/recover` do GoTrue seguem acessíveis a quem tiver a publishable key, que só existe no servidor (o browser nunca fala com o Supabase, ADR 0002); `/otp` e `/magiclink` não criam usuário (teste de integração). **Risco residual aceito:** `/otp` diferencia e-mail conhecido de desconhecido | SEC-12, SEC-20 |
+| T-03 | Login | D | Esgotar a cota de logins do Supabase Auth (a cota `sign_in_sign_ups` conta por IP de origem e, atrás do BFF, o Auth só vê o IP do servidor) e derrubar o login de todos | Os limites por IP (20 / 15 min) e por conta **não** protegem essa cota contra um atacante distribuído: são por prefixo e por e-mail, e há muitos prefixos. **Teto global (F-02):** todo login gasta um orçamento `global` de 300 por 300 s antes de chamar o Auth, sempre abaixo da cota do Auth (1000 por 5 min no `config.toml` local; o projeto hospedado precisa ser configurado acima, Onda 11); acima dele, 429 `RATE_LIMITED` com `Retry-After`. **Residual aceito:** o teto troca um 503 por um 429 para todos durante o ataque, não impede a negação de serviço; o alerta de rajada de 429 (Onda 11) é a resposta | SEC-09 |
+| T-04 | Login | D | Bloqueio direcionado: errar a senha de um CEO de propósito | Janela curta (15 min), sem bloqueio permanente, alerta. **Não mitigado, e sustentável:** 11 tentativas a cada 15 min, de qualquer IP, mantêm a conta bloqueada indefinidamente, não só a atrasam. **Decisão em aberto (F-03), para o usuário:** mudar o §3.9 da spec para (a) um limite por e-mail mais prefixo de IP, (b) um contador global por conta só de falhas, ou (c) um cookie de dispositivo que isente o navegador já conhecido. Fica registrado como pendente até a decisão | SEC-09 |
 | T-05 | Sessão | S | Roubo de cookie via XSS | `HttpOnly`, CSP, API só JSON; frontend futuro com CSP de nonce | SEC-07, SEC-14 |
-| T-06 | Sessão | S | Reuso de refresh token roubado | Rotação com detecção de reuso (Supabase revoga a família) | SEC-07 |
-| T-07 | Sessão | E | JWT continua válido após logout ou desativação | `current_principal()` exige sessão viva em `auth.sessions` e perfil ativo a cada requisição | SEC-07 |
+| T-06 | Sessão | S | Reuso de refresh token roubado; credencial roubada que vive para sempre | Rotação com detecção de reuso (Supabase revoga a família). A sessão vale no máximo 12 h e acaba após 4 h sem uso (ADR 0009): o Auth aplica `timebox` e `inactivity_timeout`, o banco repete os dois limites em `private.session_is_alive()` (F-08, migration `session_time_limits_in_db`), e o cookie vive 12 h | SEC-07 |
+| T-07 | Sessão | E | JWT continua válido após logout ou desativação | `current_principal()` exige sessão viva em `auth.sessions` (dentro de 12 h e 4 h) e perfil ativo a cada requisição. O logout confirma no banco, antes do 204, que o token antigo já não tem principal (o client do Auth diz "deslogado" mesmo quando o Auth respondeu 401, 403 ou 404 sem revogar nada); se não confirmar, 503 e o cookie volta | SEC-07 |
 | T-08 | Mutações | T | CSRF numa aprovação | SameSite=Lax, checagem de `Origin`, JSON obrigatório | SEC-08 |
 | T-09 | `/me/*` | I | Cliente troca o `processId` (BOLA/IDOR) | Tenant derivado da sessão; filtro por tenant no repositório e RLS; 404 | SEC-03, SEC-05 |
 | T-10 | `/me/*` | I | Cliente lê campos internos (quem aprovou) | Tabelas do cliente só com colunas seguras; dados internos em tabelas exclusivas de CEO; DTO explícito; contrato com `additionalProperties: false` | SEC-04 |
@@ -67,10 +67,14 @@ flowchart LR
 | T-22 | MFA | S | Força bruta de TOTP | 5 tentativas / 5 min por usuário | SEC-09 |
 | T-23 | Erros | I | Stack trace ou erro SQL vazando estrutura | problem+json com `code` estável; mapeamento explícito; 500 genérico | SEC-13 |
 | T-24 | Exceções | E | Falha numa checagem libera acesso (fail open) | Toda exceção em auth, authz ou rate limit nega a requisição | SEC-13, E-22 |
-| T-25 | Segredos | I | Secret key no bundle do browser ou em log | Sem `NEXT_PUBLIC_`; `server-only`; uso restrito a um arquivo; redação de logs; gitleaks; hook | SEC-15, SEC-16 |
+| T-25 | Segredos | I | Secret key no bundle do browser ou em log | Sem `NEXT_PUBLIC_`; `server-only`; uso restrito a um arquivo; redação de logs; gitleaks; hook. **F-12:** o singleton do admin client não é exportado: só uma fachada estreita (a Auth Admin API e o RPC `rate_limit_hit`), sem `.from`, `.rpc` genérico nem `.auth.signIn*`; o ESLint só deixa o rate limiter e a infraestrutura de identity importá-la | SEC-15, SEC-16 |
 | T-26 | Supply chain | T | Dependência ou Action maliciosa | Lockfile, SHA pinado, Dependabot, `pnpm audit`, SAST, review de MCP e plugins | SEC-18 |
 | T-27 | Ferramentas de IA | T/I | Conteúdo do banco (nome de cliente, fase) com prompt injection lido pelo agente via MCP | MCP read-only, só no projeto de dev, saída tratada como dado | SEC-18 |
 | T-28 | Previews | I | Preview da Vercel apontando para dados de produção | Previews usam staging + Deployment Protection | §3.11 |
+| T-29 | Sessão | D | Amplificação antes da autenticação: um cookie forjado (`{"access_token":"x","refresh_token":"y","expires_at":1}` basta) faz o servidor chamar o Auth (refresh, `getUser` ou busca de JWKS) a partir do IP da Vercel, sem limite algum antes da autenticação; um 429 do Auth derruba o refresh de todos os usuários legítimos (F-01) | Antes de `getClaims()`, o resolvedor decodifica o cookie sem confiar nele e, se a resolução chamaria o Auth (token vencido, ou que não se verifica localmente: algoritmo simétrico, sem `kid` ou `kid` ainda não visto), gasta o orçamento por IP `session-upstream` (60 por 900 s, IPv6 no /64). Acima dele: 401 **sem apagar os cookies**, log `auth.rate_limited` com grupo, escopo e hash do sujeito, e nenhuma chamada ao Auth. Um token de `kid` conhecido é verificado localmente e não gasta nada, então um navegador legítimo no mesmo endereço não é afetado. Limitador que falha: 503 (fail closed). Se o Auth responde 429 ao refresh, 503 e o cookie é mantido. **Residual:** um `kid` novo e legítimo gasta uma unidade uma vez por processo | SEC-09, SEC-13 |
+| T-30 | Rate limit | D | O limitador como amplificador: um flood contra um sujeito já bloqueado custa uma escrita no banco por requisição; `private.rate_limit_counters` cresce sem limite com sujeitos variados (F-06, F-07) | Cache de negações em memória, por instância, consultado antes do RPC (só deixa o limite mais estrito, nunca libera, então não enfraquece o fail closed); `rate_limit_hit` apaga, em cerca de 1% das chamadas, até 500 janelas vencidas há mais de 1 dia (migration `rate_limit_opportunistic_cleanup`). A limpeza diária por `pg_cron` entra na Onda 11 | SEC-09, E-22 |
+| T-31 | Sessão | S/T | Fixação de sessão, CSRF e cookie tossing | Todo login cria uma sessão e tokens novos no Auth e sobrescreve o cookie (não há como impor um id de sessão); `__Host-` obriga `Secure`, `Path=/` e nenhum `Domain`, o que impede um subdomínio de plantar o cookie; `SameSite=Lax` mais checagem de `Origin` e JSON obrigatório (T-08). **Residual (F-10):** um login feito sobre uma sessão existente não revoga a anterior; ela expira pelo `timebox` de 12 h (ADR 0009) | SEC-07, SEC-08 |
+| T-32 | Logs | R/T | Correlação falsificada ou insuficiente: um `X-Request-Id` escolhido pelo cliente entra na trilha de auditoria e nos logs; eventos de auth sem sessão nem origem (F-09, F-11) | O id da requisição é sempre gerado no servidor (UUID v4) e é o que vai ao header, ao `problem+json`, aos logs e ao `x-request-id` do banco, então a auditoria só carrega ids do servidor; um valor válido do cliente é registrado à parte como `clientRequestId`. Os eventos `auth.login.*` e `auth.logout` levam `sessionId` e `ipHash` (HMAC com chave derivada, nunca o IP), e `auth.rate_limited` leva `subjectHash` | SEC-16, RNF-04 |
 
 ## 4. OWASP Top 10:2025
 
@@ -114,13 +118,30 @@ flowchart LR
 | POST de aprovação vindo de outra origem | API: 403 `ORIGIN_NOT_ALLOWED` (AC-23) |
 | 11 logins errados para a mesma conta | API: 429 (AC-03) |
 | Cookie reaproveitado após logout | API: 401 (AC-04) |
+| Logout quando o Auth responde 403 sem revogar | API: 503 e cookie mantido; a sessão continua viva (AC-04) |
+| 75 requisições com um cookie forjado do mesmo IP | API: no máximo 60 chamadas ao Auth, o resto 401 sem `Set-Cookie` (F-01) |
+| Login recusado de três jeitos (senha errada, e-mail inexistente, conta desativada) | API: mesmo 401 e mesmo piso de tempo (AC-02, F-05) |
+| Sessão com 12 h 1 min, ou sem uso há 4 h 1 min, ainda com JWT válido | pgTAP: sem principal (SEC-07, F-08) |
 | Corpo com campo extra `clientId` em `/me/*` ou `role` em provisionamento | API: 400 (AC-23) |
 
 ## 7. Riscos residuais aceitos
 
-- **T-04:** um atacante consegue atrasar o login de um CEO específico por até 15 min. Aceito
-  diante do benefício contra força bruta; há alerta.
+- **T-04 (não aceito, pendente de decisão):** um atacante consegue manter bloqueado o login de um
+  CEO específico de forma sustentada (11 tentativas a cada 15 min bastam), não só atrasá-lo. A
+  decisão F-03 sobre o §3.9 da spec é do usuário; até lá o risco está aberto, com alerta.
 - **Janela do access token:** sem o BFF, o JWT vale até 15 min. Pelo BFF, a revogação é imediata
   (checagem de sessão no banco).
+- **Login sobre uma sessão existente (F-10):** a sessão anterior não é revogada; expira pelo
+  `timebox` de 12 h (ADR 0009).
+- **Enumeração por `/otp` (T-02):** ver T-02.
 - **Insider CEO:** um CEO pode aprovar indevidamente. Mitigado por auditoria, não por prevenção.
   Desfazer aprovação fica para a v1.1 (Q-05).
+
+## 8. Pendências e decisões em aberto
+
+| Item | Situação |
+|------|----------|
+| F-03 (bloqueio direcionado, T-04) | **Decisão do usuário**, muda o §3.9 da spec: limite por e-mail mais prefixo de IP, contador global por conta só de falhas, ou cookie de dispositivo. Não mitigado |
+| F-04 (T-01) | Adiado para a Onda 11 |
+| F-13 | `[auth.email] secure_password_change` (trocar a senha exige login recente) entra na Onda 4, com a troca de senha |
+| F-14 | Registrado pelo threat-modeler como observação, sem ação nesta onda |

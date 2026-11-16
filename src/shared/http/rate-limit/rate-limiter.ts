@@ -1,5 +1,16 @@
-/** What the key of a rule is made of (spec §3.9). */
-export type RateLimitScope = 'ip' | 'account' | 'user';
+/**
+ * What the key of a rule is made of (spec §3.9). `ip`, `account` and `user` are what a route policy
+ * may declare. `global` has ONE subject for the whole app (an aggregate budget, e.g. all logins
+ * together); it exists only for programmatic budgets (`HandlerContext.consumeGlobalBudget`, or a
+ * component of the pipeline) and is never accepted in a route policy.
+ */
+export type RateLimitScope = 'ip' | 'account' | 'user' | 'global';
+
+/** The scopes a route policy may use. */
+export type PolicyRateLimitScope = Exclude<RateLimitScope, 'global'>;
+
+/** The one subject of every `global` budget. */
+export const GLOBAL_SUBJECT = 'global';
 
 /**
  * Named counter groups of spec §3.9. Two routes share a counter (per subject) exactly when their
@@ -15,6 +26,8 @@ export type RateLimitScope = 'ip' | 'account' | 'user';
  * - `writes`            every other authenticated write
  * - `reads`             every authenticated read
  * - `health`            GET /health
+ * - `session-upstream`  not a route: the per-IP budget of requests whose session cookie would make
+ *                       the server call the Auth server (see the Supabase principal resolver)
  *
  * All rules of one group MUST carry the same `limit` and `windowSeconds` (the same
  * `x-rate-limit` in the contract); the contract-guardian checks it.
@@ -28,6 +41,7 @@ export const RATE_LIMIT_GROUPS = [
   'writes',
   'reads',
   'health',
+  'session-upstream',
 ] as const;
 
 export type RateLimitGroup = (typeof RATE_LIMIT_GROUPS)[number];
@@ -43,6 +57,15 @@ export type RateLimitRule = {
   readonly windowSeconds: number;
 };
 
+/**
+ * A rule a route policy may declare: equal to an `x-rate-limit` entry, with the `ip`, `account` or
+ * `user` scope (never `global`).
+ */
+export type PolicyRateLimitRule = RateLimitRule & { readonly scope: PolicyRateLimitScope };
+
+/** An aggregate budget (scope `global`): everything but the scope, which is implied. */
+export type GlobalBudget = Omit<RateLimitRule, 'scope'>;
+
 /** Identifies one counter. */
 export type RateLimitKey = {
   readonly scope: RateLimitScope;
@@ -51,7 +74,8 @@ export type RateLimitKey = {
   readonly bucket: string;
   /**
    * PLAINTEXT subject: the client IP (an IPv6 address is already aggregated to its /64 prefix),
-   * the normalized account identifier or the user id. The pipeline never hashes it. An
+   * the normalized account identifier, the user id or, for `global`, the constant
+   * `GLOBAL_SUBJECT`. The pipeline never hashes it. An
    * implementation that PERSISTS counters (the Postgres limiter, Wave 3) must turn it into an
    * HMAC-SHA256 keyed with `RATE_LIMIT_KEY_SECRET` before storing it, so the database holds
    * neither IPs nor e-mails (spec §3.9). An in-memory implementation may use it as is.
