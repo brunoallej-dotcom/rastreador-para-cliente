@@ -5,66 +5,99 @@
 // touch. The same goes for `private.mfa_first_activations`, which only the operator's MFA reset (E-25,
 // Wave 11) deletes.
 //
-// It runs the project's own Supabase CLI (`supabase db query --local`, no shell), the way
-// `tests/setup/local-env.ts` runs `supabase status`. `--local` is not a default but a flag: the CLI
-// refuses to point it anywhere else, and the tests only ever run against a loopback stack. The binary and
-// the working directory come from where this file is, not from `process.cwd()`. Test code only: nothing
-// in `src/` may import it (ESLint enforces it).
+// It runs `psql` INSIDE the stack's `db` container (`docker exec`, no shell). The container is named
+// `supabase_db_<project_id>`, with the `project_id` of `supabase/config.toml`, so it depends on nothing
+// but the `db` container, which every stack has, whichever services were left out of `supabase start`
+// (CI leaves out several). It does not go through `supabase db query`: that command answers differently
+// depending on whether it thinks an AI agent is running it (a `{ rows }` object with a warning, or a bare
+// array), and CI is not one. The statement is wrapped so that the database itself returns the rows as one
+// JSON array, which is all that is parsed. Test code only: nothing in `src/` may import it (ESLint
+// enforces it).
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 
 const execFileAsync = promisify(execFile);
 
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
-const SUPABASE_BIN = `${REPO_ROOT}node_modules/.bin/supabase`;
+const CONFIG_PATH = fileURLToPath(new URL('../../supabase/config.toml', import.meta.url));
 const QUERY_TIMEOUT_MS = 30_000;
 const QUERY_MAX_BUFFER_BYTES = 1024 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_HOURS = 24 * 365;
+/** The characters a Supabase project id (and so a container name) is made of. */
+const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
-/** What `supabase db query -o json` prints: an object with the rows (plus a boundary and a warning). */
-const queryAnswerSchema = z.looseObject({ rows: z.array(z.record(z.string(), z.unknown())) });
-
-/**
- * The JSON object in the CLI output. The CLI may print progress lines before it ("Connecting to local
- * database...") and a notice after it (an update available), so each line that opens an object is tried
- * as the start, and each later line that ends with a closing brace as the end; the first slice that
- * parses and has the shape of an answer wins.
- */
-export function parseQueryOutput(output: string): z.infer<typeof queryAnswerSchema> {
-  const lines = output.split('\n');
-  for (let start = 0; start < lines.length; start += 1) {
-    if (lines[start]?.trimStart().startsWith('{') !== true) continue;
-    for (let end = start; end < lines.length; end += 1) {
-      if (lines[end]?.trimEnd().endsWith('}') !== true) continue;
-      try {
-        const slice = lines.slice(start, end + 1).join('\n');
-        const answer = queryAnswerSchema.safeParse(JSON.parse(slice));
-        if (answer.success) return answer.data;
-      } catch {
-        // not a complete object yet: try the next closing line
-      }
-    }
+/** The `project_id` of a `config.toml`: it names the containers (`supabase_db_<project_id>`). */
+export function parseProjectId(toml: string): string {
+  const id = /^project_id\s*=\s*"([^"\n]+)"/m.exec(toml)?.[1];
+  if (id === undefined || !PROJECT_ID_PATTERN.test(id)) {
+    throw new Error('supabase/config.toml has no usable project_id');
   }
-  throw new Error('the output of "supabase db query" holds no answer with rows');
+  return id;
 }
 
-/** Runs one statement against the local database and returns the rows it RETURNING. */
-async function queryLocal(sql: string): Promise<unknown[]> {
+/** The name of the `db` container of the stack of this repository. */
+export function dbContainerName(toml: string = readFileSync(CONFIG_PATH, 'utf8')): string {
+  return `supabase_db_${parseProjectId(toml)}`;
+}
+
+/**
+ * The rows `psql` printed: ONE JSON array (see `queryLocal`). Anything else (no output, an object, text)
+ * throws instead of being guessed at: a helper that guessed would test nothing.
+ */
+export function parseRowsOutput(stdout: string): Record<string, unknown>[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout.trim());
+  } catch {
+    throw new Error('the database container answered something that is not a JSON array of rows');
+  }
+  const rows = z.array(z.record(z.string(), z.unknown())).safeParse(value);
+  if (!rows.success) {
+    throw new Error('the database container answered something that is not a JSON array of rows');
+  }
+  return rows.data;
+}
+
+/**
+ * Runs one statement that returns rows (a SELECT, or an UPDATE or DELETE with RETURNING) against the
+ * local database and returns them. The statement goes in a data-modifying CTE so that the database
+ * itself folds the rows into one JSON array: no column separators, no command tags, no psql formatting
+ * to parse. Callers build the statement from validated values only.
+ */
+async function queryLocal(sql: string): Promise<Record<string, unknown>[]> {
+  const wrapped = `WITH r AS (${sql}) SELECT coalesce(json_agg(r), '[]'::json) FROM r`;
   let stdout: string;
   try {
-    ({ stdout } = await execFileAsync(SUPABASE_BIN, ['db', 'query', '--local', '-o', 'json', sql], {
-      cwd: REPO_ROOT,
-      timeout: QUERY_TIMEOUT_MS,
-      maxBuffer: QUERY_MAX_BUFFER_BYTES,
-    }));
+    ({ stdout } = await execFileAsync(
+      'docker',
+      [
+        'exec',
+        '-i',
+        dbContainerName(),
+        'psql',
+        '-U',
+        'postgres',
+        '-d',
+        'postgres',
+        '-X',
+        '-q',
+        '-A',
+        '-t',
+        '-v',
+        'ON_ERROR_STOP=1',
+        '-c',
+        wrapped,
+      ],
+      { timeout: QUERY_TIMEOUT_MS, maxBuffer: QUERY_MAX_BUFFER_BYTES },
+    ));
   } catch {
-    // Deliberately not echoed: the CLI output could carry connection details.
-    throw new Error('"supabase db query --local" failed. Is the stack running?');
+    // Deliberately not echoed: what psql or docker print could carry the statement or connection details.
+    throw new Error('the query in the database container failed. Is the stack running?');
   }
-  return parseQueryOutput(stdout).rows;
+  return parseRowsOutput(stdout);
 }
 
 function assertUuid(userId: string, what: string): void {
