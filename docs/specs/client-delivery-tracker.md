@@ -231,7 +231,15 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   409 `MFA_ALREADY_ENROLLED` e nada muda; fatores não verificados são removidos (E-26) e um novo é
   criado sem `friendly_name` (o Auth então aceita um único fator por usuário, o que fecha a
   corrida entre dois enrolls). URI, segredo e QR code vão na resposta, uma única vez; o log só leva
-  ids. **Verify:** primeiro **queima o código** (`consume_totp_code`, abaixo) e só então faz o
+  ids. **Verify:** o fator vem da sessão, não de um parâmetro. Sem `factorId` no corpo (o normal;
+  o campo está `deprecated` desde o contrato `1.0.0-draft.2`), o caso de uso lista os fatores TOTP
+  do usuário com a **própria sessão dele** (nenhum client admin) e usa o único fator verificado
+  (login em outro dispositivo, `VERIFY_MFA`) ou, se nenhum estiver verificado, o único candidato do
+  cadastro (primeiro uso, `ENROLL_MFA`): o espelho do enroll, que mantém um fator só. Sem fator
+  TOTP, ou com mais de um no mesmo estado, a resposta é 422 `INVALID_MFA_CODE` (o log diz
+  `factor_not_found` ou `factor_ambiguous`) e o código nunca é tentado em vários fatores. Com
+  `factorId`, ele precisa ser fator do próprio usuário (E-28, como antes). Resolvido o fator,
+  **queima o código** (`consume_totp_code`, abaixo, chaveado pelo id resolvido) e só então faz o
   `challenge` + `verify` do Auth. O primeiro sucesso ativa o fator, e todo sucesso troca a sessão
   por uma `aal2` (mesma `session_id`, tokens novos): os cookies novos saem na resposta, pelo jar do
   pipeline, e o principal é lido de novo com a sessão nova. Código errado, código vencido, código
@@ -284,7 +292,11 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   na hora (nada dela vai para a resposta); grava a nova senha com a sessão do usuário (o Auth
   derruba as outras sessões) e chama `mark_password_changed()`, que prova a troca, limpa
   `CHANGE_PASSWORD` e revoga as outras sessões de novo, mantendo a da requisição (AC-06). Senha
-  atual errada: 422 `INVALID_CURRENT_PASSWORD`. Um CEO sem TOTP verificado ainda fica com
+  atual errada: 422 `INVALID_CURRENT_PASSWORD`. No schema, `newPassword` não tem limite de tamanho
+  (só o do corpo, 16 KiB): toda violação da política é 422 `WEAK_PASSWORD`, nunca 400.
+  `currentPassword` tem de 1 a 72 **bytes** UTF-8, e acima disso é 400 `VALIDATION_ERROR` (forma,
+  como no login). O 204 só traz `Set-Cookie` quando o token da sessão foi renovado durante a
+  chamada. Um CEO sem TOTP verificado ainda fica com
   `ENROLL_MFA` depois da troca; um CEO com TOTP verificado precisa de `aal2` (com `aal1` o pipeline
   responde 403 `MFA_VERIFICATION_REQUIRED`, e a função recusa com 42501 por baixo). Duas falhas sem
   resposta deixam o estado incerto e viram 503 com a orientação "repita; se a senha atual for
@@ -446,6 +458,13 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
 | leituras autenticadas | usuário | 300 / min |
 | health | IP | 60 / min |
 
+- **No contrato:** as linhas da tabela marcadas como orçamento do handler, o teto global de logins e o
+  orçamento de sessão estão no `x-rate-limit` com `programmatic: true` e o `group` do contador
+  (`verifyTotp`: `totp-verify-daily`; `login` e `changePassword`: `global` / `login`; e, por serem de
+  qualquer operação autenticada, `sessionCookie`: `session-upstream`). Não fazem parte da política
+  da rota (`withRoute`), que continua igual às entradas sem a marca; um teste confere os números
+  contra as constantes do código. Estourado, o orçamento responde 429 com `Retry-After`, menos o de
+  sessão, que responde 401 (abaixo).
 - **Teto diário da verificação TOTP (F-22):** 5 / 5 min permite 1.440 tentativas por dia contra um
   código de seis dígitos (três valem a qualquer momento: cerca de 8 meses até acertar, em média).
   O handler de `verify` gasta também `totp-verify-daily`, 20 por 86.400 s por usuário, com
@@ -488,9 +507,14 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   `auth.login.failed` (HMAC do e-mail, `ipHash` e uma categoria: `invalid_credentials`,
   `account_inactive`, `upstream_unavailable` ou `upstream_error`), `auth.logout` (userId,
   `sessionId`, `ipHash`), `auth.mfa.enrolled` (`userId`, `factorId`, `replacedFactors`, `ipHash`),
-  `auth.mfa.verified` (`userId`, `factorId`, `sessionId`, `activated`, `ipHash`),
-  `auth.mfa.failed` (`userId`, `factorId`, `ipHash` e uma categoria: `invalid_code`, `code_reused` ou
-  `factor_not_found`; a resposta é a mesma nas três), `auth.mfa.followup_failed` (`userId`, `step`:
+  `auth.mfa.verified` (`userId`, `factorId`, `factorSource`, `candidateCount`, `sessionId`,
+  `activated`, `ipHash`), `auth.mfa.failed` (`userId`, `factorId` quando há fator, `factorSource`,
+  `candidateCount`, `ipHash` e uma categoria: `invalid_code`, `code_reused`, `factor_not_found` ou
+  `factor_ambiguous`; a resposta é a mesma nas quatro). `candidateCount` é quantos fatores TOTP a
+  conta tem e só existe quando o verify não trouxe `factorId` (o app mantém um só: mais de um é
+  anômalo, F-60; a tomada por um fator verificado plantado não aumenta a conta, F-61: o sinal é o
+  `factorId` não ser o do `auth.mfa.enrolled` do mesmo usuário). `factor_ambiguous` também gera `auth.mfa.factor_ambiguous`, em nível `error` e com
+  nome estável, para alerta (o app nunca cria esse estado, F-60). Ainda: `auth.mfa.followup_failed` (`userId`, `step`:
   a revogação das outras sessões que falhou depois de um verify bom), `auth.rate_limited` (escopo, grupo e `subjectHash`), `authz.denied` (com motivo),
   `auth.session_budget_mispredicted` (chamadas medidas, unidades cobradas e `ipHash`) e
   `auth.session_key_rejected` (token recusado na importação da chave; só o nome do erro).
@@ -712,6 +736,8 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
   confere se os handlers declaram a mesma política.
 - Erros em `application/problem+json`: `type`, `title`, `status`, `code`, `requestId`, além de
   `errors[]` em 400 e extensões específicas (`currentStageId` em 409 `STALE_STAGE`).
+- Toda operação autenticada documenta 503 `SERVICE_UNAVAILABLE` (com `Retry-After`): quando uma
+  dependência de segurança (limitador, banco, Auth) falha, a requisição é negada (E-21, E-22).
 - Paginação por cursor opaco: `?limit=1..100&cursor=…` → `{ items, nextCursor }`.
 
 | Método e path | operationId | Política |
@@ -784,7 +810,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
 | E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`; escritas são atômicas, então o retry é seguro |
-| E-22 | Rate limiter indisponível | 503 (fail closed) |
+| E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
 | E-25 | CEO perde o dispositivo do TOTP | Fora da API: runbook com script operacional (Onda 11) |
@@ -793,6 +819,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-28 | Código TOTP errado | 422 `INVALID_MFA_CODE`; conta no rate limit (5 / 5 min) |
 | E-29 | Cursor de paginação adulterado | 400 `VALIDATION_ERROR` |
 | E-30 | Texto com caracteres de controle ou Unicode não normalizado | Normaliza para NFC e rejeita caracteres de controle (400) |
+| E-31 | Verify sem `factorId` e a conta sem fator TOTP, ou com mais de um fator no mesmo estado | 422 `INVALID_MFA_CODE`, igual a código errado; conta nos dois limites; o log diz `factor_not_found` ou `factor_ambiguous` |
 
 ---
 

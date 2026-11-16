@@ -151,10 +151,13 @@ export function enrollTotpViaApi(cookies: CookieStore, options: { ip?: string | 
   });
 }
 
-/** `POST /auth/mfa/totp/verify` through the real route. The response is returned as it is. */
+/**
+ * `POST /auth/mfa/totp/verify` through the real route. The response is returned as it is. The body
+ * is what the test sends: `factorId` is optional and deprecated (contract 1.0.0-draft.2).
+ */
 export function verifyTotpViaApi(
   cookies: CookieStore,
-  body: { factorId: string; code: string },
+  body: { factorId?: string; code: string },
   options: { ip?: string | null } = {},
 ) {
   return invoke(verifyRoute, {
@@ -182,12 +185,23 @@ export async function enrollTotp(cookies: CookieStore): Promise<StartedEnrollmen
   return { factorId: body.factorId, secret: body.secret };
 }
 
-/** Verifies with a right code (see `nextTotpCode`); fails the helper unless the answer is 200. */
-export async function verifyTotp(cookies: CookieStore, enrollment: StartedEnrollment) {
-  const response = await verifyTotpViaApi(cookies, {
-    factorId: enrollment.factorId,
-    code: nextTotpCode(enrollment.secret),
-  });
+/**
+ * Verifies with a right code (see `nextTotpCode`); fails the helper unless the answer is 200.
+ *
+ * Like a current client it sends only the `code`: the server resolves the factor of the session
+ * (so a new device, which never learned the factor id, works). `sendFactorId: true` sends the
+ * deprecated `factorId` too, to exercise that path.
+ */
+export async function verifyTotp(
+  cookies: CookieStore,
+  enrollment: StartedEnrollment,
+  options: { sendFactorId?: boolean } = {},
+) {
+  const code = nextTotpCode(enrollment.secret);
+  const response = await verifyTotpViaApi(
+    cookies,
+    options.sendFactorId === true ? { factorId: enrollment.factorId, code } : { code },
+  );
   if (response.status !== 200) {
     throw new Error(`verify fixture failed with ${response.status}: ${await response.text()}`);
   }

@@ -35,7 +35,14 @@ Referências: `contracts/openapi.v1.yaml`, `docs/specs/client-delivery-tracker.m
    - `withRoute` com política equivalente ao `x-auth-policy` (`access`, `roles`, `allowPending`).
      Divergência → **CRÍTICO**. Rota pública fora de `GET /health` e `POST /auth/login` →
      **CRÍTICO**;
-   - rate limit equivalente ao `x-rate-limit` (escopo, limite, janela) → divergência **ALTO**;
+   - rate limit equivalente ao `x-rate-limit` (escopo, limite, janela) → divergência **ALTO**.
+     Entradas com `programmatic: true` (e as de `securitySchemes`) **não** são da política da rota:
+     são orçamentos que o handler ou o resolvedor gastam (`consumeUserBudget`,
+     `consumeGlobalBudget`, `session-upstream`). Confira-as contra as constantes
+     (`rate-limit-budgets.ts`, `SESSION_UPSTREAM_RULE`) e confirme que cada orçamento do código
+     consta no contrato. Entrada `programmatic` sem constante ou sem handler que a gaste, ou
+     orçamento no código (`consume*Budget(`) ausente do contrato → **ALTO**;
+   - toda operação autenticada documenta o 503 (`ServiceUnavailable`) → divergência **MÉDIO**;
    - schemas Zod de params, query e body: mesmos campos, obrigatoriedade, `maxLength`/`minLength`,
      enums, formatos (`uuid`, `email`) e `.strict()` → divergência **ALTO**;
    - mapper de DTO: os campos de saída batem exatamente com o schema de resposta (nulos

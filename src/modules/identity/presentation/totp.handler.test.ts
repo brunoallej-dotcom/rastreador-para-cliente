@@ -12,8 +12,14 @@ import { createVerifyTotpHandler, verifyTotpHandler } from './verify-totp.handle
 type ContractOperation = {
   operationId: string;
   'x-auth-policy': { access: string; roles: string[]; allowPending: string[] };
-  'x-rate-limit': { scope: string; limit: number; windowSeconds: number }[];
+  'x-rate-limit': { scope: string; limit: number; windowSeconds: number; programmatic?: boolean }[];
 };
+
+/** The rules of the route policy: the entries the handler spends on top (`programmatic`) are not. */
+const policyRules = (limits: ContractOperation['x-rate-limit']) =>
+  limits
+    .filter(({ programmatic }) => programmatic !== true)
+    .map(({ scope, limit, windowSeconds }) => ({ scope, limit, windowSeconds }));
 
 const contract = parse(
   readFileSync(
@@ -82,7 +88,9 @@ describe('POST /auth/mfa/totp/enroll: policy of the contract', () => {
     expect(policy.roles).toEqual(auth.roles);
     expect(policy.allowPending).toEqual(auth.allowPending);
     expect(policy.allowPending).toEqual(['ENROLL_MFA']);
-    expect(policy.rateLimit).toEqual(limits.map((limit) => ({ ...limit, group: 'totp-enroll' })));
+    expect(policy.rateLimit).toEqual(
+      policyRules(limits).map((limit) => ({ ...limit, group: 'totp-enroll' })),
+    );
     expect(policy.rateLimit).toEqual([
       { scope: 'user', group: 'totp-enroll', limit: 10, windowSeconds: 900 },
     ]);
@@ -111,7 +119,9 @@ describe('POST /auth/mfa/totp/verify: policy of the contract', () => {
     expect(policy.roles).toEqual(auth.roles);
     expect(policy.allowPending).toEqual(auth.allowPending);
     expect(policy.allowPending).toEqual(['ENROLL_MFA', 'VERIFY_MFA']);
-    expect(policy.rateLimit).toEqual(limits.map((limit) => ({ ...limit, group: 'totp-verify' })));
+    expect(policy.rateLimit).toEqual(
+      policyRules(limits).map((limit) => ({ ...limit, group: 'totp-verify' })),
+    );
     expect(policy.rateLimit).toEqual([
       { scope: 'user', group: 'totp-verify', limit: 5, windowSeconds: 300 },
     ]);

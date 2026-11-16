@@ -1,6 +1,7 @@
 # ADR 0008 — Contrato como teto de respostas: entrada não declarada é ignorada
 
-- **Status:** accepted
+- **Status:** accepted; alterado em parte pelo [ADR 0011](0011-contrato-draft-2-fator-da-sessao-e-503.md)
+  (o 503 de infraestrutura passou a constar do contrato `1.0.0-draft.2`)
 - **Data:** 2026-11-16
 
 ## Contexto

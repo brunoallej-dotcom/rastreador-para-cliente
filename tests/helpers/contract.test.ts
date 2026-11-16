@@ -320,6 +320,34 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
     );
   });
 
+  describe('503 on authenticated operations (the contract documents it on all of them)', () => {
+    const unavailable = problem({ status: 503, code: 'SERVICE_UNAVAILABLE' });
+
+    it.each([
+      'logout',
+      'getSession',
+      'changePassword',
+      'enrollTotp',
+      'verifyTotp',
+      'listMyProcesses',
+      'getMyProcess',
+      'listClients',
+      'createClient',
+      'approveCurrentStage',
+    ])('accepts a 503 problem with Retry-After for %s', (operationId) => {
+      expect(
+        failureWith(operationId, 503, unavailable, problemResponse(503, { 'Retry-After': '5' })),
+      ).toBe('');
+      expect(failureWith(operationId, 503, unavailable, problemResponse(503))).toMatch(
+        /declares the header Retry-After/,
+      );
+    });
+
+    it('still refuses a 503 where the contract documents none: getHealth is public, its limiter is in memory', () => {
+      expect(failureOf('getHealth', 503, unavailable)).toMatch(/documents no such status/);
+    });
+  });
+
   describe('Set-Cookie and Location', () => {
     it('requires the Set-Cookie of the logout response (204 clears the cookie)', () => {
       const withCookie = new Response(null, {
@@ -334,6 +362,20 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
       expect(failureWith('logout', 204, undefined, without)).toMatch(
         /declares the header Set-Cookie/,
       );
+    });
+
+    it('the Set-Cookie of the changePassword 204 is optional: it passes with and without it', () => {
+      const answer = (headers: Record<string, string>) =>
+        new Response(null, { status: 204, headers: { 'X-Request-Id': requestId, ...headers } });
+      expect(failureWith('changePassword', 204, undefined, answer({}))).toBe('');
+      expect(
+        failureWith(
+          'changePassword',
+          204,
+          undefined,
+          answer({ 'Set-Cookie': '__Host-rt-session=x; HttpOnly; Secure; SameSite=Lax; Path=/' }),
+        ),
+      ).toBe('');
     });
 
     it('requires the Location header of a 201', () => {

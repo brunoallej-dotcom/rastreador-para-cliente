@@ -13,6 +13,10 @@ import { VERIFY_DAILY_BUDGET } from './rate-limit-budgets';
 import { toSessionDto } from './session.dto';
 import { verifyTotpBodySchema } from './verify-totp.schema';
 
+/** Where the factor of a verification came from, for the log: lets us see who still sends the id. */
+const factorSourceOf = (body: { factorId?: string | undefined }) =>
+  body.factorId === undefined ? 'session' : 'request';
+
 const VERIFY_LIMIT = 5;
 const FIVE_MINUTES_SECONDS = 5 * 60;
 
@@ -35,6 +39,10 @@ const FIVE_MINUTES_SECONDS = 5 * 60;
  * On top of the contract's rule, every attempt that gets past it also spends the daily cap
  * (`VERIFY_DAILY_BUDGET`, 429 over it). A wrong code, a replayed one (the database refuses a code it
  * already accepted in the last 120 s) and a factor that is not the CEO's all answer the same 422.
+ *
+ * The body's `factorId` is optional and deprecated: left out, the use case resolves the CEO's TOTP
+ * factor from the session itself, with the same request client (no admin client). Both budgets are
+ * spent before that, so leaving the field out buys no extra attempt.
  *
  * When the verification activated the FIRST factor, the use case signs the CEO out of their other
  * sessions. It is best effort: a failure is logged at warn level and the verification stands.
@@ -74,16 +82,25 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
 
       if (!result.ok) {
         if (result.error instanceof InvalidMfaCodeError) {
+          const details = {
+            userId: principal.userId,
+            factorId: result.error.factorId,
+            factorSource: factorSourceOf(body),
+            candidateCount: result.error.candidateCount,
+            ipHash: clientIpFingerprint(request),
+          };
           logger.warn(
-            {
-              event: 'auth.mfa.failed',
-              userId: principal.userId,
-              factorId: body.factorId,
-              reason: result.error.reason,
-              ipHash: clientIpFingerprint(request),
-            },
+            { event: 'auth.mfa.failed', ...details, reason: result.error.reason },
             'auth.mfa.failed',
           );
+          // The app keeps ONE TOTP factor per CEO: a second one was planted straight at the Auth
+          // server (F-60). A stable event name, at error level, so an alert can be built on it.
+          if (result.error.reason === 'factor_ambiguous') {
+            logger.error(
+              { event: 'auth.mfa.factor_ambiguous', ...details },
+              'auth.mfa.factor_ambiguous',
+            );
+          }
         }
         return result.error;
       }
@@ -96,7 +113,9 @@ export function createVerifyTotpHandler(route: WithRoute = withRoute) {
         {
           event: 'auth.mfa.verified',
           userId: principal.userId,
-          factorId: body.factorId,
+          factorId: result.value.factorId,
+          factorSource: factorSourceOf(body),
+          candidateCount: result.value.candidateCount,
           sessionId: accessToken === undefined ? undefined : sessionIdOfToken(accessToken),
           activated,
           ipHash: clientIpFingerprint(request),

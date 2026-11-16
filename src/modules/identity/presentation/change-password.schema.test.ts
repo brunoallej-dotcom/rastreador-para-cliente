@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
-import { PASSWORD_MAX_BYTES, PASSWORD_MIN_CHARACTERS } from '../domain/password-policy';
+import { PASSWORD_MAX_BYTES } from '../domain/password-policy';
 import { changePasswordBodySchema } from './change-password.schema';
 
 const VALID = { currentPassword: 'the-current-one', newPassword: 'a-new-password-12' };
@@ -14,7 +14,10 @@ type ContractSchemas = {
       {
         required?: string[];
         additionalProperties?: boolean;
-        properties?: Record<string, { minLength?: number; maxLength?: number }>;
+        properties?: Record<
+          string,
+          { minLength?: number; maxLength?: number; description?: string }
+        >;
       }
     >;
   };
@@ -106,10 +109,18 @@ describe('changePasswordBodySchema against the contract (ChangePasswordRequest)'
     });
   });
 
-  it('newPassword: the contract limits ARE the password policy; the schema leaves their enforcement to it', () => {
-    expect(request?.properties?.['newPassword']).toMatchObject({
-      minLength: PASSWORD_MIN_CHARACTERS,
-      maxLength: PASSWORD_MAX_BYTES,
-    });
+  it('currentPassword: the contract says the 72 is in BYTES and what an over-limit value returns (400), as the schema does', () => {
+    const description = request?.properties?.['currentPassword']?.description ?? '';
+    expect(description).toContain('72 **bytes**');
+    expect(description).toContain('400 `VALIDATION_ERROR`');
+  });
+
+  it('newPassword: the contract declares NO minLength/maxLength (a conforming server would answer 400 before the policy), and describes the policy', () => {
+    const property = request?.properties?.['newPassword'];
+    expect(property).toBeDefined();
+    expect(property).not.toHaveProperty('minLength');
+    expect(property).not.toHaveProperty('maxLength');
+    expect(property?.description).toContain('422');
+    expect(property?.description).toContain('WEAK_PASSWORD');
   });
 });

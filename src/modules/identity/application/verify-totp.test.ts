@@ -183,3 +183,189 @@ describe('verifyTotp: the first activation signs the other sessions out', () => 
     expect(result.value.otherSessionsRevoked).toBe(false);
   });
 });
+
+describe('verifyTotp without a factor id (the factor of the session, E-31)', () => {
+  const OTHER = '00000000-0000-4000-8000-0000000000a2';
+  const code = { code: FAKE_VALID_CODE };
+
+  const reasonOf = (result: Awaited<ReturnType<typeof verifyTotp>>) => {
+    expect(result.ok).toBe(false);
+    if (result.ok) return undefined;
+    expect(result.error).toBeInstanceOf(InvalidMfaCodeError);
+    return (result.error as InvalidMfaCodeError).reason;
+  };
+
+  it('a new device: the one VERIFIED factor of the user is used, and the session becomes aal2', async () => {
+    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+
+    const result = await verifyTotp(d, returning, code);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.factorId).toBe(FACTOR);
+    expect(result.value.activated).toBe(false);
+    expect(result.value.session.principal.aal).toBe('aal2');
+    expect(mfa.calls).toEqual(['list', `verify:${FACTOR}`, 'current']);
+    expect(mfa.revocations()).toBe(0);
+  });
+
+  it('the first use: with nothing verified, the one unverified candidate of the enrollment is used and activated', async () => {
+    const { mfa, deps: d } = deps();
+
+    const result = await verifyTotp(d, enrolling, code);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.factorId).toBe(FACTOR);
+    expect(result.value.activated).toBe(true);
+    expect(mfa.factors()).toEqual([{ id: FACTOR, verified: true }]);
+    expect(mfa.revocations()).toBe(1);
+  });
+
+  it('a verified factor wins over an unverified leftover next to it', async () => {
+    const { mfa, deps: d } = deps({
+      factors: [
+        { id: OTHER, verified: false },
+        { id: FACTOR, verified: true },
+      ],
+    });
+
+    const result = await verifyTotp(d, returning, code);
+
+    expect(result.ok && result.value.factorId).toBe(FACTOR);
+    expect(mfa.calls).toContain(`verify:${FACTOR}`);
+    expect(mfa.calls).not.toContain(`verify:${OTHER}`);
+  });
+
+  it('no TOTP factor at all is refused like a wrong code (factor_not_found), and no code is tried', async () => {
+    const { mfa, deps: d } = deps({ factors: [] });
+
+    const result = await verifyTotp(d, enrolling, code);
+
+    expect(reasonOf(result)).toBe('factor_not_found');
+    expect(mfa.calls).toEqual(['list']);
+    expect(mfa.elevated()).toBe(false);
+  });
+
+  it.each([
+    [
+      'two verified factors',
+      [
+        { id: FACTOR, verified: true },
+        { id: OTHER, verified: true },
+      ],
+    ],
+    [
+      'two unverified factors and no verified one',
+      [
+        { id: FACTOR, verified: false },
+        { id: OTHER, verified: false },
+      ],
+    ],
+  ])(
+    '%s are ambiguous: factor_not_found would lie, so factor_ambiguous, and the code is tried on none of them',
+    async (_label, factors) => {
+      const { mfa, deps: d } = deps({ factors });
+
+      const result = await verifyTotp(d, returning, code);
+
+      expect(reasonOf(result)).toBe('factor_ambiguous');
+      expect(mfa.calls).toEqual(['list']);
+      expect(mfa.elevated()).toBe(false);
+    },
+  );
+
+  it('a factor id in the request is used as it is: the factors of the user are not even listed', async () => {
+    const { mfa, deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+
+    const result = await verifyTotp(d, returning, { factorId: FACTOR, ...code });
+
+    expect(result.ok).toBe(true);
+    expect(mfa.calls).toEqual([`verify:${FACTOR}`, 'current']);
+  });
+
+  it("a factor id that is not the account's stays refused like a wrong code, and the error knows which id it was", async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+
+    const result = await verifyTotp(d, returning, { factorId: OTHER, ...code });
+
+    expect(reasonOf(result)).toBe('factor_not_found');
+    if (!result.ok) expect((result.error as InvalidMfaCodeError).factorId).toBe(OTHER);
+  });
+
+  it('F-21: the replay guard is keyed by the RESOLVED factor: the same code without the id, twice, is code_reused', async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+    expect((await verifyTotp(d, returning, code)).ok).toBe(true);
+
+    const replay = await verifyTotp(d, returning, code);
+    const replayWithId = await verifyTotp(d, returning, { factorId: FACTOR, ...code });
+
+    expect(reasonOf(replay)).toBe('code_reused');
+    // naming the factor does not give the code a second life: it is the same factor
+    expect(reasonOf(replayWithId)).toBe('code_reused');
+    if (!replay.ok) expect((replay.error as InvalidMfaCodeError).factorId).toBe(FACTOR);
+  });
+
+  it('SEC-11: the session decides the role before anything is listed: a client never reaches the gateway', async () => {
+    const { mfa, deps: d } = deps();
+
+    const result = await verifyTotp(d, { ...enrolling, role: 'client', clientId: 'c1' }, code);
+
+    expect(result.ok).toBe(false);
+    expect(mfa.calls).toEqual([]);
+  });
+
+  it('E-21: an outage while listing the factors is a ServiceUnavailableError, never a refused code', async () => {
+    const { mfa, deps: d } = deps();
+    mfa.failWith('list');
+
+    await expect(verifyTotp(d, enrolling, code)).rejects.toBeInstanceOf(ServiceUnavailableError);
+    expect(mfa.calls).toEqual(['list']);
+  });
+
+  it('F-60, F-61: the number of TOTP factors the account has travels with the outcome and with every refusal, so the log can see a planted factor', async () => {
+    const one = deps({ factors: [{ id: FACTOR, verified: true }] });
+    const ok = await verifyTotp(one.deps, returning, code);
+    expect(ok.ok && ok.value.candidateCount).toBe(1);
+
+    // a wrong code on an account that has two factors: the refusal says "two"
+    const two = deps({
+      factors: [
+        { id: FACTOR, verified: true },
+        { id: OTHER, verified: false },
+      ],
+    });
+    const wrong = await verifyTotp(two.deps, returning, { code: '000000' });
+    expect(reasonOf(wrong)).toBe('invalid_code');
+    if (!wrong.ok) {
+      const error = wrong.error as InvalidMfaCodeError;
+      expect(error.candidateCount).toBe(2);
+      expect(error.factorId).toBe(FACTOR);
+    }
+
+    // the refusals of the resolution itself
+    const none = await verifyTotp(deps({ factors: [] }).deps, enrolling, code);
+    const ambiguous = await verifyTotp(
+      deps({
+        factors: [
+          { id: FACTOR, verified: false },
+          { id: OTHER, verified: false },
+        ],
+      }).deps,
+      enrolling,
+      code,
+    );
+    expect(!none.ok && (none.error as InvalidMfaCodeError).candidateCount).toBe(0);
+    expect(!ambiguous.ok && (ambiguous.error as InvalidMfaCodeError).candidateCount).toBe(2);
+  });
+
+  it('a request that names the factor lists nothing, so it has no candidate count', async () => {
+    const { deps: d } = deps({ factors: [{ id: FACTOR, verified: true }] });
+
+    const ok = await verifyTotp(d, returning, { factorId: FACTOR, ...code });
+    const refused = await verifyTotp(d, returning, { factorId: OTHER, ...code });
+
+    expect(ok.ok && ok.value.candidateCount).toBeUndefined();
+    expect(!refused.ok && (refused.error as InvalidMfaCodeError).candidateCount).toBeUndefined();
+  });
+});

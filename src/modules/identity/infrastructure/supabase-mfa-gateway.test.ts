@@ -99,6 +99,36 @@ describe('SupabaseMfaGateway.listTotpFactors', () => {
     ]);
   });
 
+  it('F-62: a factor type the adapter has never heard of is ignored, whatever its shape: it cannot turn the list into a 500', async () => {
+    const { supabase } = fakeSupabase({
+      listFactors: {
+        data: {
+          all: [
+            { id: FACTOR_ID, factor_type: 'totp', status: 'verified' },
+            // a type that does not exist yet: no id, an unknown status, extra members
+            { factor_type: 'recovery_code', created_at: 'now', codes_left: 8 },
+            { id: 'not-a-uuid', factor_type: 'webauthn', status: 'pending', credential: {} },
+          ],
+        },
+        error: null,
+      },
+    });
+
+    const factors = await createSupabaseMfaGateway(supabase).listTotpFactors();
+
+    expect(factors).toEqual([{ id: FACTOR_ID, verified: true }]);
+  });
+
+  it('F-62: an entry with no factor_type at all is still an answer that is not understood', async () => {
+    const { supabase } = fakeSupabase({
+      listFactors: { data: { all: [{ id: FACTOR_ID, status: 'verified' }] }, error: null },
+    });
+
+    await expect(createSupabaseMfaGateway(supabase).listTotpFactors()).rejects.toThrow(
+      /not understood/,
+    );
+  });
+
   it('never carries more than the id and the state: no secret, no friendly name', async () => {
     const { supabase } = fakeSupabase({
       listFactors: {
