@@ -1,0 +1,57 @@
+# Local Semgrep rules (ADR 0012): the project bans that the ESLint `no-restricted-syntax` rules
+# (eslint.config.mjs) already enforce in src/, repeated in a second engine so one cannot silently
+# stop working. Fixtures: .semgrep/rules.ts (`sh scripts/sast.sh test`).
+rules:
+  - id: no-auth-getsession
+    languages: [typescript, javascript]
+    severity: ERROR
+    # Test clients play the browser and read their own session; the ban is for server code.
+    paths:
+      exclude:
+        - tests/
+    message: >-
+      auth.getSession() does not validate the JWT on the server. Use getClaims()/getUser()
+      through the PrincipalResolver (AGENTS.md, "Segurança").
+    metadata:
+      category: security
+      cwe: 'CWE-287: Improper Authentication'
+    pattern-either:
+      - pattern: $CLIENT.auth.getSession
+      - pattern: $CLIENT.auth?.getSession
+      - pattern: $CLIENT.auth['getSession']
+      - pattern: $CLIENT['auth']['getSession']
+      - pattern: auth.getSession
+      - pattern: const { ..., getSession, ... } = $CLIENT.auth
+      - pattern: 'const { ..., getSession: $ALIAS, ... } = $CLIENT.auth'
+      - pattern: 'const { ..., auth: { ..., getSession, ... }, ... } = $CLIENT'
+      - pattern: 'const { ..., auth: { ..., getSession: $ALIAS, ... }, ... } = $CLIENT'
+      - pattern: const { ..., getSession, ... } = auth
+      - pattern: 'const { ..., getSession: $ALIAS, ... } = auth'
+
+  - id: no-interpolated-postgrest-filter
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      Interpolated or concatenated input in a PostgREST filter allows injection (spec §3.8). Use
+      .eq/.in/.ilike with a plain value, or an RPC.
+    metadata:
+      category: security
+      cwe: 'CWE-74: Improper Neutralization of Special Elements in Output Used by a Downstream Component'
+    patterns:
+      - pattern-either:
+          # `.filter` with one argument is Array#filter; PostgREST's takes (column, operator, value).
+          - patterns:
+              - pattern: $Q.filter($A, $B, ...)
+              - pattern-either:
+                  - pattern: $Q.filter(`...${$X}...`, ...)
+                  - pattern: $Q.filter($A, `...${$X}...`, ...)
+                  - pattern: $Q.filter($A, $B, `...${$X}...`, ...)
+                  - pattern: $Q.filter($S + $T, ...)
+                  - pattern: $Q.filter($A, $S + $T, ...)
+                  - pattern: $Q.filter($A, $B, $S + $T, ...)
+          - pattern: $Q.or(`...${$X}...`, ...)
+          - pattern: $Q.or($S + $T, ...)
+          - pattern: $Q.textSearch(`...${$X}...`, ...)
+          - pattern: $Q.textSearch($A, `...${$X}...`, ...)
+          - pattern: $Q.textSearch($S + $T, ...)
+          - pattern: $Q.textSearch($A, $S + $T, ...)
