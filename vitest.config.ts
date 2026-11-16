@@ -29,7 +29,16 @@ export default defineConfig({
       include: ['src/modules/*/domain/**', 'src/modules/*/application/**'],
       exclude: ['**/*.test.ts'],
       reporter: ['text-summary', 'lcov'],
-      // Thresholds arrive in Wave 8.
+      // RNF-06: at least 80% in the domain and application layers of tracking (Wave 8). The glob
+      // matches a threshold per pattern: a drop below it fails `pnpm test:coverage`.
+      thresholds: {
+        'src/modules/tracking/{domain,application}/**': {
+          statements: 80,
+          branches: 80,
+          functions: 80,
+          lines: 80,
+        },
+      },
     },
     projects: [
       {
