@@ -115,6 +115,13 @@ Crie ou atualize `supabase/tests/<area>.test.sql` usando a skill `tenant-isolati
 cross-tenant, `anon`, escrita direta negada, função de CEO negada para cliente e para `aal1`,
 `proconfig`/privilégios da função e o caminho feliz. O hook `stop-gates` lembra se faltar.
 
+**Todo objeto de CEO novo (função, policy) precisa de um teste negativo com `p_attested => false`**
+(`tests.authenticate_as(<ceo>, 'aal2', false)`): um CEO com o claim `aal2` mas sem o atestado do
+backend (Onda 6.1, ADR 0013) é negado, com o positivo de controle logo depois (a mesma sessão, atestada,
+passa). Sem isso um objeto novo pode aceitar uma `aal2` obtida direto no Auth sem ninguém notar. A
+checagem de CEO é sempre `private.is_ceo()`; ler o claim `aal` do JWT numa função reprova o
+`supabase/tests/001_privileges.test.sql`.
+
 ## Depois de escrever
 
 ```bash

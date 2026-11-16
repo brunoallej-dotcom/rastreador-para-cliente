@@ -1,6 +1,8 @@
 import { getRequestSupabase } from '@/shared/db/server-client';
 import { clientIpFingerprint, json, withRoute, type WithRoute } from '@/shared/http';
 import { enrollTotp } from '../application/enroll-totp';
+import { MfaReenrollmentRefusedError } from '../domain/mfa-errors';
+import { createSupabaseMfaAttestor } from '../infrastructure/supabase-mfa-attestor';
 import { createSupabaseMfaGateway } from '../infrastructure/supabase-mfa-gateway';
 import { toTotpEnrollmentDto } from './totp.dto';
 
@@ -15,7 +17,10 @@ const FIFTEEN_MINUTES_SECONDS = 15 * 60;
  * has no body schema, so the body is ignored.
  *
  * It does not change the session: no cookie is written beyond a refresh the pipeline already did.
- * The response carries the TOTP secret, once; the log line `auth.mfa.enrolled` carries only ids.
+ * The new factor is recorded as the backend's own (ADR 0013) before the response goes out; if the
+ * record cannot be written the answer is an error and the CEO enrolls again (the unrecorded factor is
+ * removed then). The response carries the TOTP secret, once; the log line `auth.mfa.enrolled`
+ * carries only ids.
  *
  * `route` is `withRoute` in production; tests pass a pipeline wired to fakes.
  */
@@ -36,8 +41,26 @@ export function createEnrollTotpHandler(route: WithRoute = withRoute) {
     },
     async ({ request, requestId, cookies, logger, principal }) => {
       const supabase = getRequestSupabase({ request, cookies, requestId });
-      const result = await enrollTotp({ mfa: createSupabaseMfaGateway(supabase) }, principal);
-      if (!result.ok) return result.error;
+      const result = await enrollTotp(
+        { mfa: createSupabaseMfaGateway(supabase), attestor: createSupabaseMfaAttestor() },
+        principal,
+      );
+      if (!result.ok) {
+        // F-64: the account had its first factor activated, someone deleted it straight at Auth and a
+        // new enrollment came. The database deleted every session; the answer is the usual 409. A
+        // stable name at error level, so an alert can be built on it.
+        if (result.error instanceof MfaReenrollmentRefusedError) {
+          logger.error(
+            {
+              event: 'auth.mfa.reenrollment_refused',
+              userId: principal.userId,
+              ipHash: clientIpFingerprint(request),
+            },
+            'auth.mfa.reenrollment_refused',
+          );
+        }
+        return result.error;
+      }
 
       const { enrollment, replacedFactors } = result.value;
       // Ids and a count only. Never the secret, the URI or the QR code (they are in the response).

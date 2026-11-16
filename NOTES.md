@@ -4,12 +4,12 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 6 concluídas, mais o contrato
-  `1.0.0-draft.2` e a troca do CodeQL pelo Semgrep.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 6.1 concluídas, mais os contratos
+  `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 6.1 (F-50 e F-41, decidida em 2026-11-16), depois 7 ∥ 8 e 9 ∥ 10.
+- **Próximas ondas:** 7 ∥ 8, depois 9 ∥ 10.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -22,7 +22,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
-| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
+| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
@@ -39,7 +39,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 | Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
 | Deixar o repositório privado (decidido em 2026-11-16) **depois** do merge do PR do Semgrep, que substitui o CodeQL (code scanning não existe em repositório privado de conta pessoal no GitHub Free) | exposição do threat model com achados abertos |
-| Branch protection na `main` e merge só por squash: em repositório privado, exige GitHub Pro (no Free, só repositório público tem branch protection e rulesets) | CI da Onda 0 |
+| ~~Branch protection na `main`~~: **decidido em 2026-11-16, sem GitHub Pro por ora.** Risco aceito: o GitHub não barra merge com CI vermelho; o fluxo de ondas só faz merge com todos os checks verdes | — |
 | Corrigir no código-fonte do `@aisac/cli` o falso positivo do `secrets-guard` (identificador terminado em `.key` em comando Bash; ver CLAUDE.md) | conforto dos agentes |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
@@ -389,3 +389,43 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 - Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`: `pnpm verify` → 1879
   unit + 768 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` → 266/266;
   `test:api -t "E-4"` → 19; `test:int` → 22/22; `build` e `format:check` ok.
+
+### 2026-11-16 — Onda 6.1: elevação de CEO atestada pelo backend e validade da senha temporária
+
+- Executada por subagente Sonnet (xhigh) em worktree. É uma onda de segurança crítica. A
+  compensação foram três rodadas de revisão (threat-modeler, code-reviewer, rls-auditor, mais uma
+  segunda passada e uma checagem focada no trigger), com os gates reexecutados pela sessão
+  principal.
+- **Atestado (F-50 b, F-63, ADR 0013):** uma sessão `aal2` só vale como CEO depois que o verify
+  passa pelo backend.
+  - `attest_mfa_session` é só do `service_role` e revalida tudo em SQL. O atestado é por
+    `session_id`, ligado ao fator e ao challenge do backend.
+  - `is_ceo()`, `current_principal()` e `mark_password_changed()` exigem o atestado.
+  - **Oráculo:** um challenge verificado fora do backend nos últimos 120 s faz o atestado ser
+    recusado.
+  - Recusa por sinal de ataque revoga todas as sessões e grava auditoria. Recusa por corrida só
+    recusa.
+- Achados das revisões, corrigidos antes do merge:
+  - **F-64 (ALTO):** uma `aal2` direta apagava o fator do CEO e o atacante cadastrava o próprio.
+    Agora existe uma marca permanente de primeira ativação, gravada por trigger em
+    `auth.mfa_factors` na mesma transação da ativação. Um fator novo só entra depois do reset do
+    operador (E-25, Onda 11).
+  - **F-20 na recuperação (ALTO):** a revogação das outras sessões sumia depois de um atestado que
+    falhava. Agora ela acontece dentro do próprio atestado, na transação.
+  - **F-65 (MÉDIO):** `consume_totp_code` era um oráculo via PostgREST. A versão antiga caiu, e a
+    nova é só do `service_role`.
+  - Também corrigidos: F-66, F-67, F-69, F-71 (parcial), F-73, F-74, guarda de catálogo contra
+    leitura de `aal` fora do atestado, e testes negativos `p_attested => false` em todos os objetos
+    de CEO (regra registrada nas skills).
+- **F-41:** a senha temporária vale 72 h (`current_active_user_id()`). O reset renova o prazo. O
+  CEO com a senha vencida fica trancado até o script de reset da Onda 11.
+- **Consequências operacionais:**
+  - um CEO que perde o celular precisa do reset de MFA (E-25), um gate da Onda 11;
+  - as conferências no Supabase hospedado (trigger em `auth.mfa_factors`, retenção de challenges,
+    locale) entraram nos gates da Onda 11.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`, já com o F-51 na main:
+  `pnpm verify` → 2023 unit + 934 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` → 289/289
+  duas vezes; `test:api -t "E-3[2-9]"` → 19; `test:int` → 22/22; `build` e `format:check` ok;
+  `pnpm sast` sem achados (subagente).
+- **GitHub Pro:** o usuário decidiu ficar sem por ora. Sem branch protection, o merge só com CI
+  verde depende do fluxo, e é o que a sessão principal faz.

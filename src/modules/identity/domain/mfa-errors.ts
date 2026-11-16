@@ -1,4 +1,5 @@
 import { DomainError } from '@/shared/kernel';
+import type { AttestationRefusal } from './mfa-ports';
 
 /**
  * Why a TOTP code was refused, for the LOG only (`auth.mfa.failed`). It is never part of the
@@ -10,11 +11,16 @@ import { DomainError } from '@/shared/kernel';
  *   was removed, or an id nobody has), or, when the request names no factor, the account has none.
  *   It is how a stale tab after E-26 looks, and also how an attacker who replaced the CEO's
  *   unfinished factor (F-20) shows up when the CEO tries it;
- * - `factor_ambiguous`: the request names no factor and the account has more than one TOTP factor
- *   in the same state (E-31), so the session does not say which one is meant. The enrollment never
- *   leaves such an account behind; the code is not tried on any of them.
+ * - `factor_ambiguous`: the request names no factor and the backend enrolled more than one TOTP
+ *   factor of the account in the same state (E-31), so the session does not say which one is meant.
+ *   The enrollment never leaves such an account behind (and a factor planted straight at Auth is not
+ *   counted, F-60); the code is not tried on any of them;
+ * - `attestation_refused`: the Auth service accepted the code, but the database refused to attest the
+ *   session (F-50 b, F-61): see `attestationReason`. Every session of the user was deleted. It is an
+ *   alert, not a typo.
  */
-export type MfaRefusal = 'invalid_code' | 'code_reused' | 'factor_not_found' | 'factor_ambiguous';
+export type MfaRefusal =
+  'invalid_code' | 'code_reused' | 'factor_not_found' | 'factor_ambiguous' | 'attestation_refused';
 
 export type InvalidMfaCodeOptions = ErrorOptions & {
   /** The factor the code was meant for, when there is one. For the log only. */
@@ -24,6 +30,13 @@ export type InvalidMfaCodeOptions = ErrorOptions & {
    * app keeps exactly one, so more than one is anomalous (F-60, F-61). For the log only.
    */
   readonly candidateCount?: number;
+  /**
+   * How many of those factors the backend did not enroll (created straight at Auth, F-60, F-61).
+   * The app never makes one, so a value above zero is an alert. For the log only.
+   */
+  readonly foreignFactorCount?: number;
+  /** Why the database refused to attest the session (`attestation_refused`). For the log only. */
+  readonly attestationReason?: AttestationRefusal;
 };
 
 /**
@@ -39,9 +52,14 @@ export class InvalidMfaCodeError extends DomainError {
   readonly factorId: string | undefined;
   /** How many TOTP factors the account has, when they were listed (never part of the response). */
   readonly candidateCount: number | undefined;
+  /** How many of them the backend did not enroll, when they were listed (never part of the response). */
+  readonly foreignFactorCount: number | undefined;
+  /** Why the attestation was refused, for `attestation_refused` (never part of the response). */
+  readonly attestationReason: AttestationRefusal | undefined;
 
   constructor(reason: MfaRefusal = 'invalid_code', options: InvalidMfaCodeOptions = {}) {
-    const { factorId, candidateCount, ...errorOptions } = options;
+    const { factorId, candidateCount, foreignFactorCount, attestationReason, ...errorOptions } =
+      options;
     super('the TOTP code was refused', {
       ...errorOptions,
       detail: 'The code is invalid or has expired.',
@@ -49,6 +67,8 @@ export class InvalidMfaCodeError extends DomainError {
     this.reason = reason;
     this.factorId = factorId;
     this.candidateCount = candidateCount;
+    this.foreignFactorCount = foreignFactorCount;
+    this.attestationReason = attestationReason;
   }
 }
 
@@ -62,4 +82,15 @@ export class MfaAlreadyEnrolledError extends DomainError {
       detail: 'An authenticator app is already registered for this account.',
     });
   }
+}
+
+/**
+ * The account already had its first TOTP factor activated through the backend, that factor no longer
+ * exists (someone deleted it straight at the Auth server, F-64) and a new enrollment came. The answer
+ * is the same 409 as a verified factor that exists: the client learns nothing more. Every session of
+ * the user was deleted by the database, and the log raises `auth.mfa.reenrollment_refused`. Only the
+ * operator's MFA reset (E-25, Wave 11) lets the account enroll again.
+ */
+export class MfaReenrollmentRefusedError extends MfaAlreadyEnrolledError {
+  readonly reason = 'factor_reenrolled';
 }

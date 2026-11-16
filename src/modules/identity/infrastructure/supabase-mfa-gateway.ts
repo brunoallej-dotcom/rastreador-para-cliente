@@ -41,11 +41,6 @@ const SESSION_GONE_CODES: ReadonlySet<string> = new Set([
   'user_not_found',
 ]);
 
-/** `PostgREST` answer of `consume_totp_code`: SQLSTATE `P0001` with the catalog `MESSAGE`. */
-const SQL_BUSINESS_RULE = 'P0001';
-const SQL_NOT_FOUND = 'NOT_FOUND';
-const SQL_INSUFFICIENT_PRIVILEGE = '42501';
-
 /**
  * What the Auth server answers for the factors of the user. Only the type is read from every entry:
  * the TOTP ones are filtered FIRST and only then parsed strictly (`totpFactorSchema`), so a factor
@@ -75,6 +70,12 @@ const enrollmentSchema = z.object({
 });
 
 const challengeSchema = z.object({ id: z.guid() });
+
+/** `public.list_backend_totp_factors()`: the ids of the factors the backend enrolled for the user. */
+const backendFactorsSchema = z.array(z.object({ factor_id: z.guid() }));
+
+/** The `session_id` claim of an access token the client has verified. */
+const sessionIdSchema = z.guid();
 
 const errorCodeOf = (error: unknown): string | undefined => {
   const { code } = error as { code?: unknown };
@@ -146,7 +147,33 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         .array(totpFactorSchema)
         .safeParse(envelope.data.filter((factor) => factor.factor_type === 'totp'));
       if (!totp.success) throw new Error('list the factors: an answer that is not understood');
-      return totp.data.map((factor) => ({ id: factor.id, verified: factor.status === 'verified' }));
+
+      // Which of them the backend enrolled (F-60, F-61). The user's own session reads it: the
+      // database function answers only for the principal of that session.
+      const registry = await attempt(
+        'list the backend factors',
+        async () => await supabase.rpc('list_backend_totp_factors'),
+      );
+      if (registry.error) {
+        if (registry.status === UNAUTHORIZED_STATUS) {
+          throw new UnauthenticatedError('list the backend factors: the session was rejected', {
+            cause: registry.error,
+            detail: 'Authentication required.',
+          });
+        }
+        throw upstreamFailure('list the backend factors', registry.error, registry.status);
+      }
+      const enrolled = backendFactorsSchema.safeParse(registry.data);
+      if (!enrolled.success) {
+        throw new Error('list the backend factors: an answer that is not understood');
+      }
+      const backendIds = new Set(enrolled.data.map((row) => row.factor_id.toLowerCase()));
+
+      return totp.data.map((factor) => ({
+        id: factor.id,
+        verified: factor.status === 'verified',
+        backendEnrolled: backendIds.has(factor.id.toLowerCase()),
+      }));
     },
 
     async removeUnverifiedTotp(factorId) {
@@ -192,39 +219,15 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
       return ok({ factorId: id, uri: totp.uri, secret: totp.secret, qrCode: totp.qr_code });
     },
 
-    async verifyTotp({ factorId, code }) {
+    async verifyTotp({ factorId, code, burnCode, recordChallenge }) {
       // 1. Burn the code BEFORE the Auth server sees it (F-21): the Auth server accepts the same
       //    code again inside its window, the database does not. A wrong code is burned too, which
-      //    costs nothing (a code is single-use whatever its fate). The database also checks that
-      //    the factor is a TOTP factor of THIS user, so nobody burns another account's codes.
-      const consumed = await attempt(
-        'burn a TOTP code',
-        async () =>
-          await supabase.rpc('consume_totp_code', {
-            p_factor_id: factorId,
-            p_code_digest: codeDigest(factorId, code),
-          }),
-      );
-      if (consumed.error) {
-        const { code: sqlState, message } = consumed.error;
-        if (sqlState === SQL_BUSINESS_RULE && message === SQL_NOT_FOUND) {
-          return err(
-            new InvalidMfaCodeError('factor_not_found', { cause: consumed.error, factorId }),
-          );
-        }
-        // no active principal: the session ended after the pipeline accepted it
-        if (sqlState === SQL_INSUFFICIENT_PRIVILEGE) {
-          throw new UnauthenticatedError('burn a TOTP code: no active principal', {
-            cause: consumed.error,
-            detail: 'Authentication required.',
-          });
-        }
-        throw upstreamFailure('burn a TOTP code', consumed.error, consumed.status);
-      }
-      if (consumed.data === false) return err(new InvalidMfaCodeError('code_reused', { factorId }));
-      if (consumed.data !== true) {
-        throw new Error('burn a TOTP code: an answer that is not understood');
-      }
+      //    costs nothing (a code is single-use whatever its fate). The burn is the ADMIN path's, not
+      //    this client's (F-65): with the user's own session it was a code oracle at PostgREST. It
+      //    also checks that the factor is a TOTP factor of THIS user, so nobody burns another
+      //    account's codes. What it receives is the digest, never the code.
+      const burned = await burnCode(codeDigest(factorId, code));
+      if (!burned.ok) return burned;
 
       // 2. The Auth server's own challenge and verification.
       const challenge = await attempt('challenge a factor', () =>
@@ -243,6 +246,12 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         throw new Error('challenge a factor: an answer that is not understood');
       }
 
+      // 2b. The backend records the challenge it just made BEFORE the Auth server can verify it:
+      //     the attestation tells these challenges from the ones made straight at Auth (F-63). If it
+      //     cannot, the code is never tried (a throw is a 503, fail closed).
+      const recorded = await recordChallenge(challengeId.data.id);
+      if (!recorded.ok) return recorded;
+
       const verified = await attempt('verify a factor', () =>
         supabase.auth.mfa.verify({ factorId, challengeId: challengeId.data.id, code }),
       );
@@ -258,17 +267,24 @@ export function createSupabaseMfaGateway(supabase: RequestSupabase): MfaGateway 
         }
         throw failure('verify a factor', verified.error);
       }
-      return ok(undefined);
+      return ok({ challengeId: challengeId.data.id });
     },
 
-    async revokeOtherSessions() {
-      // `others`: the Auth client leaves the current session (and so the cookies) as it is. It
-      // reports success for a 401, 403 or 404 of the Auth server (it takes them for "already signed
-      // out"), so a revocation that did not happen for that reason is not visible here.
-      const { error } = await attempt('revoke the other sessions', () =>
-        supabase.auth.signOut({ scope: 'others' }),
-      );
-      if (error) throw failure('revoke the other sessions', error);
+    async currentSessionId() {
+      // The claims of the access token the client holds NOW (after a verification, the new one),
+      // verified against the project's signing keys; the id is not read from an unverified cookie.
+      let result: Awaited<ReturnType<typeof supabase.auth.getClaims>>;
+      try {
+        result = await supabase.auth.getClaims();
+      } catch (cause) {
+        throw upstreamFailure('read the session claims', cause);
+      }
+      if (result.error) throw failure('read the session claims', result.error);
+      const sessionId = sessionIdSchema.safeParse(result.data?.claims.session_id);
+      if (!sessionId.success) {
+        throw new Error('read the session claims: no session id in the token');
+      }
+      return sessionId.data;
     },
 
     current() {
