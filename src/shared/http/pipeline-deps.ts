@@ -1,10 +1,13 @@
 import { getEnv } from '@/shared/config/env';
 import { getLogger, type Logger } from '@/shared/observability/logger';
-import { noPrincipalResolver } from './fake-principal-resolver';
 import { resolveAllowedOrigins } from './origin';
+import { createGroupRoutedRateLimiter } from './rate-limit/group-routed-rate-limiter';
 import { createInMemoryRateLimiter } from './rate-limit/in-memory-rate-limiter';
+import { createPostgresRateLimiter } from './rate-limit/postgres-rate-limiter';
+import { fingerprintSubject } from './rate-limit/subject-hmac';
 import type { RateLimiter } from './rate-limit/rate-limiter';
 import type { PrincipalResolver } from './principal-resolver';
+import { createSupabasePrincipalResolver } from './supabase-principal-resolver';
 
 /** The platform dependencies of the pipeline. Unit tests pass fakes through `createWithRoute`. */
 export type PipelineDeps = {
@@ -19,28 +22,43 @@ export type PipelineDeps = {
   readonly requireClientIp: boolean;
   /** Root logger; the pipeline derives a per-request child with the `requestId`. */
   readonly logger: Logger;
+  /**
+   * Keyed, non-reversible fingerprint of a rate-limit subject (an IP, an e-mail, a user id), for
+   * log lines: `auth.rate_limited` carries it as `subjectHash`, never the subject itself.
+   */
+  readonly subjectFingerprint: (subject: string) => string;
 };
 
 /**
  * PRODUCTION WIRING: the single place that decides which rate limiter and which principal
- * resolver the real `withRoute` uses. Wave 3 replaces the two lines marked below (Postgres
- * limiter, Supabase resolver) and edits nothing else in `src/shared/http`.
+ * resolver the real `withRoute` uses.
  *
- * Wave 3 must keep the `health` group OFF the Postgres limiter (route it to an in-memory limiter,
- * for example a limiter that picks by `key.group`): `GET /health` documents no 503, so a database
- * outage must not be able to turn a liveness probe into an undocumented 503.
+ * - Rate limiter: the Postgres counters (ADR 0004), shared by every serverless instance, with the
+ *   `health` group kept OFF the database: `GET /health` documents no 503, so a database outage
+ *   must not be able to turn a liveness probe into an undocumented 503. `health` stays on an
+ *   in-memory limiter (per instance, which is enough for a liveness probe).
+ * - Principal resolver: `getClaims()` + `current_principal()` (spec §3.4).
  */
 function buildPipelineDeps(): PipelineDeps {
   const env = getEnv();
+  const requireClientIp = env.VERCEL_ENV === 'production';
+  const rateLimiter = createGroupRoutedRateLimiter({
+    routes: { health: createInMemoryRateLimiter() },
+    fallback: createPostgresRateLimiter(),
+  });
   return {
-    // Wave 3: replace with the Postgres-backed limiter (ADR 0004).
-    rateLimiter: createInMemoryRateLimiter(),
-    // Wave 3: replace with the Supabase resolver (getClaims + current_principal()).
-    // Until then nobody authenticates: authenticated routes answer 401.
-    principalResolver: noPrincipalResolver,
+    rateLimiter,
+    // The resolver spends the `session-upstream` budget of the client IP before it lets the Auth
+    // client call the Auth server for a session cookie it cannot verify locally (F-01).
+    principalResolver: createSupabasePrincipalResolver({
+      rateLimiter,
+      requireClientIp,
+      fingerprint: fingerprintSubject,
+    }),
     allowedOrigins: resolveAllowedOrigins(env),
-    requireClientIp: env.VERCEL_ENV === 'production',
+    requireClientIp,
     logger: getLogger(),
+    subjectFingerprint: fingerprintSubject,
   };
 }
 

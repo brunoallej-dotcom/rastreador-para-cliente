@@ -14,7 +14,7 @@ export type FakePrincipalResolver = PrincipalResolver & {
 /**
  * In-memory resolver for tests: always the same principal (or `null` for "no session"), or
  * whatever a function decides from the request. A function that throws simulates an outage.
- * It records every call, so do not use it in production wiring (use `noPrincipalResolver`).
+ * It records every call, so it is for tests only; production uses the Supabase resolver.
  */
 export function createFakePrincipalResolver(
   source: FakePrincipalSource = null,
@@ -30,8 +30,9 @@ export function createFakePrincipalResolver(
 }
 
 /**
- * Resolver that never finds a session. It is the production default until the Supabase resolver
- * is wired in (Wave 3): authenticated routes answer 401, public routes are unaffected.
+ * Resolver that never finds a session: authenticated routes answer 401, public routes are
+ * unaffected. Production wiring uses the Supabase resolver (Wave 3); this one is a safe stand-in
+ * for tests that do not care about authentication.
  */
 export const noPrincipalResolver: PrincipalResolver = {
   resolve: () => Promise.resolve(null),

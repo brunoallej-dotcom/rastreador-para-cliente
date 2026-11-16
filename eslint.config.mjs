@@ -105,6 +105,12 @@ const FORBIDDEN_SYNTAX = [
     message:
       'Do not use next/headers: the pipeline reads NextRequest and writes NextResponse (spec §3.3).',
   },
+  {
+    // the static-import restriction (ADMIN_CLIENT) cannot see a dynamic import()
+    selector: 'ImportExpression[source.value=/admin-client$/]',
+    message:
+      'Do not import the admin client dynamically: it may be imported (statically) only from the rate limiter and identity/infrastructure.',
+  },
 ];
 
 /**
@@ -152,15 +158,37 @@ const NON_CANONICAL_SPECIFIER = pattern(
 );
 
 /**
- * no-restricted-imports options. `next/headers` and non-canonical specifiers are forbidden
- * everywhere in src/. Later config objects REPLACE earlier ones for the same rule, so each layer
- * lists its full set: going through this helper is what puts the shared patterns in every list.
+ * The admin client holds the Supabase secret key and BYPASSES RLS (SEC-15). Only the rate limiter
+ * (`src/shared/http/rate-limit/`) and identity's infrastructure (`src/modules/identity/infrastructure/`,
+ * the Auth Admin API) may import it; everywhere else in src/ any specifier that ends in
+ * `admin-client` (alias, relative, with or without an extension) is refused. The two allowed places
+ * use `restrictImportsAllowingAdminClient`.
+ */
+const ADMIN_CLIENT = pattern(
+  String.raw`(?:^|/)admin-client(?:\.[cm]?[jt]sx?)?$`,
+  'The admin client (secret key, bypasses RLS) may be imported only from src/shared/http/rate-limit/ and src/modules/identity/infrastructure/. Business reads and writes use the request-scoped client.',
+);
+
+/**
+ * no-restricted-imports options. `next/headers`, non-canonical specifiers and the admin client are
+ * forbidden everywhere in src/. Later config objects REPLACE earlier ones for the same rule, so
+ * each layer lists its full set: going through this helper is what puts the shared patterns in
+ * every list.
+ * @param {readonly { regex: string, message: string }[]} always
  * @param {...{ regex: string, message: string }} patterns
  */
-const restrictImports = (...patterns) => [
+const restrictImportsWith = (always, ...patterns) => [
   'error',
-  { paths: [NEXT_HEADERS], patterns: [NON_CANONICAL_SPECIFIER, ...patterns] },
+  { paths: [NEXT_HEADERS], patterns: [NON_CANONICAL_SPECIFIER, ...always, ...patterns] },
 ];
+
+/** @param {...{ regex: string, message: string }} patterns */
+const restrictImports = (...patterns) => restrictImportsWith([ADMIN_CLIENT], ...patterns);
+
+/** Only for the two places allowed to import the admin client (see ADMIN_CLIENT). */
+const restrictImportsAllowingAdminClient = (
+  /** @type {{ regex: string, message: string }[]} */ ...patterns
+) => restrictImportsWith([], ...patterns);
 
 const alt = (/** @type {string[]} */ names) => names.join('|');
 
@@ -306,7 +334,10 @@ const moduleLayerConfigs = (/** @type {string} */ mod) => {
       name: `boundaries/${mod}/infrastructure`,
       files: [`${base}/infrastructure/**/*.${CODE_EXT}`],
       rules: {
-        'no-restricted-imports': restrictImports(
+        // identity's infrastructure is one of the two places that may use the admin client
+        'no-restricted-imports': (mod === 'identity'
+          ? restrictImportsAllowingAdminClient
+          : restrictImports)(
           aliasLayers(mod, ['presentation'], 'infrastructure/ must not import presentation/.'),
           relativeLayers(['presentation'], 'infrastructure/ must not import presentation/.'),
           ...cross,
@@ -323,6 +354,12 @@ const moduleLayerConfigs = (/** @type {string} */ mod) => {
 
 const ROUTE_FILES = [`src/app/**/route.${CODE_EXT}`];
 
+/** What src/shared/ may not import: modules, by alias or by relative path. */
+const SHARED_PATTERNS = [
+  pattern(String.raw`^@/modules(?:/|$)`, 'src/shared/ never imports @/modules/**.'),
+  pattern(String.raw`^(?:\./)?(?:\.\./)+modules(?:/|$)`, 'src/shared/ never imports modules/.'),
+];
+
 const boundaryConfigs = [
   {
     name: 'boundaries/src',
@@ -333,15 +370,13 @@ const boundaryConfigs = [
   {
     name: 'boundaries/shared',
     files: [`src/shared/**/*.${CODE_EXT}`],
-    rules: {
-      'no-restricted-imports': restrictImports(
-        pattern(String.raw`^@/modules(?:/|$)`, 'src/shared/ never imports @/modules/**.'),
-        pattern(
-          String.raw`^(?:\./)?(?:\.\./)+modules(?:/|$)`,
-          'src/shared/ never imports modules/.',
-        ),
-      ),
-    },
+    rules: { 'no-restricted-imports': restrictImports(...SHARED_PATTERNS) },
+  },
+  {
+    // the rate limiter is the other place that may use the admin client (`rate_limit_hit`)
+    name: 'boundaries/shared/rate-limit',
+    files: [`src/shared/http/rate-limit/**/*.${CODE_EXT}`],
+    rules: { 'no-restricted-imports': restrictImportsAllowingAdminClient(...SHARED_PATTERNS) },
   },
   {
     name: 'boundaries/route',

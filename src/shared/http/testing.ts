@@ -106,6 +106,8 @@ export function createTestPipeline(options: TestPipelineOptions = {}): TestPipel
     allowedOrigins: options.allowedOrigins ?? [TEST_APP_ORIGIN],
     requireClientIp: options.requireClientIp ?? false,
     logger: logs.logger,
+    // a stand-in that never contains the subject, like the real keyed fingerprint
+    subjectFingerprint: (subject) => `fingerprint-of-${subject.length}-chars`,
   };
   return { withRoute: createWithRoute(() => deps), principalResolver, rateLimiter, logs };
 }

@@ -319,6 +319,122 @@ describe('src/shared/ never imports modules', () => {
   });
 });
 
+describe('the admin client (secret key, bypasses RLS) has exactly two doors', () => {
+  const ADMIN = '@/shared/db/admin-client';
+  const importAdmin = (source = ADMIN) =>
+    `import { getAdminFacade } from '${source}';\nexport const admin = getAdminFacade;`;
+
+  it.each([
+    ['the rate limiter', 'src/shared/http/rate-limit/postgres-rate-limiter.ts', importAdmin()],
+    ['a test beside the rate limiter', 'src/shared/http/rate-limit/x.int.test.ts', importAdmin()],
+    [
+      'a nested file of the rate limiter, by a relative path',
+      'src/shared/http/rate-limit/deep/x.ts',
+      importAdmin('../../../db/admin-client'),
+    ],
+    [
+      'identity infrastructure',
+      'src/modules/identity/infrastructure/supabase-account-gateway.ts',
+      importAdmin(),
+    ],
+    [
+      'a test beside identity infrastructure',
+      'src/modules/identity/infrastructure/supabase-account-gateway.test.ts',
+      importAdmin(),
+    ],
+    [
+      'a nested file of identity infrastructure',
+      'src/modules/identity/infrastructure/accounts/gateway.ts',
+      importAdmin(),
+    ],
+  ])('allows %s', async (_label, file, code) => {
+    expect(await violations(file, code)).toEqual([]);
+  });
+
+  it.each([
+    'src/shared/http/with-route.ts',
+    'src/shared/http/pipeline-deps.ts',
+    'src/shared/http/supabase-principal-resolver.ts',
+    'src/shared/db/server-client.ts',
+    'src/shared/kernel/index.ts',
+    'src/shared/observability/logger.ts',
+    'src/instrumentation.ts',
+    'src/modules/identity/domain/session.ts',
+    'src/modules/identity/application/login.ts',
+    'src/modules/identity/presentation/login.handler.ts',
+    'src/modules/identity/index.ts',
+    'src/modules/tracking/infrastructure/supabase-client-directory.ts',
+    'src/modules/tracking/application/approve-current-stage.ts',
+    'src/modules/tracking/presentation/approve-current-stage.handler.ts',
+    'src/modules/platform/presentation/health.handler.ts',
+    'src/app/api/v1/auth/login/route.ts',
+  ])('refuses %s', async (file) => {
+    expect(await violations(file, importAdmin()), file).toContain('no-restricted-imports');
+  });
+
+  it.each([
+    ['the alias with an extension', importAdmin('@/shared/db/admin-client.ts')],
+    ['a relative path inside shared/db', importAdmin('./admin-client')],
+    ['a relative path from a sibling folder', importAdmin('../db/admin-client')],
+    ['a re-export', `export { getAdminFacade } from '${ADMIN}';`],
+    ['export *', `export * from '${ADMIN}';`],
+    [
+      'a type-only import',
+      `import type { AdminFacade } from '${ADMIN}';\nexport type T = AdminFacade;`,
+    ],
+    ['a ".." segment that hides the path', importAdmin('@/shared/kernel/../db/admin-client')],
+  ])('refuses %s, wherever it is not a door', async (_label, code) => {
+    expect(await violations('src/shared/db/current-principal.ts', code)).toContain(
+      'no-restricted-imports',
+    );
+  });
+
+  it.each([
+    // a folder or file whose name only STARTS like a door
+    'src/shared/http/rate-limit-extra/x.ts',
+    'src/shared/http/rate-limit.ts',
+    'src/shared/http/rate-limiter/x.ts',
+    'src/modules/identity/infrastructure-extra/x.ts',
+    'src/modules/identity/infrastructure.ts',
+    // the doors of ANOTHER module or of another shared folder
+    'src/modules/tracking/infrastructure/x.ts',
+    'src/shared/db/x.ts',
+  ])('is not fooled by the look-alike path %s', async (file) => {
+    expect(await violations(file, importAdmin()), file).toContain('no-restricted-imports');
+  });
+
+  it('refuses a dynamic import() of it, even at the doors', async () => {
+    const code = `export const load = () => import('${ADMIN}');`;
+    for (const file of [
+      'src/shared/http/with-route.ts',
+      'src/shared/http/rate-limit/postgres-rate-limiter.ts',
+      'src/modules/identity/infrastructure/supabase-account-gateway.ts',
+    ]) {
+      expect(await violations(file, code), file).toContain('no-restricted-syntax');
+    }
+  });
+
+  it('keeps every other import rule alive at the doors (modules stay out of shared/)', async () => {
+    const code = `import { x } from '@/modules/tracking';\nexport const y = x;`;
+    expect(await violations('src/shared/http/rate-limit/postgres-rate-limiter.ts', code)).toContain(
+      'no-restricted-imports',
+    );
+    // and identity infrastructure still may not reach into presentation/ or deep tracking paths
+    expect(
+      await violations(
+        'src/modules/identity/infrastructure/x.ts',
+        `import { h } from '@/modules/identity/presentation/login.handler';\nexport const y = h;`,
+      ),
+    ).toContain('no-restricted-imports');
+    expect(
+      await violations(
+        'src/modules/identity/infrastructure/x.ts',
+        `import { d } from '@/modules/tracking/domain/client';\nexport const y = d;`,
+      ),
+    ).toContain('no-restricted-imports');
+  });
+});
+
 describe('next/headers', () => {
   it.each([
     'src/shared/http/cookies.ts',

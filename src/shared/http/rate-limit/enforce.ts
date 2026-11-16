@@ -12,6 +12,8 @@ export type EnforceRateLimitsInput = {
   /** Plaintext subject of the scope: IP (or IPv6 /64), normalized account identifier or user id. */
   readonly subject: string;
   readonly logger: Logger;
+  /** Keyed, non-reversible fingerprint of the subject, for the log: the subject itself never is. */
+  readonly fingerprint: (subject: string) => string;
 };
 
 /** `Retry-After` is a whole number of seconds, at least 1, whatever the limiter returned. */
@@ -23,12 +25,12 @@ function retryAfterSeconds(raw: number, rule: RateLimitRule): number {
 /**
  * Counts the request against every rule of `scope`, in declaration order.
  * - the first denial → `RateLimitedError` (429), and an `auth.rate_limited` event carrying the
- *   scope and the group (never the subject);
+ *   scope, the group and a keyed fingerprint of the subject (`subjectHash`, never the subject);
  * - the limiter throwing, or answering something that is not a clear decision →
  *   `ServiceUnavailableError` (503): fail closed, a broken limiter never lets requests through.
  */
 export async function enforceRateLimits(input: EnforceRateLimitsInput): Promise<void> {
-  const { limiter, rules, scope, subject, logger } = input;
+  const { limiter, rules, scope, subject, logger, fingerprint } = input;
 
   for (const rule of rules) {
     if (rule.scope !== scope) continue;
@@ -49,7 +51,10 @@ export async function enforceRateLimits(input: EnforceRateLimitsInput): Promise<
       throw new ServiceUnavailableError('rate limiter returned an invalid decision');
     }
 
-    logger.warn({ event: 'auth.rate_limited', scope, group }, 'auth.rate_limited');
+    logger.warn(
+      { event: 'auth.rate_limited', scope, group, subjectHash: fingerprint(subject) },
+      'auth.rate_limited',
+    );
     throw new RateLimitedError(retryAfterSeconds(decision.retryAfterSeconds, rule));
   }
 }

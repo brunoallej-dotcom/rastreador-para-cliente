@@ -1,14 +1,9 @@
 import type { NextRequest } from 'next/server';
-import {
-  DomainError,
-  ServiceUnavailableError,
-  UnauthenticatedError,
-  type Principal,
-} from '@/shared/kernel';
+import { DomainError, UnauthenticatedError, type Principal } from '@/shared/kernel';
 import { getFallbackLogger, requestLogger, type Logger } from '@/shared/observability/logger';
 import { assertAuthorized } from './authorization';
 import { readJsonBody, type RequestBody } from './body';
-import { clientIp, UNKNOWN_IP } from './client-ip';
+import { resolveIpSubject } from './client-ip';
 import { createCookieJar, type ManagedCookieJar } from './cookies';
 import { errorToResponse } from './error-mapping';
 import { assertOriginAllowed, isUnsafeMethod } from './origin';
@@ -17,7 +12,8 @@ import { getPipelineDeps, type PipelineDeps } from './pipeline-deps';
 import { assertValidPolicy } from './policy-guard';
 import { problemResponse } from './problem';
 import { enforceRateLimits } from './rate-limit/enforce';
-import { REQUEST_ID_HEADER, resolveRequestId } from './request-id';
+import { GLOBAL_SUBJECT } from './rate-limit/rate-limiter';
+import { clientRequestId, newRequestId, REQUEST_ID_HEADER } from './request-id';
 import type {
   HandlerContext,
   NextRouteContext,
@@ -78,14 +74,20 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
       limiter: deps.rateLimiter,
       rules,
       scope: 'ip',
-      subject: ipRuleSubject(request, deps),
+      subject: resolveIpSubject(request, deps.requireClientIp),
       logger,
+      fingerprint: deps.subjectFingerprint,
     });
   }
 
   // 5. Authentication, then the per-user rate limit and 6. authorization.
   if (policy.access === 'authenticated') {
-    const principal = await deps.principalResolver.resolve({ request, cookies, requestId });
+    const principal = await deps.principalResolver.resolve({
+      request,
+      cookies,
+      requestId,
+      logger,
+    });
     if (principal === null) {
       throw new UnauthenticatedError('no valid session', { detail: 'Authentication required.' });
     }
@@ -96,6 +98,7 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
       scope: 'user',
       subject: principal.userId,
       logger,
+      fingerprint: deps.subjectFingerprint,
     });
     assertAuthorized(principal, {
       roles: policy.roles ?? [],
@@ -123,6 +126,7 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
       scope: 'account',
       subject: accountKey(parsed.body),
       logger,
+      fingerprint: deps.subjectFingerprint,
     });
   }
 
@@ -136,6 +140,15 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
     body: parsed.body as RuntimeContext['body'],
     cookies,
     logger,
+    consumeGlobalBudget: (budget) =>
+      enforceRateLimits({
+        limiter: deps.rateLimiter,
+        rules: [{ scope: 'global', ...budget }],
+        scope: 'global',
+        subject: GLOBAL_SUBJECT,
+        logger,
+        fingerprint: deps.subjectFingerprint,
+      }),
   });
   if (output instanceof DomainError) throw output;
   if (!(output instanceof Response)) {
@@ -150,21 +163,6 @@ async function runPipeline(input: PipelineInput): Promise<Response> {
     );
   }
   return output;
-}
-
-/**
- * Subject of the `ip` rate-limit rules. Without an IP from the platform helper the request falls
- * into the shared `unknown` bucket in dev and tests, but in production it is refused (503): there
- * every request must come through Vercel's proxy, so a missing IP is a platform fault, and a shared
- * bucket would let one noisy client lock everyone out.
- */
-function ipRuleSubject(request: Request, deps: PipelineDeps): string {
-  const ip = clientIp(request);
-  if (ip !== undefined) return ip;
-  if (deps.requireClientIp) {
-    throw new ServiceUnavailableError('the platform provided no client IP');
-  }
-  return UNKNOWN_IP;
 }
 
 /** Next resolves `params` to `undefined` (not `{}`) on routes without dynamic segments. */
@@ -276,7 +274,8 @@ export function createWithRoute(getDeps: () => PipelineDeps): WithRoute {
 
     return async (request, context) => {
       const startedAt = performance.now();
-      const requestId = resolveRequestId(request.headers.get(REQUEST_ID_HEADER));
+      const requestId = newRequestId();
+      const clientId = clientRequestId(request.headers.get(REQUEST_ID_HEADER));
 
       let setup: RequestSetup;
       try {
@@ -284,7 +283,7 @@ export function createWithRoute(getDeps: () => PipelineDeps): WithRoute {
         setup = {
           cookies: createCookieJar(request.cookies.getAll()),
           deps,
-          logger: requestLogger(deps.logger, requestId),
+          logger: requestLogger(deps.logger, requestId, clientId),
         };
       } catch (cause) {
         return bareFailure(requestId, cause);

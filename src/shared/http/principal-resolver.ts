@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server';
 import type { Principal } from '@/shared/kernel';
+import type { Logger } from '@/shared/observability/logger';
 import type { CookieJar } from './cookies';
 
 export type ResolvePrincipalInput = {
@@ -11,6 +12,8 @@ export type ResolvePrincipalInput = {
   readonly cookies: CookieJar;
   /** For the `x-request-id` header the per-request Supabase client forwards to the database. */
   readonly requestId: string;
+  /** Child logger that already carries the `requestId`. */
+  readonly logger: Logger;
 };
 
 /**

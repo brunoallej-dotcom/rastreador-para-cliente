@@ -9,9 +9,9 @@ const ONE_MINUTE_SECONDS = 60;
  * internal detail, and its handler touches no dependency.
  *
  * The pipeline around it does use the rate limiter, though, and the contract documents only 200
- * and 429 for this route. Wave 3 must therefore keep the `health` group OFF the Postgres limiter
- * (`pipeline-deps.ts` should route that group to an in-memory limiter), so a database outage can
- * never turn a liveness probe into an undocumented 503.
+ * and 429 for this route. `pipeline-deps.ts` therefore keeps the `health` group OFF the Postgres
+ * limiter (it routes that group to an in-memory limiter), so a database outage can never turn a
+ * liveness probe into an undocumented 503.
  */
 export const healthHandler = withRoute(
   {

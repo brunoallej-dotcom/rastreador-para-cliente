@@ -23,4 +23,5 @@ export {
   type Principal,
   type Role,
 } from './principal';
+export { computePendingActions, type PendingActionsInput } from './pending-actions';
 export { err, ok, type Err, type Ok, type Result } from './result';

@@ -79,9 +79,12 @@ describe('GET /health', () => {
     expectToMatchContract('getHealth', response.status, await response.json());
   });
 
-  it('AC-22: carries the security headers and an X-Request-Id', async () => {
+  it('AC-22: carries the security headers and a server-generated X-Request-Id', async () => {
     const response = await getHealth({ ...freshIp(), 'x-request-id': 'probe-0000-0001' });
-    expect(response.headers.get('x-request-id')).toBe('probe-0000-0001');
+    // F-11: the client's id is never the request's own id
+    expect(response.headers.get('x-request-id')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     expect(response.headers.get('strict-transport-security')).toContain('max-age=63072000');

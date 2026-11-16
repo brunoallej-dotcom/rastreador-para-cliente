@@ -8,6 +8,7 @@ import {
 import type { RuntimePolicy } from './route-policy';
 import type { InputSchema } from './validation';
 
+/** The scopes a route policy may declare; `global` is a programmatic budget, never a policy. */
 const RATE_LIMIT_SCOPES: readonly RateLimitScope[] = ['ip', 'account', 'user'];
 
 const isPositiveInteger = (value: number) => Number.isInteger(value) && value > 0;
@@ -18,6 +19,12 @@ function isStrictObject(schema: InputSchema): boolean {
 }
 
 function assertRule(rule: RateLimitRule, policy: RuntimePolicy): void {
+  if (rule.scope === 'global') {
+    throw new Error(
+      'withRoute: the "global" rate-limit scope is not allowed in a route policy; ' +
+        'a handler spends a global budget with `consumeGlobalBudget`',
+    );
+  }
   if (!RATE_LIMIT_SCOPES.includes(rule.scope)) {
     throw new Error(`withRoute: unknown rate-limit scope "${String(rule.scope)}"`);
   }

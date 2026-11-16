@@ -9,7 +9,9 @@ import {
   DEFAULT_MAX_COUNTERS,
 } from './rate-limit/in-memory-rate-limiter';
 import {
+  GLOBAL_SUBJECT,
   RATE_LIMIT_GROUPS,
+  type PolicyRateLimitRule,
   type RateLimitDecision,
   type RateLimiter,
   type RateLimitGroup,
@@ -39,19 +41,19 @@ function recordingLimiter(decide: (n: number) => RateLimitDecision = () => ({ al
   return { limiter, consumptions };
 }
 
-const IP_20_PER_15_MIN: RateLimitRule = {
+const IP_20_PER_15_MIN: PolicyRateLimitRule = {
   scope: 'ip',
   group: 'login',
   limit: 20,
   windowSeconds: 900,
 };
-const ACCOUNT_10_PER_15_MIN: RateLimitRule = {
+const ACCOUNT_10_PER_15_MIN: PolicyRateLimitRule = {
   scope: 'account',
   group: 'login',
   limit: 10,
   windowSeconds: 900,
 };
-const USER_60_PER_MIN: RateLimitRule = {
+const USER_60_PER_MIN: PolicyRateLimitRule = {
   scope: 'user',
   group: 'writes',
   limit: 60,
@@ -71,10 +73,12 @@ const GROUP_NUMBERS: Record<RateLimitGroup, readonly Omit<RateLimitRule, 'group'
   writes: [{ scope: 'user', limit: 60, windowSeconds: 60 }],
   reads: [{ scope: 'user', limit: 300, windowSeconds: 60 }],
   health: [{ scope: 'ip', limit: 60, windowSeconds: 60 }],
+  // not a route: the per-IP budget of session cookies that make the server call Auth (F-01)
+  'session-upstream': [{ scope: 'ip', limit: 60, windowSeconds: 900 }],
 };
 
 describe('rate-limit groups (spec §3.9)', () => {
-  it('the named groups are exactly those of spec §3.9 (plus totp-enroll, which the contract adds)', () => {
+  it('the named groups are exactly those of spec §3.9 (plus totp-enroll, which the contract adds, and session-upstream, which is no route)', () => {
     expect([...RATE_LIMIT_GROUPS].sort()).toEqual(
       [
         'login',
@@ -85,6 +89,7 @@ describe('rate-limit groups (spec §3.9)', () => {
         'writes',
         'reads',
         'health',
+        'session-upstream',
       ].sort(),
     );
   });
@@ -634,5 +639,83 @@ describe('createInMemoryRateLimiter', () => {
     it('defaults to a cap of 10,000 counters', () => {
       expect(DEFAULT_MAX_COUNTERS).toBe(10_000);
     });
+  });
+});
+
+describe('withRoute: the global budget (F-02) and the subject hash of auth.rate_limited (F-09)', () => {
+  const BUDGET = { group: 'login', limit: 2, windowSeconds: 300 } as const;
+
+  it('hands the handler a way to spend an aggregate budget: scope global, one constant subject', async () => {
+    const { limiter, consumptions } = recordingLimiter();
+    const { withRoute } = createTestPipeline({ rateLimiter: limiter });
+    const route = withRoute(PUBLIC_POLICY, async ({ consumeGlobalBudget }) => {
+      await consumeGlobalBudget(BUDGET);
+      return json(200, {});
+    });
+
+    await route(apiRequest('/x', { headers: { 'x-real-ip': '203.0.113.7' } }));
+
+    // the first consumption is the route's own ip rule; the second is the handler's global budget
+    expect(consumptions.map(({ key }) => key.bucket)).toEqual(['ip:reads', 'global:login']);
+    expect(consumptions[1]).toEqual({
+      key: { scope: 'global', group: 'login', bucket: 'global:login', subject: GLOBAL_SUBJECT },
+      rule: { scope: 'global', ...BUDGET },
+    });
+  });
+
+  it('over budget it is 429 with Retry-After and the handler stops there', async () => {
+    const { limiter } = recordingLimiter((n) =>
+      n === 2 ? { allowed: false, retryAfterSeconds: 42 } : { allowed: true },
+    );
+    const { withRoute } = createTestPipeline({ rateLimiter: limiter });
+    const afterBudget = vi.fn();
+    const route = withRoute(PUBLIC_POLICY, async ({ consumeGlobalBudget }) => {
+      await consumeGlobalBudget(BUDGET);
+      afterBudget();
+      return json(200, {});
+    });
+
+    const response = await route(apiRequest('/x'));
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get('retry-after')).toBe('42');
+    expect(await response.json()).toMatchObject({ code: 'RATE_LIMITED' });
+    expect(afterBudget).not.toHaveBeenCalled();
+  });
+
+  it('E-22: a limiter that fails on a global budget denies with 503 (fail closed)', async () => {
+    const limiter: RateLimiter = {
+      consume: (key) =>
+        key.scope === 'global'
+          ? Promise.reject(new Error('down'))
+          : Promise.resolve({ allowed: true }),
+    };
+    const { withRoute } = createTestPipeline({ rateLimiter: limiter });
+    const route = withRoute(PUBLIC_POLICY, async ({ consumeGlobalBudget }) => {
+      await consumeGlobalBudget(BUDGET);
+      return json(200, {});
+    });
+
+    expect((await route(apiRequest('/x'))).status).toBe(503);
+  });
+
+  it('F-09: auth.rate_limited carries scope, group and a keyed hash of the subject, never the subject', async () => {
+    const { limiter } = recordingLimiter(() => ({ allowed: false, retryAfterSeconds: 9 }));
+    const { withRoute, logs } = createTestPipeline({ rateLimiter: limiter });
+    const route = withRoute({ ...PUBLIC_POLICY, rateLimit: [IP_20_PER_15_MIN] }, () =>
+      json(200, {}),
+    );
+
+    await route(apiRequest('/x', { headers: { 'x-real-ip': '203.0.113.7' } }));
+
+    expect(logs.events('auth.rate_limited')).toEqual([
+      expect.objectContaining({
+        event: 'auth.rate_limited',
+        scope: 'ip',
+        group: 'login',
+        subjectHash: 'fingerprint-of-11-chars',
+      }),
+    ]);
+    expect(logs.lines.join('\n')).not.toContain('203.0.113.7');
   });
 });
