@@ -394,8 +394,8 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
 | `current_principal()` | authenticated | Retorna o principal (ou nenhuma linha): sessão viva, perfil ativo, papel, cliente, nome de exibição, `aal`, `has_verified_totp`, `must_change_password` |
-| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente e devolve a linha. Evento `client.created` (§3.7.1) |
-| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva; `NULL` = não mexe. Eventos `client.updated` / `client.archived` / `client.unarchived`, só quando algo muda (§3.7.1) |
+| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente e devolve a linha. Evento `client.created`. Nome já usado por um cliente não arquivado: `CLIENT_NAME_TAKEN`, sem evento (§3.7.1) |
+| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva; `NULL` = não mexe. Eventos `client.updated` / `client.archived` / `client.unarchived`, só quando algo muda. Renomear ou desarquivar para um nome já usado por um cliente não arquivado: `CLIENT_NAME_TAKEN`, sem evento e sem mudança (§3.7.1) |
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
 | `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`) |
 | `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
@@ -408,7 +408,7 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. `stage.approved` (+ `process.completed`) |
 | `rate_limit_hit(p_bucket, p_window_seconds, p_max)` | **somente `service_role`** | Contador de janela fixa; retorna `allowed` e `retry_after_seconds` |
 
-**Mapeamento de erros do banco** (feito em `infrastructure/`; o que não for mapeado vira 500):
+**Mapeamento de erros do banco** (feito em `infrastructure/`; o que não for mapeado vira 500, o `23505` bruto inclusive: o único que o app espera, o do índice de nome de cliente, as funções já trocam por `CLIENT_NAME_TAKEN`):
 
 | Banco | Erro de domínio | HTTP / `code` |
 |-------|-----------------|---------------|
@@ -420,7 +420,7 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `P0001` + `PASSWORD_UNCHANGED` | `PasswordUnchangedError` | 422 `PASSWORD_UNCHANGED` |
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` |
-| `23505` | `ConflictError` | 409 `CONFLICT` |
+| `P0001` + `CLIENT_NAME_TAKEN` | `ConflictError` (o `detail` não diz qual é o outro cliente) | 409 `CONFLICT` |
 
 #### 3.7.1 Clientes (Onda 6)
 
@@ -444,6 +444,26 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
   arquivar na mesma chamada grava dois eventos, nessa ordem. A linha é travada com `FOR NO KEY UPDATE`:
   as escritas do mesmo cliente se serializam (a última vence, sem controle otimista: T-37) e a criação
   de processos e logins, que só referenciam o cliente, não espera.
+- **Nome único (F-51; E-40 a E-46).** Entre os clientes **não arquivados** não há dois nomes com a
+  mesma chave: `lower(normalize(name, NFKC))` com cada sequência de espaços reduzida a um só (índice
+  único parcial `clients_active_name_key … WHERE archived_at IS NULL`). A chave ignora maiúsculas e
+  minúsculas, formas de compatibilidade do Unicode (largura total, ligaduras, sobrescritos) e a
+  diferença entre um espaço e vários, que o HTML mostra igual. O Postgres 17 não tem `casefold()`
+  (chega no 18), então o dobramento é o de `lower()` do locale do banco: "ß" e "ss", ou "ς" e "σ",
+  seguem distintos. Letras de outro alfabeto que se parecem com as latinas (o "А" cirílico) também
+  passam: é o residual do T-33, e o frontend deve mostrar o id do cliente na hora de provisionar um
+  login (Onda 7). `create_client` e `update_client` pegam a violação **desse** índice e a trocam por
+  `P0001` + `CLIENT_NAME_TAKEN`, sem o texto do erro original (que traz o nome normalizado); o app a
+  mapeia para `ConflictError` (409 `CONFLICT`) e a resposta não diz qual é o outro cliente. Quem
+  decide é o índice, não uma consulta prévia: duas escritas concorrentes com o mesmo nome não passam
+  as duas (uma recebe 201 e a outra 409), e um retry de criação que já tinha sido gravada responde 409
+  em vez de duplicar (E-21). A recusa vem do `INSERT` ou do `UPDATE`, antes da auditoria, e desfaz a
+  transação: nenhum evento é gravado e nada muda. O conflito vale pelo **estado final** da linha:
+  renomear e arquivar na mesma chamada não disputa o nome; renomear para outra grafia do próprio nome
+  (maiúsculas, espaços) é permitido; desarquivar disputa o nome que o cliente tem naquele momento; e
+  uma chamada que não muda nada nunca dá 409. Arquivar libera o nome, e pode haver vários clientes
+  arquivados com o mesmo nome. Se um banco já tem dois clientes ativos com o mesmo nome, a migration
+  falha: arquive ou renomeie um deles antes de aplicá-la.
 - **Auditoria sem PII.** Os metadados não levam o nome do cliente: `client.updated` guarda só
   `{"fields":["name"]}`, e os demais eventos não têm metadados. Recurso e `client_id` são o próprio
   cliente.
@@ -637,7 +657,7 @@ erDiagram
 | Coluna | Tipo | Regras |
 |--------|------|--------|
 | `id` | `uuid` PK | `default gen_random_uuid()` |
-| `name` | `text` | 1–160 caracteres após trim |
+| `name` | `text` | 1–160 caracteres após trim; único entre os não arquivados, pela chave de §3.7.1 |
 | `archived_at` | `timestamptz` | nulo = ativo |
 | `created_at`, `updated_at` | `timestamptz` | `default now()` |
 
@@ -763,6 +783,7 @@ e `private.is_ceo()`. O helper `private.request_id()` lê o `x-request-id` do Po
 | `audit_events (process_id, occurred_at)` | linha do tempo |
 | `audit_events (client_id, occurred_at)` | auditoria por cliente |
 | `audit_events (occurred_at)` | retenção |
+| `clients (lower(normalize(name, NFKC)), espaços reduzidos) WHERE archived_at IS NULL` (unique) | nome de cliente único entre os ativos: 409 `CONFLICT` ao criar, renomear e desarquivar (F-51) |
 | `clients (created_at DESC, id)` | paginação por cursor |
 
 ---
@@ -853,7 +874,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-18 | Limite de 10 logins por cliente atingido | 422 `USER_LIMIT_REACHED` |
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
-| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o de um `POST` que cria sem chave natural (cliente, processo) **pode duplicar**, então o CEO confere a lista antes de repetir (F-51) |
+| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de um `POST` que cria sem chave natural (processo) **pode duplicar**, então o CEO confere a lista antes de repetir |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
@@ -864,6 +885,13 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-29 | Cursor de paginação adulterado | 400 `VALIDATION_ERROR` |
 | E-30 | Texto com caracteres de controle ou Unicode não normalizado | Normaliza para NFC e rejeita caracteres de controle e de formatação, "fillers" invisíveis, texto sem nenhuma letra ou número e surrogate UTF-16 solto (400) |
 | E-31 | Verify sem `factorId` e a conta sem fator TOTP, ou com mais de um fator no mesmo estado | 422 `INVALID_MFA_CODE`, igual a código errado; conta nos dois limites; o log diz `factor_not_found` ou `factor_ambiguous` |
+| E-40 | Criar cliente com o nome de outro cliente não arquivado (igual depois da chave de §3.7.1: "ACME" e "acme", "Ａｃｍｅ" de largura total, espaços repetidos) | 409 `CONFLICT`; nada é criado, nenhum evento é gravado, e a resposta não traz o id nem o nome do outro cliente |
+| E-41 | Renomear cliente para o nome de outro cliente não arquivado | 409 `CONFLICT`; o cliente fica como estava, sem evento. Trocar só as maiúsculas, ou os espaços, do próprio nome é permitido |
+| E-42 | Desarquivar cliente cujo nome é agora de um cliente ativo (sozinho ou junto com um novo nome em uso) | 409 `CONFLICT`; continua arquivado, sem evento. Renomear para um nome em uso e arquivar na mesma chamada vale: o estado final não disputa o nome |
+| E-43 | Nome que só existe em clientes arquivados | Livre: criar, renomear e desarquivar (se nenhum ativo o usa) funcionam, e vários arquivados podem ter o mesmo nome. Arquivar libera o nome |
+| E-44 | Duas criações simultâneas com o mesmo nome | Exatamente um 201 e um 409 `CONFLICT`; um cliente só |
+| E-45 | Retry de `POST /admin/clients` depois de um 503 | Primeira chamada gravada: 409 `CONFLICT` e um cliente só. Primeira não gravada: 201 |
+| E-46 | Nome que difere só por uma letra de outro alfabeto parecida com a latina (o "А" cirílico) | Aceito: é o residual do T-33, tratado no frontend (id do cliente ao provisionar login, Onda 7) |
 
 ---
 
