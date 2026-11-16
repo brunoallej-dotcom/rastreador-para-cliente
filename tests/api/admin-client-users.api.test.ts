@@ -43,13 +43,17 @@ import {
 } from '../helpers/http';
 import {
   completeFirstAccess,
-  loginAsCeoReadyToEnroll,
   loginAsCeoWithMfa,
   loginViaApi,
-  signInCeoWithMfa,
   type CeoWithMfa,
 } from '../helpers/mfa';
-import { canSignIn, changePassword, LOSE_ANSWER, whileWatching } from '../helpers/password';
+import {
+  canSignIn,
+  changePassword,
+  LOSE_ANSWER,
+  sessionJarFor,
+  whileWatching,
+} from '../helpers/password';
 
 const logged = vi.hoisted(() => ({ lines: [] as string[] }));
 
@@ -112,12 +116,33 @@ async function managementTrail(userId: string) {
   return (await auditOfAccount(userId)).filter((row) => row.action !== 'account.password_changed');
 }
 
-/** A client with one login that already changed its temporary password and is signed in. */
+/**
+ * A client with one login that already changed its temporary password and is signed in. The session is
+ * opened straight at Auth (`sessionJarFor`): the global budget of the login route (300 per 5 minutes for
+ * the WHOLE run) is shared by every test file, and tests that are not about the login must not spend it
+ * (two runs in a row would otherwise exhaust it). The tests that ARE about the login call the route.
+ */
 async function tenantWithSignedInLogin(label = 'Cliente') {
   const tenant = await createClient(`${label} ${randomUUID().slice(0, 8)}`);
   const login = await completeFirstAccess(await createClientUser({ clientId: tenant.id }));
-  const cookies = await loginViaApi(login);
+  const cookies = await sessionJarFor(login);
   return { tenant, login, cookies };
+}
+
+/**
+ * What a session opened straight at Auth with these credentials is worth to the API, with no spend of
+ * the login route's budget: `'refused'` when Auth itself refuses the sign-in (wrong password, banned),
+ * otherwise the status of `GET /auth/session` (200, or 401 when the database gives the user no
+ * principal: disabled, or a temporary password past its 72 h).
+ */
+async function statusOfSignIn(email: string, password: string): Promise<number | 'refused'> {
+  let jar: CookieStore;
+  try {
+    jar = await sessionJarFor({ email, password });
+  } catch {
+    return 'refused';
+  }
+  return sessionStatus(jar);
 }
 
 /** Everything the four operations answer to a caller that must be refused, in one list. */
@@ -563,8 +588,7 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
     expect(body.disabled).toBe(true);
     // the database blocks the account: the session is gone and the sign-in is refused...
     expect(await sessionStatus(cookies)).toBe(401);
-    const refused = await loginResponse({ email: login.email, password: login.password });
-    expect(refused.status).toBe(401);
+    expect(await statusOfSignIn(login.email, login.password)).toBe(401);
     // ...even though the Auth server was not told to ban it
     expect(await isBannedInAuth(login.id)).toBe(false);
     const [failure] = events('identity.client_user.ban_failed');
@@ -679,7 +703,7 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
 
   it('AC-14: a reset gives a new temporary password, makes the user change it, and revokes every session', async () => {
     const { tenant, login, cookies } = await tenantWithSignedInLogin();
-    const second = await loginViaApi(login);
+    const second = await sessionJarFor(login);
     expect([await sessionStatus(cookies), await sessionStatus(second)]).toEqual([200, 200]);
     logged.lines.length = 0;
 
@@ -697,9 +721,7 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
     // sessions revoked: both old cookies are dead
     expect([await sessionStatus(cookies), await sessionStatus(second)]).toEqual([401, 401]);
     // the old password is gone, the new one opens a session with CHANGE_PASSWORD pending
-    expect((await loginResponse({ email: login.email, password: login.password })).status).toBe(
-      401,
-    );
+    expect(await canSignIn(login.email, login.password)).toBe(false);
     const signedIn = await loginResponse({
       email: login.email,
       password: body.temporaryPassword,
@@ -739,7 +761,7 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
       'resetClientUserPassword',
       reset,
     );
-    const jar = await loginViaApi({ email: login.email, password: temporaryPassword });
+    const jar = await sessionJarFor({ email: login.email, password: temporaryPassword });
 
     const changed = await changePassword(jar, {
       currentPassword: temporaryPassword,
@@ -758,11 +780,8 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
     const tenant = await createClient();
     const created = await provisionOrFail(ceo.cookies, tenant.id);
     await agePasswordBaseline(created.user.id, 100);
-    const expired = await loginResponse({
-      email: created.user.email,
-      password: created.temporaryPassword,
-    });
-    expect(expired.status).toBe(401);
+    // Auth does not know the 72 h: the sign-in opens a session and the database gives it no principal
+    expect(await statusOfSignIn(created.user.email, created.temporaryPassword)).toBe(401);
 
     const response = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, created.user.id);
     const body = await expectContract<{ temporaryPassword: string }>(
@@ -932,7 +951,7 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       'resetClientUserPassword',
       reset,
     );
-    expect((await loginResponse({ email, password: temporaryPassword })).status).toBe(200);
+    expect(await statusOfSignIn(email, temporaryPassword)).toBe(200);
   });
 
   it('E-50: a creation whose answer is lost (503) may have created the login: repeating it is 409, the login is in the list, and a reset hands it over', async () => {
@@ -968,7 +987,7 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       'resetClientUserPassword',
       reset,
     );
-    expect((await loginResponse({ email, password: temporaryPassword })).status).toBe(200);
+    expect(await statusOfSignIn(email, temporaryPassword)).toBe(200);
   });
 
   it('E-51: the database step of a reset keeps failing after the Auth server stored the password: 503 and an error log; the old password and the sessions are gone but the pending action is not set; repeating the reset finishes it', async () => {
@@ -999,8 +1018,9 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       'resetClientUserPassword',
       repeated,
     );
-    const signedIn = await loginResponse({ email: login.email, password: temporaryPassword });
-    expect(await signedIn.json()).toMatchObject({ pendingActions: ['CHANGE_PASSWORD'] });
+    const jar = await sessionJarFor({ email: login.email, password: temporaryPassword });
+    const session = await invoke(sessionRoute, { path: '/auth/session', cookies: jar });
+    expect(await bodyOf(session)).toMatchObject({ pendingActions: ['CHANGE_PASSWORD'] });
     expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
       'account.password_reset',
     ]);
@@ -1120,9 +1140,8 @@ describe('E-21: Supabase failing', () => {
       spy.restore();
     }
     expect((await profileOf(login.id))?.disabled_at).not.toBeNull();
-    expect((await loginResponse({ email: login.email, password: login.password })).status).toBe(
-      401,
-    );
+    // disabled in the database and still banned in the Auth server: no session at all
+    expect(await statusOfSignIn(login.email, login.password)).toBe('refused');
   });
 
   it('E-21: resetClientUserPassword whose Auth server is down is 503 and nothing changes: the old password and the session stay', async () => {
@@ -1269,26 +1288,28 @@ describe('who may call the client login routes', () => {
   });
 
   it('E-07: a client user is 403 FORBIDDEN on every operation, on its own client too', async () => {
-    const cookies = await loginViaApi(login);
+    const cookies = await sessionJarFor(login);
 
     await expectAllRefused(cookies, 403, 'FORBIDDEN');
   });
 
   it('SEC-11: a CEO whose session is aal1, with a verified factor, is 403 MFA_VERIFICATION_REQUIRED', async () => {
-    const cookies = await signInCeoWithMfa(ceo, { verify: false });
+    // a session opened with the password only: aal1, whatever the CEO has enrolled
+    const cookies = await sessionJarFor(ceo.ceo);
 
     await expectAllRefused(cookies, 403, 'MFA_VERIFICATION_REQUIRED');
   });
 
   it('SEC-11: a CEO with no TOTP factor is 403 MFA_ENROLLMENT_REQUIRED', async () => {
-    const { cookies } = await loginAsCeoReadyToEnroll();
+    const readyToEnroll = await completeFirstAccess(await createCeo());
+    const cookies = await sessionJarFor(readyToEnroll);
 
     await expectAllRefused(cookies, 403, 'MFA_ENROLLMENT_REQUIRED');
   });
 
   it('spec §3.5: a CEO who still has the temporary password is 403 PASSWORD_CHANGE_REQUIRED', async () => {
     const fresh = await createCeo();
-    const cookies = await loginViaApi(fresh);
+    const cookies = await sessionJarFor(fresh);
 
     await expectAllRefused(cookies, 403, 'PASSWORD_CHANGE_REQUIRED');
   });
