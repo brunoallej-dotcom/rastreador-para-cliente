@@ -8,8 +8,16 @@
 --   tests.insert_auth_user(id, app_meta jsonb, user_meta jsonb DEFAULT '{}')
 --       só o INSERT em auth.users, para testar o trigger com metadados arbitrários.
 --   tests.verify_totp(user_id)      cria um fator TOTP verificado (has_verified_totp = true).
---   tests.authenticate_as(user_id, aal DEFAULT 'aal1')
---       role = authenticated e request.jwt.claims com sub, aal e session_id (= user_id).
+--   tests.attest_session(user_id, session_id DEFAULT NULL) devolve boolean
+--       atesta a sessão (session_id; por padrão a do próprio usuário) como o backend faria: eleva a
+--       sessão a aal2, registra o fator TOTP verificado do CEO como cadastrado e ativado pelo
+--       backend, registra e verifica um challenge do backend e chama a função REAL
+--       public.attest_mfa_session (levanta erro se ela recusar). false, sem fazer nada, quando não há
+--       o que atestar: usuário que não é CEO ou está desativado, sem fator TOTP verificado ou sem a sessão.
+--   tests.authenticate_as(user_id, aal DEFAULT 'aal1', attested DEFAULT true, session_id DEFAULT NULL)
+--       role = authenticated e request.jwt.claims com sub, aal e session_id (por padrão = user_id). Com aal2 e
+--       attested, atesta a sessão antes (tests.attest_session): é o CEO que o backend elevou. Com
+--       attested = false, o claim aal2 fica sem atestado: é o que se obtém direto no Auth.
 --   tests.set_request_id(id)       simula o header x-request-id enviado pelo PostgREST.
 --   tests.clear_authentication()   volta ao papel da sessão (postgres) e limpa os claims.
 
@@ -75,14 +83,84 @@ AS $$
   VALUES (gen_random_uuid(), p_user_id, 'test-totp', 'totp', 'verified', now(), now(), 'TESTSECRET');
 $$;
 
-CREATE OR REPLACE FUNCTION tests.authenticate_as(p_user_id uuid, p_aal text DEFAULT 'aal1')
+-- Atesta uma sessão pelo caminho REAL (public.attest_mfa_session). SECURITY DEFINER: roda como o dono
+-- dos helpers qualquer que seja o papel da sessão de teste no momento da chamada.
+CREATE OR REPLACE FUNCTION tests.attest_session(p_user_id uuid, p_session_id uuid DEFAULT NULL)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_session_id   uuid := coalesce(p_session_id, p_user_id);
+  v_factor_id    uuid;
+  v_activated    boolean;
+  v_challenge_id uuid := gen_random_uuid();
+  v_result       text;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.profiles p
+     WHERE p.id = p_user_id AND p.role = 'ceo' AND p.disabled_at IS NULL
+  ) THEN
+    RETURN false;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM auth.sessions s WHERE s.id = v_session_id AND s.user_id = p_user_id) THEN
+    RETURN false;
+  END IF;
+  SELECT f.id
+    INTO v_factor_id
+    FROM auth.mfa_factors f
+   WHERE f.user_id = p_user_id
+     AND f.factor_type = 'totp'
+     AND f.status = 'verified'
+   ORDER BY f.created_at, f.id
+   LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  UPDATE auth.sessions SET aal = 'aal2' WHERE id = v_session_id;
+
+  INSERT INTO private.mfa_backend_factors (factor_id, user_id, enrolled_session_id)
+  VALUES (v_factor_id, p_user_id, v_session_id)
+  ON CONFLICT (factor_id) DO NOTHING;
+  SELECT bf.activated_at IS NOT NULL
+    INTO v_activated
+    FROM private.mfa_backend_factors bf
+   WHERE bf.factor_id = v_factor_id;
+
+  INSERT INTO auth.mfa_challenges (id, factor_id, created_at, verified_at, ip_address)
+  VALUES (v_challenge_id, v_factor_id, now(), now(), '127.0.0.1');
+  INSERT INTO private.mfa_backend_challenges (challenge_id, factor_id, user_id, factor_was_verified)
+  VALUES (v_challenge_id, v_factor_id, p_user_id, v_activated);
+
+  v_result := public.attest_mfa_session(p_user_id, v_session_id, v_factor_id, v_challenge_id);
+  IF v_result IS DISTINCT FROM 'attested' THEN
+    RAISE EXCEPTION 'tests.attest_session: a função recusou o atestado (%)', v_result;
+  END IF;
+  RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION tests.authenticate_as(
+  p_user_id    uuid,
+  p_aal        text DEFAULT 'aal1',
+  p_attested   boolean DEFAULT true,
+  p_session_id uuid DEFAULT NULL
+)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF p_aal = 'aal2' AND p_attested THEN
+    PERFORM tests.attest_session(p_user_id, p_session_id);
+  END IF;
   PERFORM set_config(
     'request.jwt.claims',
-    json_build_object('sub', p_user_id, 'role', 'authenticated', 'aal', p_aal, 'session_id', p_user_id)::text,
+    json_build_object(
+      'sub', p_user_id, 'role', 'authenticated', 'aal', p_aal,
+      'session_id', coalesce(p_session_id, p_user_id)
+    )::text,
     true
   );
   PERFORM set_config('role', 'authenticated', true);

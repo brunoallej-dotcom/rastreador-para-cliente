@@ -145,7 +145,10 @@ isOneToOne: false
             [_ in never]: never
           }
           Functions: {
-            "consume_totp_code":
+            "attest_mfa_session":
+{ Args: { "p_challenge_id": string,"p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: string
+                           },
+"consume_totp_code":
 { Args: { "p_code_digest": string,"p_factor_id": string }; Returns: boolean
                            },
 "create_client":
@@ -167,6 +170,11 @@ isOneToOne: false
               "aal": string,"client_id": string,"display_name": string,"has_verified_totp": boolean,"must_change_password": boolean,"role": Database["public"]['Enums']["app_role"],"user_id": string
             }[]
                            },
+"list_backend_totp_factors":
+{ Args: Record<PropertyKey, never>; Returns: {
+              "factor_id": string
+            }[]
+                           },
 "list_client_users":
 { Args: { "p_client_id": string }; Returns: {
               "created_at": string,"disabled_at": string,"display_name": string,"email": string,"last_sign_in_at": string,"must_change_password": boolean,"user_id": string
@@ -182,6 +190,12 @@ isOneToOne: false
                            },
 "record_account_provisioned":
 { Args: { "p_user_id": string }; Returns: undefined
+                           },
+"record_backend_mfa_challenge":
+{ Args: { "p_challenge_id": string,"p_factor_id": string,"p_user_id": string }; Returns: undefined
+                           },
+"register_backend_totp_factor":
+{ Args: { "p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: undefined
                            },
 "require_password_change":
 { Args: { "p_user_id": string }; Returns: undefined

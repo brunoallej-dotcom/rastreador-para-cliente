@@ -3,7 +3,7 @@
 -- usuário, reuso dentro e depois da janela de 120 s, escrita direta negada e a exigência do fator
 -- em toda leitura e função de CEO.
 BEGIN;
-SELECT plan(49);
+SELECT plan(50);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000a', 'Cliente A');
@@ -319,13 +319,21 @@ SELECT is(
 );
 SELECT tests.clear_authentication();
 
--- o fator volta a existir: o acesso volta (nada é gravado no JWT nem no perfil)
+-- um fator novo NÃO traz o acesso de volta (Onda 6.1): o atestado era do fator removido e foi junto com
+-- ele (ON DELETE CASCADE); só um verify novo pelo backend atesta de novo
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2', false);
+SELECT is(
+  (SELECT count(*)::integer FROM public.clients),
+  0,
+  'F-24, F-63: um fator verificado novo não devolve o acesso ao mesmo JWT aal2: o atestado era do fator removido'
+);
+SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT is(
   (SELECT count(*)::integer FROM public.clients),
   1,
-  'F-24: com um fator verificado de novo, o mesmo JWT aal2 volta a ler os clientes'
+  'F-24: depois de um verify novo pelo backend (atestado do fator novo), o CEO lê os clientes'
 );
 SELECT tests.clear_authentication();
 

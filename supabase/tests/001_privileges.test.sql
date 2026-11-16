@@ -273,9 +273,11 @@ SELECT is_empty(
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = 'public'
-        AND p.proname <> 'rate_limit_hit'
+        AND p.proname NOT IN (
+          'rate_limit_hit', 'register_backend_totp_factor', 'record_backend_mfa_challenge', 'attest_mfa_session'
+        )
         AND has_function_privilege('service_role', p.oid, 'EXECUTE') $$,
-  'SEC-04: service_role não executa funções de public além de rate_limit_hit (EXECUTE só para o papel necessário)'
+  'SEC-04: service_role não executa funções de public além de rate_limit_hit e das três do atestado de CEO (Onda 6.1)'
 );
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
