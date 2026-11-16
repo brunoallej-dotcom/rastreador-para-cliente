@@ -34,7 +34,7 @@ export async function login(
     const principal = await deps.principals.current();
     if (principal === null) {
       await revokeQuietly(deps.auth);
-      return err(new InvalidCredentialsError());
+      return err(new InvalidCredentialsError('account_inactive'));
     }
     return ok(await loadSessionView(deps.clients, principal));
   } catch (error) {

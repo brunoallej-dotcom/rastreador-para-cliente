@@ -1,10 +1,25 @@
-import type { CookieJar } from '@/shared/http/cookies';
-
 /** The session cookie of `@supabase/ssr`; the `__Host-` prefix needs Secure, Path=/ and no Domain. */
 export const SESSION_COOKIE_NAME = '__Host-rt-session';
-const SECONDS_PER_DAY = 24 * 60 * 60;
-/** Lifetime of the cookie (the default of `@supabase/ssr`); the session itself lives in Supabase. */
-export const SESSION_COOKIE_MAX_AGE_SECONDS = 400 * SECONDS_PER_DAY;
+const SECONDS_PER_HOUR = 60 * 60;
+/** The session lasts at most this long (ADR 0009, SEC-07); the Auth server enforces it too (`timebox`). */
+const SESSION_MAX_HOURS = 12;
+/**
+ * Lifetime of the session cookie, 12 h (43,200 s): the same ceiling as the session itself, so the
+ * browser never keeps a cookie for a session the server already ended. The default of
+ * `@supabase/ssr` would be 400 days.
+ */
+export const SESSION_COOKIE_MAX_AGE_SECONDS = SESSION_MAX_HOURS * SECONDS_PER_HOUR;
+
+/**
+ * The part of the request's cookie jar that session handling uses. A structural type on purpose:
+ * the pipeline's `CookieJar` (`shared/http`) satisfies it, and `shared/db` imports nothing from
+ * `shared/http`.
+ */
+export type SessionCookieStore = {
+  getAll(): { name: string; value: string }[];
+  set(name: string, value: string, options?: { maxAge?: number }): void;
+  delete(name: string): void;
+};
 
 export type SessionCookie = { readonly name: string; readonly value: string };
 
@@ -14,7 +29,7 @@ export function isSessionCookieName(name: string): boolean {
 }
 
 /** The session cookies (and chunks) the jar holds right now. */
-export function snapshotSessionCookies(jar: CookieJar): SessionCookie[] {
+export function snapshotSessionCookies(jar: SessionCookieStore): SessionCookie[] {
   return jar.getAll().filter(({ name }) => isSessionCookieName(name));
 }
 
@@ -23,7 +38,10 @@ export function snapshotSessionCookies(jar: CookieJar): SessionCookie[] {
  * is not in the snapshot is deleted. Used when a call that clears the session did not complete, so
  * the browser keeps a session it can still use to try again.
  */
-export function restoreSessionCookies(jar: CookieJar, snapshot: readonly SessionCookie[]): void {
+export function restoreSessionCookies(
+  jar: SessionCookieStore,
+  snapshot: readonly SessionCookie[],
+): void {
   const kept = new Set(snapshot.map(({ name }) => name));
   for (const { name, value } of snapshot) {
     jar.set(name, value, { maxAge: SESSION_COOKIE_MAX_AGE_SECONDS });

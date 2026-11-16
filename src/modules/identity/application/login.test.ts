@@ -68,7 +68,10 @@ describe('login', () => {
     const result = await login(deps, { email: maria.email, password: 'wrong-password-123' });
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+      expect(result.error.reason).toBe('invalid_credentials');
+    }
     expect(identity.sessionOpen()).toBe(false);
   });
 
@@ -87,7 +90,11 @@ describe('login', () => {
     const result = await login(deps, { email: disabled.email, password: PASSWORD });
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+      // the reason is for the log; the response is the same one a wrong password gets
+      expect(result.error.reason).toBe('account_inactive');
+    }
     expect(identity.calls).toEqual(['signIn', 'current', 'signOut']);
     expect(identity.sessionOpen()).toBe(false);
   });
@@ -108,6 +115,8 @@ describe('login', () => {
     for (const error of errors as InvalidCredentialsError[]) {
       expect(error.code).toBe('INVALID_CREDENTIALS');
       expect(error.detail).toBe((errors[0] as InvalidCredentialsError).detail);
+      // nothing but `code` and `detail` is client-facing: the reason must not leak into either
+      expect(`${error.code} ${error.detail}`).not.toMatch(/inactive|disabled|banned|unknown/i);
     }
   });
 

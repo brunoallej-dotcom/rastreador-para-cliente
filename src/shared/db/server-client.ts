@@ -2,10 +2,13 @@ import 'server-only';
 import { createServerClient } from '@supabase/ssr';
 import type { NextRequest } from 'next/server';
 import { getEnv } from '@/shared/config/env';
-import type { CookieJar } from '@/shared/http/cookies';
 import type { Database } from './database.types';
 import { fetchWithTimeout } from './fetch-with-timeout';
-import { SESSION_COOKIE_MAX_AGE_SECONDS, SESSION_COOKIE_NAME } from './session-cookies';
+import {
+  SESSION_COOKIE_MAX_AGE_SECONDS,
+  SESSION_COOKIE_NAME,
+  type SessionCookieStore,
+} from './session-cookies';
 
 /** Supabase client acting as the signed-in user: RLS applies to everything it does. */
 export type RequestSupabase = ReturnType<typeof createServerClient<Database>>;
@@ -13,7 +16,7 @@ export type RequestSupabase = ReturnType<typeof createServerClient<Database>>;
 export type RequestSupabaseInput = {
   readonly request: NextRequest;
   /** The pipeline's cookie jar: session reads and refreshed tokens go through it. */
-  readonly cookies: CookieJar;
+  readonly cookies: SessionCookieStore;
   /** Sent as `x-request-id`, so database functions can record it in the audit trail. */
   readonly requestId: string;
 };
@@ -26,7 +29,7 @@ export type RequestSupabaseInput = {
  */
 const clientsByRequest = new WeakMap<
   NextRequest,
-  { readonly client: RequestSupabase; readonly cookies: CookieJar }
+  { readonly client: RequestSupabase; readonly cookies: SessionCookieStore }
 >();
 
 /**
@@ -65,12 +68,15 @@ export function getRequestSupabase(input: RequestSupabaseInput): RequestSupabase
       setAll: (cookiesToSet) => {
         for (const { name, value, options } of cookiesToSet) {
           if (value === '') input.cookies.delete(name);
-          else
-            input.cookies.set(
-              name,
-              value,
-              options.maxAge === undefined ? {} : { maxAge: options.maxAge },
-            );
+          else {
+            // `@supabase/ssr` overwrites `cookieOptions.maxAge` with its own default (400 days)
+            // when it writes a session, so the lifetime cannot be set through the options alone:
+            // it is capped here, at the last step before the jar (ADR 0009).
+            const requested = options.maxAge ?? SESSION_COOKIE_MAX_AGE_SECONDS;
+            input.cookies.set(name, value, {
+              maxAge: Math.min(requested, SESSION_COOKIE_MAX_AGE_SECONDS),
+            });
+          }
         }
       },
     },

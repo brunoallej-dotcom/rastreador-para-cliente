@@ -3,7 +3,7 @@
 // limiter, Supabase resolver), the local Supabase (Auth + PostgREST), and every response checked
 // against the OpenAPI contract, headers included.
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { POST as loginRoute } from '@/app/api/v1/auth/login/route';
 import { POST as logoutRoute } from '@/app/api/v1/auth/logout/route';
 import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
@@ -25,6 +25,7 @@ import {
   newClientIp,
   observableHeaders,
   readSessionCookie,
+  spyOnSupabaseFetch,
   textOf,
   withoutRequestId,
   writeSessionCookie,
@@ -32,6 +33,12 @@ import {
 } from '../helpers/http';
 
 const SESSION_COOKIE = '__Host-rt-session';
+/** ADR 0009 and spec SEC-07: a session lives at most 12 hours. */
+const SESSION_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60;
+
+/** `Max-Age` of one `Set-Cookie` line (NaN when it has none, which fails every comparison). */
+const maxAgeOf = (setCookie: string): number =>
+  Number(/;\s*Max-Age=(\d+)/i.exec(setCookie)?.[1] ?? Number.NaN);
 
 const login = (
   body: unknown,
@@ -58,25 +65,6 @@ const logout = (cookies?: CookieStore, options: { origin?: string | null } = {})
     ...(cookies === undefined ? {} : { cookies }),
     ...options,
   });
-
-/**
- * Records every outbound call (`METHOD url`) and lets a test answer some of them itself, with a
- * `Response` or by failing with an `Error`; everything else goes through to the local Supabase.
- * Always `restore()` it (try/finally): it replaces the global `fetch`.
- */
-function spyOnSupabaseFetch(intercept?: (url: string) => Response | Error | undefined) {
-  const realFetch = globalThis.fetch;
-  const calls: string[] = [];
-  const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
-    const url = String(input instanceof Request ? input.url : input);
-    calls.push(`${init?.method ?? 'GET'} ${url}`);
-    const answer = intercept?.(url);
-    if (answer instanceof Error) return Promise.reject(answer);
-    if (answer !== undefined) return Promise.resolve(answer);
-    return realFetch(input, init);
-  });
-  return { calls, restore: () => spy.mockRestore() };
-}
 
 /** What the database says about a JWT, asked straight to PostgREST (no pipeline, no Auth server). */
 async function principalRowsFor(accessToken: string): Promise<unknown[]> {
@@ -133,6 +121,9 @@ describe('POST /api/v1/auth/login', () => {
       expect(cookie).toMatch(/;\s*SameSite=Lax(;|$)/i);
       expect(cookie).toMatch(/;\s*Path=\/(;|$)/i);
       expect(cookie).not.toMatch(/;\s*Domain=/i);
+      // credentials are ephemeral (ADR 0009): the browser keeps the session cookie at most 12 h
+      expect(maxAgeOf(cookie)).toBeGreaterThan(0);
+      expect(maxAgeOf(cookie)).toBeLessThanOrEqual(SESSION_COOKIE_MAX_AGE_SECONDS);
     }
     // `__Host-` also needs the cookie to be written WITH the session, not an empty/expired one
     expect(cookies.some((cookie) => !/Max-Age=0/i.test(cookie))).toBe(true);
@@ -332,6 +323,74 @@ describe('POST /api/v1/auth/login', () => {
   });
 });
 
+describe('POST /api/v1/auth/login when the Auth server answers something other than a password check', () => {
+  const authAnswers = (status: number, errorCode: string) =>
+    Response.json(
+      { code: status, error_code: errorCode, msg: 'simulated by the test' },
+      { status },
+    );
+  const atTokenEndpoint =
+    (answer: () => Response | Error) =>
+    (url: string): Response | Error | undefined =>
+      url.includes('/auth/v1/token') ? answer() : undefined;
+
+  /** One login attempt of an unknown user (the token call is intercepted, so nothing else matters). */
+  async function loginWhileAuthAnswers(answer: () => Response | Error): Promise<Response> {
+    const spy = spyOnSupabaseFetch(atTokenEndpoint(answer));
+    try {
+      return await login({ email: uniqueEmail('mapping'), password: 'any-password-1' });
+    } finally {
+      spy.restore();
+    }
+  }
+
+  it.each([
+    ['a 502 from Auth', () => Response.json({ msg: 'bad gateway' }, { status: 502 })],
+    ['a 500 from Auth', () => authAnswers(500, 'unexpected_failure')],
+    ['Auth throttling (429)', () => authAnswers(429, 'over_request_rate_limit')],
+    ['a transport failure', () => new TypeError('fetch failed')],
+    ['a timeout', () => new DOMException('The operation timed out', 'TimeoutError')],
+    ['an error code nobody knows', () => authAnswers(400, 'some_new_error')],
+    ['the email provider being disabled', () => authAnswers(422, 'email_provider_disabled')],
+    ['a rejected API key', () => authAnswers(401, 'invalid_api_key')],
+    ['a validation failure', () => authAnswers(422, 'validation_failed')],
+  ])(
+    'E-21: %s is 503 SERVICE_UNAVAILABLE with Retry-After and no Set-Cookie, never a wrong-password 401',
+    async (_label, answer) => {
+      const response = await loginWhileAuthAnswers(answer);
+      const body = await bodyOf(response);
+
+      expect(response.status).toBe(503);
+      expect(body).toMatchObject({ code: 'SERVICE_UNAVAILABLE', status: 503 });
+      expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+      expect(response.headers.getSetCookie()).toEqual([]);
+      expectToMatchContract('login', 503, body, response);
+    },
+  );
+
+  it.each([
+    ['a banned user', () => authAnswers(403, 'user_banned')],
+    ['an unconfirmed e-mail', () => authAnswers(400, 'email_not_confirmed')],
+  ])(
+    'SEC-12: %s is the same 401 INVALID_CREDENTIALS as a wrong password, without a cookie',
+    async (_label, answer) => {
+      const wrongPassword = await login({
+        email: uniqueEmail('nobody'),
+        password: 'any-password-1',
+      });
+      const response = await loginWhileAuthAnswers(answer);
+
+      expect(response.status).toBe(401);
+      expectToMatchContract('login', 401, await bodyOf(response), response);
+      expect(JSON.stringify(withoutRequestId(await bodyOf(response)))).toBe(
+        JSON.stringify(withoutRequestId(await bodyOf(wrongPassword))),
+      );
+      expect(observableHeaders(response)).toEqual(observableHeaders(wrongPassword));
+      expect(response.headers.getSetCookie()).toEqual([]);
+    },
+  );
+});
+
 describe('GET /api/v1/auth/session', () => {
   it('AC-26: a client login sees its tenant and CHANGE_PASSWORD, and the response matches the contract', async () => {
     const client = await createClient();
@@ -431,6 +490,8 @@ describe('GET /api/v1/auth/session', () => {
       expect(cookie).toMatch(/;\s*HttpOnly(;|$)/i);
       expect(cookie).toMatch(/;\s*Secure(;|$)/i);
       expect(cookie).toMatch(/;\s*SameSite=Lax(;|$)/i);
+      // a refresh must not stretch the cookie past the 12 h ceiling either
+      expect(maxAgeOf(cookie)).toBeLessThanOrEqual(SESSION_COOKIE_MAX_AGE_SECONDS);
     }
     const after = readSessionCookie(jar);
     expect(after.refresh_token).not.toBe(before.refresh_token);

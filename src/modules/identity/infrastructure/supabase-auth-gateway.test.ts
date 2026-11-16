@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { RequestSupabase } from '@/shared/db/server-client';
 import { ServiceUnavailableError } from '@/shared/kernel';
-import { InvalidCredentialsError } from '../domain/errors';
+import { InvalidCredentialsError, UnexpectedAuthAnswerError } from '../domain/errors';
 import { createSupabaseAuthGateway } from './supabase-auth-gateway';
 
 const CREDENTIALS = { email: 'maria@cliente.test', password: 'correct-horse-battery' };
@@ -64,20 +64,35 @@ describe('SupabaseAuthGateway.signInWithPassword', () => {
     [
       'wrong password or unknown e-mail',
       { name: 'AuthApiError', status: 400, code: 'invalid_credentials' },
+      'invalid_credentials',
     ],
-    ['an unconfirmed e-mail', { name: 'AuthApiError', status: 400, code: 'email_not_confirmed' }],
-    ['a banned user', { name: 'AuthApiError', status: 403, code: 'user_banned' }],
-    ['a validation failure', { name: 'AuthApiError', status: 422, code: 'validation_failed' }],
-  ])('SEC-12: %s is the generic InvalidCredentialsError', async (_label, error) => {
+    [
+      'an unconfirmed e-mail',
+      { name: 'AuthApiError', status: 400, code: 'email_not_confirmed' },
+      'account_inactive',
+    ],
+    [
+      'a banned user',
+      { name: 'AuthApiError', status: 403, code: 'user_banned' },
+      'account_inactive',
+    ],
+  ])('SEC-12: %s is the generic InvalidCredentialsError', async (_label, error, reason) => {
     const { supabase } = fakeSupabase({ signIn: { data: { session: null }, error } });
     const result = await createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(InvalidCredentialsError);
+      expect(result.error.reason).toBe(reason);
+    }
   });
 
   it.each([
     ['a network failure', { name: 'AuthRetryableFetchError', status: 0 }],
     ['a 5xx from the Auth server', { name: 'AuthApiError', status: 502 }],
+    [
+      'a 500 from the Auth server',
+      { name: 'AuthApiError', status: 500, code: 'unexpected_failure' },
+    ],
     [
       'the Auth server throttling (429)',
       { name: 'AuthApiError', status: 429, code: 'over_request_rate_limit' },
@@ -86,9 +101,10 @@ describe('SupabaseAuthGateway.signInWithPassword', () => {
     'E-21: %s is ServiceUnavailableError, never a verdict on the credentials',
     async (_label, error) => {
       const { supabase } = fakeSupabase({ signIn: { data: { session: null }, error } });
-      await expect(
-        createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS),
-      ).rejects.toBeInstanceOf(ServiceUnavailableError);
+      const rejection = createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
+      await expect(rejection).rejects.toBeInstanceOf(ServiceUnavailableError);
+      // an outage, not an unexpected answer: the log category differs
+      await expect(rejection).rejects.not.toBeInstanceOf(UnexpectedAuthAnswerError);
     },
   );
 
@@ -99,20 +115,52 @@ describe('SupabaseAuthGateway.signInWithPassword', () => {
     ).rejects.toBeInstanceOf(ServiceUnavailableError);
   });
 
-  it('fails (500) on an error it does not know, instead of guessing 401', async () => {
+  it.each([
+    ['an unknown error code', { name: 'AuthApiError', status: 400, code: 'some_new_error' }],
+    [
+      'a disabled email provider (misconfigured Auth)',
+      { name: 'AuthApiError', status: 422, code: 'email_provider_disabled' },
+    ],
+    ['a rejected API key', { name: 'AuthApiError', status: 401, code: 'invalid_api_key' }],
+    ['a validation failure', { name: 'AuthApiError', status: 422, code: 'validation_failed' }],
+    ['an error without any code', { name: 'AuthApiError', status: 400 }],
+    ['an error nobody classified', { name: 'AuthUnknownError', message: 'weird' }],
+    // a code that is a property of Object.prototype must not be mistaken for a known refusal
+    [
+      'a code that looks like a prototype key',
+      { name: 'AuthApiError', status: 400, code: 'constructor' },
+    ],
+  ])(
+    'a misconfigured or changed Auth must not look like a wrong password: %s is 503',
+    async (_label, error) => {
+      const { supabase } = fakeSupabase({ signIn: { data: { session: null }, error } });
+      const rejection = createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS);
+      await expect(rejection).rejects.toBeInstanceOf(UnexpectedAuthAnswerError);
+      await expect(rejection).rejects.toBeInstanceOf(ServiceUnavailableError);
+    },
+  );
+
+  it('keeps the status and the code of an unexpected Auth answer for the log', async () => {
     const { supabase } = fakeSupabase({
-      signIn: { data: { session: null }, error: { name: 'AuthUnknownError', message: 'weird' } },
+      signIn: {
+        data: { session: null },
+        error: { name: 'AuthApiError', status: 422, code: 'email_provider_disabled' },
+      },
     });
-    await expect(
-      createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS),
-    ).rejects.toThrow('sign in failed unexpectedly');
+    const rejection = await createSupabaseAuthGateway(supabase)
+      .signInWithPassword(CREDENTIALS)
+      .catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(UnexpectedAuthAnswerError);
+    expect(rejection).toMatchObject({ authStatus: 422, authCode: 'email_provider_disabled' });
+    // never the Auth message, which may echo what was sent
+    expect((rejection as UnexpectedAuthAnswerError).detail).toBeUndefined();
   });
 
-  it('fails (500) when a successful answer carries no session', async () => {
+  it('is 503 too when a successful answer carries no session', async () => {
     const { supabase } = fakeSupabase({ signIn: { data: { session: null }, error: null } });
     await expect(
       createSupabaseAuthGateway(supabase).signInWithPassword(CREDENTIALS),
-    ).rejects.toThrow('no session');
+    ).rejects.toBeInstanceOf(UnexpectedAuthAnswerError);
   });
 });
 

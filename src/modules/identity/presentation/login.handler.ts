@@ -4,8 +4,16 @@ import { ServiceUnavailableError } from '@/shared/kernel';
 import { login } from '../application/login';
 import { createSupabaseAuthGateway } from '../infrastructure/supabase-auth-gateway';
 import { createTrackingClientDirectory } from '../infrastructure/tracking-client-directory';
+import { UnexpectedAuthAnswerError, type CredentialsRefusal } from '../domain/errors';
 import { loginBodySchema } from './login.schema';
 import { toSessionDto } from './session.dto';
+
+/**
+ * The categories of `auth.login.failed`: the two refusals of credentials (see
+ * `CredentialsRefusal`) and the two failures of the service. `upstream_error` is anything else that
+ * went wrong while talking to Supabase (an Auth answer nobody expected, a row nobody understands).
+ */
+type LoginFailureReason = CredentialsRefusal | 'upstream_unavailable' | 'upstream_error';
 
 const LOGIN_IP_LIMIT = 20;
 const LOGIN_ACCOUNT_LIMIT = 10;
@@ -46,10 +54,18 @@ export const loginHandler = withRoute(
     const supabase = getRequestSupabase({ request, cookies: sessionCookies, requestId });
     const gateway = createSupabaseAuthGateway(supabase);
 
-    // E-mail and password never reach a log line: only an HMAC of the e-mail and a generic reason.
-    const logFailure = (reason: string) =>
+    // E-mail and password never reach a log line: only an HMAC of the e-mail and a reason from a
+    // fixed list of categories (the response never says which one it was). For an unexpected Auth
+    // answer the status and the error code of Auth go along: they carry no personal data and are
+    // what tells a misconfigured key from a wrong password.
+    const logFailure = (reason: LoginFailureReason, details: Record<string, unknown> = {}) =>
       logger.warn(
-        { event: 'auth.login.failed', accountHash: fingerprintSubject(body.email), reason },
+        {
+          event: 'auth.login.failed',
+          accountHash: fingerprintSubject(body.email),
+          reason,
+          ...details,
+        },
         'auth.login.failed',
       );
 
@@ -61,15 +77,19 @@ export const loginHandler = withRoute(
       );
     } catch (error) {
       sessionCookies.discard();
-      logFailure(
-        error instanceof ServiceUnavailableError ? 'service_unavailable' : 'internal_error',
-      );
+      if (error instanceof UnexpectedAuthAnswerError) {
+        logFailure('upstream_error', { authStatus: error.authStatus, authCode: error.authCode });
+      } else if (error instanceof ServiceUnavailableError) {
+        logFailure('upstream_unavailable');
+      } else {
+        logFailure('upstream_error');
+      }
       throw error;
     }
 
     if (!result.ok) {
       sessionCookies.discard();
-      logFailure('invalid_credentials');
+      logFailure(result.error.reason);
       return result.error;
     }
 

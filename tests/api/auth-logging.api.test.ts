@@ -13,7 +13,7 @@ import {
   disableAccount,
   uniqueEmail,
 } from '../helpers/fixtures';
-import { createCookieStore, invoke } from '../helpers/http';
+import { createCookieStore, invoke, spyOnSupabaseFetch } from '../helpers/http';
 
 const logged = vi.hoisted(() => ({ lines: [] as string[] }));
 
@@ -35,6 +35,19 @@ const events = (name: string) => records().filter((record) => record['event'] ==
 
 const login = (email: string, password: string, cookies = createCookieStore()) =>
   invoke(loginRoute, { method: 'POST', path: '/auth/login', body: { email, password }, cookies });
+
+const authAnswers = (status: number, errorCode: string) =>
+  Response.json({ code: status, error_code: errorCode, msg: 'simulated by the test' }, { status });
+
+/** A login attempt (unknown e-mail) while the token endpoint of Auth answers `answer()`. */
+async function loginWhileAuthAnswers(answer: () => Response | Error): Promise<Response> {
+  const spy = spyOnSupabaseFetch((url) => (url.includes('/auth/v1/token') ? answer() : undefined));
+  try {
+    return await login(uniqueEmail('mapping'), 'any-password-1');
+  } finally {
+    spy.restore();
+  }
+}
 
 describe('auth events in the logs', () => {
   it('SEC-16: auth.login.failed carries an HMAC of the normalized e-mail and a generic reason, never the e-mail or the password', async () => {
@@ -65,7 +78,7 @@ describe('auth events in the logs', () => {
     expect(everything.toLowerCase()).not.toContain(email.split('@')[0]?.toLowerCase());
   });
 
-  it('SEC-12: a wrong password, an unknown e-mail and a disabled account log the same generic reason', async () => {
+  it('SEC-16: auth.login.failed names the category: invalid_credentials or account_inactive for a refusal of credentials', async () => {
     const client = await createClient();
     const user = await createClientUser({ clientId: client.id });
     const disabled = await createClientUser({ clientId: client.id });
@@ -75,9 +88,37 @@ describe('auth events in the logs', () => {
     await login(user.email, `${user.password}-wrong`);
     await login(uniqueEmail('nobody'), user.password);
     await login(disabled.email, disabled.password);
+    await loginWhileAuthAnswers(() => authAnswers(403, 'user_banned'));
+    await loginWhileAuthAnswers(() => authAnswers(400, 'email_not_confirmed'));
 
-    const reasons = events('auth.login.failed').map((record) => record['reason']);
-    expect(reasons).toEqual(['invalid_credentials', 'invalid_credentials', 'invalid_credentials']);
+    // the response is the same 401 for all of them; the log tells them apart, with no personal data
+    expect(events('auth.login.failed').map((record) => record['reason'])).toEqual([
+      'invalid_credentials',
+      'invalid_credentials',
+      'account_inactive',
+      'account_inactive',
+      'account_inactive',
+    ]);
+  });
+
+  it('E-21: auth.login.failed says upstream_unavailable for an outage and upstream_error, with the Auth status and code, for an answer nobody expected', async () => {
+    logged.lines.length = 0;
+
+    await loginWhileAuthAnswers(() => Response.json({ msg: 'bad gateway' }, { status: 502 }));
+    await loginWhileAuthAnswers(() => authAnswers(429, 'over_request_rate_limit'));
+    await loginWhileAuthAnswers(() => new TypeError('fetch failed'));
+    await loginWhileAuthAnswers(() => authAnswers(422, 'email_provider_disabled'));
+
+    const failed = events('auth.login.failed');
+    expect(failed.map((record) => record['reason'])).toEqual([
+      'upstream_unavailable',
+      'upstream_unavailable',
+      'upstream_unavailable',
+      'upstream_error',
+    ]);
+    expect(failed[3]).toMatchObject({ authStatus: 422, authCode: 'email_provider_disabled' });
+    // an outage logs no Auth detail at all
+    expect(failed[0]).not.toHaveProperty('authCode');
   });
 
   it('SEC-16: auth.login.succeeded carries the user id only; auth.logout the same; no secrets anywhere', async () => {

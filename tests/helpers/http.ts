@@ -9,6 +9,7 @@
 // of its own, so the Postgres rate-limit counters of one test never touch another's.
 import { randomBytes } from 'node:crypto';
 import { NextRequest } from 'next/server';
+import { vi } from 'vitest';
 import type { NextRouteHandler } from '@/shared/http/route-policy';
 
 const API_BASE_PATH = '/api/v1';
@@ -223,4 +224,25 @@ export function observableHeaders(response: Response): Record<string, string> {
   const cookies = response.headers.getSetCookie();
   if (cookies.length > 0) headers['set-cookie'] = cookies.join('\n');
   return headers;
+}
+
+// ------------------------------------------------------------------------------ outbound ----
+
+/**
+ * Records every outbound call (`METHOD url`) and lets a test answer some of them itself, with a
+ * `Response` or by failing with an `Error`; everything else goes through to the local Supabase.
+ * Always `restore()` it (try/finally): it replaces the global `fetch`.
+ */
+export function spyOnSupabaseFetch(intercept?: (url: string) => Response | Error | undefined) {
+  const realFetch = globalThis.fetch;
+  const calls: string[] = [];
+  const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = String(input instanceof Request ? input.url : input);
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    const answer = intercept?.(url);
+    if (answer instanceof Error) return Promise.reject(answer);
+    if (answer !== undefined) return Promise.resolve(answer);
+    return realFetch(input, init);
+  });
+  return { calls, restore: () => spy.mockRestore() };
 }

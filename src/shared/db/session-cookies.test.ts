@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { createCookieJar } from '@/shared/http/cookies';
 import {
   isSessionCookieName,
   readAccessToken,
   restoreSessionCookies,
+  SESSION_COOKIE_MAX_AGE_SECONDS,
   SESSION_COOKIE_NAME,
   snapshotSessionCookies,
 } from './session-cookies';
+import { createFakeCookieStore } from './testing';
 
 describe('isSessionCookieName', () => {
   it('matches the session cookie and its chunks, and nothing else', () => {
@@ -24,8 +25,12 @@ describe('snapshot and restore of the session cookies', () => {
     expect(SESSION_COOKIE_NAME).toBe('__Host-rt-session');
   });
 
-  it('puts back a session that a failed sign-out had already cleared', () => {
-    const jar = createCookieJar([
+  it('SEC-07: the session cookie lives at most 12 hours (ADR 0009)', () => {
+    expect(SESSION_COOKIE_MAX_AGE_SECONDS).toBe(43_200);
+  });
+
+  it('puts back a session that a failed sign-out had already cleared, with the 12 h lifetime', () => {
+    const jar = createFakeCookieStore([
       { name: '__Host-rt-session.0', value: 'chunk-0' },
       { name: '__Host-rt-session.1', value: 'chunk-1' },
       { name: 'unrelated', value: 'x' },
@@ -39,20 +44,21 @@ describe('snapshot and restore of the session cookies', () => {
     jar.delete('__Host-rt-session.0');
     jar.delete('__Host-rt-session.1');
     expect(snapshotSessionCookies(jar)).toEqual([]);
+    jar.writes.length = 0;
 
     restoreSessionCookies(jar, snapshot);
+
     expect(jar.get('__Host-rt-session.0')).toBe('chunk-0');
     expect(jar.get('__Host-rt-session.1')).toBe('chunk-1');
-    const headers = new Headers();
-    jar.applyTo(headers);
-    const written = headers.getSetCookie();
-    expect(written).toHaveLength(2);
-    for (const cookie of written) expect(cookie).not.toMatch(/Max-Age=0/i);
+    expect(jar.writes).toEqual([
+      { kind: 'set', name: '__Host-rt-session.0', value: 'chunk-0', maxAge: 43_200 },
+      { kind: 'set', name: '__Host-rt-session.1', value: 'chunk-1', maxAge: 43_200 },
+    ]);
     expect(jar.get('unrelated')).toBe('x');
   });
 
   it('removes session cookies that were not in the snapshot', () => {
-    const jar = createCookieJar([{ name: '__Host-rt-session', value: 'a' }]);
+    const jar = createFakeCookieStore([{ name: '__Host-rt-session', value: 'a' }]);
     const snapshot = snapshotSessionCookies(jar);
     jar.set('__Host-rt-session.0', 'late');
     restoreSessionCookies(jar, snapshot);

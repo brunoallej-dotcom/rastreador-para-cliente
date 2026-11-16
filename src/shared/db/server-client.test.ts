@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createCookieJar } from '@/shared/http/cookies';
 import { getRequestSupabase } from './server-client';
+import { createFakeCookieStore } from './testing';
 
 // Obviously fake, lowercase-only values (the secret-detection hook rightly ignores them).
 const FAKE_ENV = {
@@ -51,7 +51,7 @@ afterEach(() => {
 describe('getRequestSupabase', () => {
   it('SEC-07: returns ONE client per request, so the resolver and the handler never refresh twice', () => {
     const request = requestOf();
-    const cookies = createCookieJar([]);
+    const cookies = createFakeCookieStore();
 
     const first = getRequestSupabase({ request, cookies, requestId: 'request-id-1' });
     const second = getRequestSupabase({ request, cookies, requestId: 'request-id-1' });
@@ -62,12 +62,12 @@ describe('getRequestSupabase', () => {
   it('never shares a client between two requests', () => {
     const one = getRequestSupabase({
       request: requestOf(),
-      cookies: createCookieJar([]),
+      cookies: createFakeCookieStore(),
       requestId: 'request-id-1',
     });
     const other = getRequestSupabase({
       request: requestOf(),
-      cookies: createCookieJar([]),
+      cookies: createFakeCookieStore(),
       requestId: 'request-id-2',
     });
 
@@ -76,10 +76,10 @@ describe('getRequestSupabase', () => {
 
   it('refuses a second call that brings ANOTHER cookie jar (it would be silently ignored)', () => {
     const request = requestOf();
-    getRequestSupabase({ request, cookies: createCookieJar([]), requestId: 'request-id-1' });
+    getRequestSupabase({ request, cookies: createFakeCookieStore(), requestId: 'request-id-1' });
 
     expect(() =>
-      getRequestSupabase({ request, cookies: createCookieJar([]), requestId: 'request-id-1' }),
+      getRequestSupabase({ request, cookies: createFakeCookieStore(), requestId: 'request-id-1' }),
     ).toThrow('different cookie jar');
   });
 
@@ -87,7 +87,7 @@ describe('getRequestSupabase', () => {
     const calls = stubFetch(() => json([]));
     const client = getRequestSupabase({
       request: requestOf(),
-      cookies: createCookieJar([]),
+      cookies: createFakeCookieStore(),
       requestId: 'request-id-77',
     });
 
@@ -106,7 +106,7 @@ describe('getRequestSupabase', () => {
     });
     const client = getRequestSupabase({
       request: requestOf(),
-      cookies: createCookieJar([]),
+      cookies: createFakeCookieStore(),
       requestId: 'request-id-1',
     });
 
@@ -115,37 +115,33 @@ describe('getRequestSupabase', () => {
     expect(seen[0]).toBeInstanceOf(AbortSignal);
   });
 
-  it('SEC-07: a new session goes into the jar as __Host-rt-session, and a sign-out deletes it', async () => {
+  it('SEC-07: a new session is written as __Host-rt-session with a lifetime of at most 12 h, and a sign-out deletes it', async () => {
     stubFetch((url) =>
       url.includes('/logout') ? new Response(null, { status: 204 }) : json(FAKE_SESSION),
     );
-    const cookies = createCookieJar([]);
+    const cookies = createFakeCookieStore();
     const client = getRequestSupabase({ request: requestOf(), cookies, requestId: 'request-id-1' });
 
     const signedIn = await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
 
     expect(signedIn.error).toBeNull();
-    const names = cookies.getAll().map(({ name }) => name);
-    expect(names.length).toBeGreaterThan(0);
-    for (const name of names) expect(name).toMatch(/^__Host-rt-session(\.\d+)?$/);
-
-    const headers = new Headers();
-    cookies.applyTo(headers);
-    for (const cookie of headers.getSetCookie()) {
-      expect(cookie).toMatch(/;\s*HttpOnly(;|$)/i);
-      expect(cookie).toMatch(/;\s*Secure(;|$)/i);
-      expect(cookie).toMatch(/;\s*SameSite=lax(;|$)/i);
-      expect(cookie).toMatch(/;\s*Path=\/(;|$)/i);
-      expect(cookie).not.toMatch(/Domain=/i);
-      expect(cookie).not.toMatch(/Max-Age=0/i);
+    const sets = cookies.writes.filter((write) => write.kind === 'set');
+    expect(sets.length).toBeGreaterThan(0);
+    for (const write of sets) {
+      expect(write.name).toMatch(/^__Host-rt-session(\.\d+)?$/);
+      // @supabase/ssr asks for 400 days when it writes a session; the client caps it at 12 h
+      expect(write.kind === 'set' ? write.maxAge : undefined).toBeLessThanOrEqual(43_200);
+      expect(write.kind === 'set' ? write.maxAge : undefined).toBeGreaterThan(0);
     }
+    // only the lifetime goes to the jar: the flags are the jar's business, never the client's
+    for (const write of sets)
+      expect(Object.keys(write).sort()).toEqual(['kind', 'maxAge', 'name', 'value']);
 
+    cookies.writes.length = 0;
     await client.auth.signOut({ scope: 'local' });
 
     expect(cookies.getAll()).toEqual([]);
-    const cleared = new Headers();
-    cookies.applyTo(cleared);
-    expect(cleared.getSetCookie().length).toBeGreaterThan(0);
-    for (const cookie of cleared.getSetCookie()) expect(cookie).toMatch(/Max-Age=0/i);
+    expect(cookies.writes.length).toBeGreaterThan(0);
+    for (const write of cookies.writes) expect(write.kind).toBe('delete');
   });
 });
