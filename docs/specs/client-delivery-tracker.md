@@ -490,6 +490,38 @@ Fluxo do primeiro acesso de um CEO: login (`aal1`, CHANGE_PASSWORD e ENROLL_MFA)
 senha → enroll → verify (`aal2`) → painel liberado. Com pendência em ordem, o `code` do 403
 segue a prioridade CHANGE_PASSWORD > ENROLL_MFA > VERIFY_MFA.
 
+#### 3.5.1 Leitura do cliente (Onda 10)
+
+`GET /me/processes` e `GET /me/processes/{processId}` (RF-13) leem por um **query service** próprio
+(`ClientProcessQueries`), separado do repositório do agregado (§3.2), com o client do usuário (RLS) e só as
+tabelas que um cliente lê: `processes` e `process_stages`, nunca `stage_approvals`.
+
+- **Tenant.** Vem do principal (o `clientId` da sessão); nenhuma rota recebe id de cliente (a lista aceita só
+  `limit` e `cursor`, e `?clientId=` é 400). A consulta filtra por esse tenant, o RLS filtra pelo perfil da
+  sessão (`private.current_client_id()`) e cada linha lida é comparada com o tenant **antes** de ser mapeada:
+  uma linha de outro tenant é defeito (500, log `tracking.client_panel_tenant_mismatch` só com o id do
+  processo) e nada é devolvido. Processo de outro cliente e UUID inexistente dão o mesmo 404 (E-05), porque a
+  leitura por id também filtra pelo tenant. Um CEO ou um cliente sem `clientId` é recusado também no caso de
+  uso (403).
+- **DTO.** O modelo de leitura e o DTO têm só os campos de `MyProcessSummary`, `MyProcessDetail` e `MyStage`:
+  nenhum `version`, `clientId`, `cancelledAt`, id de fase, aprovação, CEO ou evento. O contrato fecha os
+  objetos com `additionalProperties: false`, e a leitura nem seleciona as aprovações.
+- **Progresso.** `progressPercent = round(100 × completedStages ÷ totalStages)`, inteiro de 0 a 100 (1 de 3 é
+  33, 2 de 3 é 67); com no máximo 30 fases, 100 só quando todas estão concluídas. `currentStage` é a fase
+  `in_progress`, como no painel de CEO: no cancelado é onde ele parou e no concluído é `null`.
+- **Ordem e paginação.** Do mais recente ao mais antigo (`created_at DESC, id ASC`, índice
+  `processes (client_id, created_at DESC, id)`), com o keyset de duas consultas de §3.7.1. O cursor é do
+  `kind` `my-processes` (`{ c, i }`, os mesmos limites de `c` do F-53): o de outro endpoint dá 400, e o de outro
+  cliente só anda dentro das linhas de quem o envia.
+- **Falha fechada.** A leitura confere as invariantes que um cliente consegue ver (todas menos a I5, que
+  depende das aprovações): processo sem fase, progresso que não fecha, fases fora de ordem ou estado sem a
+  data são 500 (log `tracking.process_invariant_violated` com `panel: 'client'`, só o id do processo e as
+  invariantes), como no painel de CEO (F-81, E-82).
+- **Limite, pendências e arquivados.** `reads`, 300 por minuto por usuário (o contador é do próprio login).
+  `allowPending: []`: login com a senha temporária por trocar recebe 403 `PASSWORD_CHANGE_REQUIRED` (E-81). O
+  mesmo login lendo direto pelo PostgREST não passa por essa recusa: é o F-83, planejado para a Onda 10.1. Um
+  cliente arquivado continua lendo os processos que já tem (E-83, Q-13).
+
 ### 3.6 Máquina de estados do processo
 
 ```mermaid
@@ -1110,6 +1142,10 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-05 | Cliente pede processo de outro cliente, ou UUID inexistente | 404 `NOT_FOUND` (resposta idêntica nos dois casos) |
 | E-06 | `processId` malformado | 400 `VALIDATION_ERROR` |
 | E-07 | Cliente chama `/admin/*`; CEO chama `/me/*` | 403 `FORBIDDEN` |
+| E-80 | `GET /me/processes` com `clientId`, `status` ou outro parâmetro que o contrato não tem; `limit` fora de 1 a 100 ou que não é inteiro; cursor adulterado, truncado, de outro endpoint ou com um instante que o banco não lê | 400 `VALIDATION_ERROR` em `query.<campo>`, sem chegar ao banco. Um cursor bem formado que veio de outro cliente é aceito e anda só dentro das linhas de quem o envia (§3.5.1) |
+| E-81 | Cliente com `CHANGE_PASSWORD` pendente em `/me/*` | 403 `PASSWORD_CHANGE_REQUIRED` na lista e no detalhe; liberado depois de `POST /auth/password` |
+| E-82 | Processo sem fase, ou que quebra I1 a I4, na lista ou no detalhe do cliente | 500 `INTERNAL_ERROR`, sem mostrar nada dele nem do título; o log leva só o id do processo e as invariantes (F-81). Os outros clientes não são afetados |
+| E-83 | Cliente arquivado lê os processos que já tem | 200 na lista e no detalhe (Q-13): arquivar só impede processos e logins novos |
 | E-08 | Conta desativada com JWT ainda válido | 401 na próxima requisição (sessões apagadas + checagem no banco) |
 | E-09 | Logout em outro dispositivo | A sessão daquele dispositivo é revogada; as demais seguem (escopo `local`) |
 | E-10 | Refresh token reutilizado (roubo) | O Supabase revoga a família; 401 |

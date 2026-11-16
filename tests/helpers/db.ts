@@ -192,6 +192,135 @@ export async function backendChallengeIdsOf(userId: string): Promise<string[]> {
     .map((row) => row.challenge_id);
 }
 
+// ------------------------------------------------------------------ tracking fixtures (Wave 10) ----
+// What the client panel tests need and no API route does yet (the "Ok" is Wave 9; a process with no
+// stage or a tie in `created_at` is a state the functions never produce). They write as the operator
+// (psql as postgres inside the db container), NOT with the secret key: Wave 10.1 revokes the
+// `service_role` DML on the tracking tables (F-81). Every value that reaches the SQL text is validated
+// first: a UUID, a timestamp of one strict shape, a whole number or a plain label.
+
+/** `2026-03-03T10:00:00.123456+00:00`: the shape PostgREST shows, with any sub-second precision. */
+const TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
+const LABEL_PATTERN = /^[A-Za-z0-9 ]{1,40}$/;
+const MAX_FIXTURE_PROCESSES = 50;
+
+function assertTimestamp(value: string, what: string): void {
+  if (!TIMESTAMP_PATTERN.test(value))
+    throw new Error(`${what}: the instant is not an ISO timestamp`);
+}
+
+/**
+ * Plays the "Ok" the way `approve_current_stage` will (Wave 9) for a process created through the API:
+ * completes the stage in progress with an approval by `approverId` and starts the next one, or, after
+ * the last, completes the process. It exists so the client panel can be read in the states an approval
+ * makes (a completed stage, a completed process) before that function exists; it is not how an approval
+ * is ever checked. Fails the helper when the process has no stage in progress.
+ */
+export async function approveCurrentStageAsFixture(
+  processId: string,
+  approverId: string,
+): Promise<void> {
+  assertUuid(processId, 'approveCurrentStageAsFixture');
+  assertUuid(approverId, 'approveCurrentStageAsFixture');
+  const completed = z
+    .array(z.object({ id: z.string(), position: z.number() }))
+    .parse(
+      await queryLocal(
+        `UPDATE public.process_stages SET status = 'completed', completed_at = now() ` +
+          `WHERE process_id = '${processId}' AND status = 'in_progress' RETURNING id, position`,
+      ),
+    );
+  const [stage] = completed;
+  if (completed.length !== 1 || stage === undefined) {
+    throw new Error('approveCurrentStageAsFixture: the process has no stage in progress');
+  }
+
+  await queryLocal(
+    `INSERT INTO public.stage_approvals (process_stage_id, process_id, approved_by) ` +
+      `VALUES ('${stage.id}', '${processId}', '${approverId}') RETURNING id`,
+  );
+  const started = await queryLocal(
+    `UPDATE public.process_stages SET status = 'in_progress', started_at = now() ` +
+      `WHERE process_id = '${processId}' AND position = ${stage.position + 1} RETURNING id`,
+  );
+  if (started.length === 0) {
+    await queryLocal(
+      `UPDATE public.processes SET status = 'completed', completed_at = now(), updated_at = now(), ` +
+        `version = version + 1 WHERE id = '${processId}' RETURNING id`,
+    );
+    return;
+  }
+  await queryLocal(
+    `UPDATE public.processes SET updated_at = now(), version = version + 1 ` +
+      `WHERE id = '${processId}' RETURNING id`,
+  );
+}
+
+/**
+ * Inserts `count` processes of a client that all carry the same creation instant (the tie a keyset on
+ * `created_at` alone gets wrong), each with ONE stage in progress, so the read side accepts them.
+ * Titles are `<label> 1` to `<label> <count>`. Returns the ids in the order the list shows equals (`id`
+ * ascending).
+ */
+export async function insertProcessesAtFixture(
+  clientId: string,
+  createdAt: string,
+  count: number,
+  label: string,
+): Promise<string[]> {
+  assertUuid(clientId, 'insertProcessesAtFixture');
+  assertTimestamp(createdAt, 'insertProcessesAtFixture');
+  if (!Number.isInteger(count) || count < 1 || count > MAX_FIXTURE_PROCESSES) {
+    throw new Error('insertProcessesAtFixture: the count is not a whole number from 1 to 50');
+  }
+  if (!LABEL_PATTERN.test(label)) {
+    throw new Error('insertProcessesAtFixture: the label is not plain text');
+  }
+  // Two statements, not one: a data-modifying CTE must be at the top level, and `queryLocal` wraps its
+  // statement in a CTE of its own.
+  const ids = z
+    .array(z.object({ id: z.string() }))
+    .parse(
+      await queryLocal(
+        `INSERT INTO public.processes (client_id, title, created_at, updated_at) ` +
+          `SELECT '${clientId}', '${label} ' || n, '${createdAt}', '${createdAt}' ` +
+          `FROM generate_series(1, ${count}) AS n RETURNING id`,
+      ),
+    )
+    .map((row) => row.id);
+  ids.forEach((id) => assertUuid(id, 'insertProcessesAtFixture'));
+  await queryLocal(
+    `INSERT INTO public.process_stages (process_id, position, name, status, started_at) ` +
+      `SELECT id, 1, 'Unica', 'in_progress', '${createdAt}' FROM public.processes ` +
+      `WHERE id IN (${ids.map((id) => `'${id}'`).join(', ')}) RETURNING id`,
+  );
+  return ids.sort();
+}
+
+/**
+ * Inserts a process of a client with NO stage: the corrupt state the read side must refuse to show (I1,
+ * 500). The functions never produce it; only a hand-made row does. Returns its id.
+ */
+export async function insertProcessWithoutStagesFixture(
+  clientId: string,
+  label: string,
+): Promise<string> {
+  assertUuid(clientId, 'insertProcessWithoutStagesFixture');
+  if (!LABEL_PATTERN.test(label)) {
+    throw new Error('insertProcessWithoutStagesFixture: the label is not plain text');
+  }
+  const [row] = z
+    .array(z.object({ id: z.string() }))
+    .parse(
+      await queryLocal(
+        `INSERT INTO public.processes (client_id, title) VALUES ('${clientId}', '${label}') RETURNING id`,
+      ),
+    );
+  if (row === undefined) throw new Error('insertProcessWithoutStagesFixture: nothing was inserted');
+  return row.id;
+}
+
 /** The name of a counter group (`login`, `totp-verify-daily`): lowercase words joined by hyphens. */
 const BUDGET_GROUP_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
 
