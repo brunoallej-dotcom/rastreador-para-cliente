@@ -105,6 +105,29 @@ export class ClientUserProvisionOrphanedError extends ServiceUnavailableError {
 }
 
 /**
+ * A creation that failed without an answer, and the client's list now shows a new login with the e-mail
+ * of the request that the use case will NOT take for its own and delete: more than one candidate, or one
+ * created before this attempt started (another CEO may have provisioned the same address a moment
+ * earlier, and ITS login must never be deleted, F-90, M1). Fail closed: nothing is destroyed, the answer
+ * is a 503, and the log (`provision_answer_lost`, with the id or ids, `deleted: false`) lets a person
+ * decide. Repeating the request then answers 409 (the address is taken).
+ */
+export class ClientUserProvisionAnswerLostError extends ServiceUnavailableError {
+  /** The candidates, for the log: never part of the response. */
+  readonly userIds: readonly string[];
+
+  constructor(userIds: readonly string[], options?: DomainErrorOptions) {
+    super('the creation did not answer and a login with the e-mail exists; nothing was deleted', {
+      detail:
+        'The login may have been created, by this request or by another one. ' +
+        'Look for it in the list of logins before trying again.',
+      ...options,
+    });
+    this.userIds = userIds;
+  }
+}
+
+/**
  * The Auth server accepted the creation but its answer carries no usable user id (E-55): the account
  * exists and cannot be named. A 503 (an unexpected answer of the service: never a 500, and never a 201
  * without the password having been handed over). The use case looks for the account by e-mail in the

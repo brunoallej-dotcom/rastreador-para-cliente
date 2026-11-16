@@ -2,6 +2,7 @@ import { getRequestSupabase } from '@/shared/db/server-client';
 import { json, withRoute, type WithRoute } from '@/shared/http';
 import { provisionClientUser } from '../application/provision-client-user';
 import {
+  ClientUserProvisionAnswerLostError,
   ClientUserProvisionOrphanedError,
   ClientUserProvisionRolledBackError,
   ClientUserProvisionUnconfirmedError,
@@ -62,6 +63,18 @@ export function createProvisionClientUserHandler(route: WithRoute = withRoute) {
           logger.error(
             { event, ...where, targetUserId: error.userId, deleteFailure: error.deleteFailure },
             event,
+          );
+        } else if (error instanceof ClientUserProvisionAnswerLostError) {
+          // A login with the e-mail exists that the use case would not take for its own, so it deleted
+          // nothing (M1): a person decides. The ids are the candidates.
+          logger.error(
+            {
+              event: 'identity.client_user.provision_answer_lost',
+              ...where,
+              targetUserIds: error.userIds,
+              deleted: false,
+            },
+            'identity.client_user.provision_answer_lost',
           );
         } else if (error instanceof ClientUserProvisionRolledBackError) {
           logger.error(

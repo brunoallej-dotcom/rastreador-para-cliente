@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { ForbiddenError, NotFoundError, ServiceUnavailableError } from '@/shared/kernel';
+import {
+  fixedClock,
+  ForbiddenError,
+  NotFoundError,
+  ServiceUnavailableError,
+} from '@/shared/kernel';
 import {
   ClientArchivedError,
+  ClientUserProvisionAnswerLostError,
   ClientUserProvisionOrphanedError,
   ClientUserProvisionRolledBackError,
   ClientUserProvisionUnconfirmedError,
@@ -421,31 +427,89 @@ describe('provisionClientUser', () => {
       expect(world.records.has('00000000-0000-4000-8000-0000000005aa')).toBe(true);
     });
 
-    it('a NEW login (the temporary password in use, never signed in) that appears with the e-mail meanwhile is what the request own creation looks like, so it is taken back', async () => {
-      const world = worldWithTwoClients();
-      const accounts = {
-        ...world.accounts,
-        createClientUser: () => {
-          world.seed({
-            id: '00000000-0000-4000-8000-0000000005bb',
-            clientId: CLIENT_A,
-            email: INPUT.email,
-            mustChangePassword: true,
-            lastSignInAt: null,
-          });
-          return Promise.reject(new ServiceUnavailableError('create unavailable'));
-        },
-      };
+    describe('M1: the compensation never deletes a login it cannot prove is its own', () => {
+      /** The instant the attempt starts, pinned: a login is "before" or "after" it by its `createdAt`. */
+      const START = new Date('2026-11-16T12:00:00.000Z');
+      const at = (offsetMs: number) => new Date(START.getTime() + offsetMs);
+      const RACER = '00000000-0000-4000-8000-0000000005bb';
+      const RACER_TWO = '00000000-0000-4000-8000-0000000005bc';
 
-      const error: unknown = await provisionClientUser(
-        { ...deps(world), accounts },
-        ceoPrincipal,
-        INPUT,
-      ).catch((caught: unknown) => caught);
+      /**
+       * Another CEO's request provisions the same e-mail in the same client right after the snapshot of
+       * this one, and this one's creation then fails without an answer. `createdAts` are the instants the
+       * logins that turn up were created.
+       */
+      async function failedCreationWithLoginsCreatedAt(createdAts: readonly Date[]) {
+        const world = worldWithTwoClients();
+        const ids = [RACER, RACER_TWO];
+        const accounts = {
+          ...world.accounts,
+          createClientUser: () => {
+            createdAts.forEach((createdAt, index) => {
+              world.seed({
+                id: ids[index] ?? RACER,
+                clientId: CLIENT_A,
+                email: INPUT.email,
+                mustChangePassword: true,
+                lastSignInAt: null,
+                createdAt,
+              });
+            });
+            return Promise.reject(new ServiceUnavailableError('create unavailable'));
+          },
+        };
+        const error: unknown = await provisionClientUser(
+          { ...deps(world), accounts, clock: fixedClock(START) },
+          ceoPrincipal,
+          INPUT,
+        ).catch((caught: unknown) => caught);
+        return { world, error };
+      }
 
-      // new and unused: exactly what the request's own creation looks like
-      expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
-      expect(world.records.has('00000000-0000-4000-8000-0000000005bb')).toBe(false);
+      it("a login created BEFORE this attempt started is another request's: nothing is deleted, the answer is 503 and the id is in the error (the old test here enshrined deleting it)", async () => {
+        const { world, error } = await failedCreationWithLoginsCreatedAt([at(-10_000)]);
+
+        expect(error).toBeInstanceOf(ClientUserProvisionAnswerLostError);
+        expect((error as ClientUserProvisionAnswerLostError).userIds).toEqual([RACER]);
+        expect(world.calls).not.toContain('deleteUser');
+        expect(world.records.has(RACER)).toBe(true);
+      });
+
+      it("exactly one candidate created at the start of the attempt is the attempt's own: it is taken back", async () => {
+        const { world, error } = await failedCreationWithLoginsCreatedAt([at(0)]);
+
+        expect(error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+        expect(world.records.has(RACER)).toBe(false);
+      });
+
+      it("the clock of the database may run a little behind: 1.5 s before the start still counts as the attempt's own, 2.5 s does not", async () => {
+        const within = await failedCreationWithLoginsCreatedAt([at(-1_500)]);
+        const outside = await failedCreationWithLoginsCreatedAt([at(-2_500)]);
+
+        expect(within.error).toBeInstanceOf(ClientUserProvisionRolledBackError);
+        expect(outside.error).toBeInstanceOf(ClientUserProvisionAnswerLostError);
+        expect(outside.world.records.has(RACER)).toBe(true);
+      });
+
+      it("TWO candidates: nobody can tell which is the attempt's, so neither is deleted and both ids are reported", async () => {
+        const { world, error } = await failedCreationWithLoginsCreatedAt([at(100), at(200)]);
+
+        expect(error).toBeInstanceOf(ClientUserProvisionAnswerLostError);
+        expect((error as ClientUserProvisionAnswerLostError).userIds).toEqual([RACER, RACER_TWO]);
+        expect(world.calls).not.toContain('deleteUser');
+        expect(world.records.has(RACER)).toBe(true);
+        expect(world.records.has(RACER_TWO)).toBe(true);
+      });
+
+      it('the error is a 503 for the client and its detail names no one', async () => {
+        const { error } = await failedCreationWithLoginsCreatedAt([at(-10_000)]);
+
+        expect(error).toBeInstanceOf(ServiceUnavailableError);
+        expect(
+          JSON.stringify({ detail: (error as Error & { detail?: string }).detail }),
+        ).not.toContain(INPUT.email);
+        expect(JSON.stringify((error as Error).message)).not.toContain(RACER);
+      });
     });
 
     it('with the login NOT in the list and the client archived by now: 422, the trigger refused it (E-52)', async () => {

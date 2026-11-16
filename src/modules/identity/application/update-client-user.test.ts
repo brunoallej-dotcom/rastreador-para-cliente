@@ -269,19 +269,67 @@ describe('updateClientUser', () => {
     ]);
   });
 
-  it('F-92a: a login enabled in the database but banned in Auth (the worst interleaving) is repaired by repeating the enable', async () => {
+  it('M2: enabling a login that is already enabled touches nothing: no unban, no database call, and no re-ban to lock it out when something fails', async () => {
     const world = worldWithTwoClients();
-    const record = world.records.get(USER_A1);
-    if (record !== undefined) record.banned = true;
+    // were the step not skipped, this failure would put a ban on an ACTIVE login
+    world.failNext('setDisabled');
+    const notices: ClientUserNotice[] = [];
 
-    const result = await updateClientUser(deps(world), ceoPrincipal, {
+    const result = await updateClientUser(deps(world, notices), ceoPrincipal, {
       clientId: CLIENT_A,
       userId: USER_A1,
       disabled: false,
     });
 
     expect(result.ok && result.value.disabled).toBe(false);
+    expect(world.calls).not.toContain('setBanned');
+    expect(world.calls).not.toContain('setDisabled');
     expect(world.records.get(USER_A1)?.banned).toBe(false);
+    expect(notices).toEqual([]);
+  });
+
+  it('M2: a repeated enable whose database step would fail never bans an active login (the first enable worked, the second is the no-op)', async () => {
+    const world = worldWithTwoClients();
+    await updateClientUser(deps(world), ceoPrincipal, {
+      clientId: CLIENT_A,
+      userId: USER_A1,
+      disabled: true,
+    });
+    await updateClientUser(deps(world), ceoPrincipal, {
+      clientId: CLIENT_A,
+      userId: USER_A1,
+      disabled: false,
+    });
+    world.failNext('setDisabled');
+
+    const again = await updateClientUser(deps(world), ceoPrincipal, {
+      clientId: CLIENT_A,
+      userId: USER_A1,
+      disabled: false,
+    });
+
+    expect(again.ok).toBe(true);
+    expect(world.records.get(USER_A1)).toMatchObject({ disabled: false, banned: false });
+  });
+
+  it('F-92a: a login enabled in the database but banned in Auth (the worst interleaving) is not touched by a bare enable, and a disable followed by an enable repairs it', async () => {
+    const world = worldWithTwoClients();
+    const record = world.records.get(USER_A1);
+    if (record !== undefined) record.banned = true;
+    const run = (disabled: boolean) =>
+      updateClientUser(deps(world), ceoPrincipal, {
+        clientId: CLIENT_A,
+        userId: USER_A1,
+        disabled,
+      });
+
+    await run(false);
+    expect(world.records.get(USER_A1)?.banned).toBe(true);
+
+    await run(true);
+    await run(false);
+
+    expect(world.records.get(USER_A1)).toMatchObject({ disabled: false, banned: false });
   });
 
   it('no-op: a rename to the name the login already has writes nothing and no second account.updated', async () => {

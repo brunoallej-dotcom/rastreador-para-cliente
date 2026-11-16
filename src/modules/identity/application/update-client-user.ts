@@ -48,7 +48,9 @@ const nothingToChange = () =>
  * 1. the rename, and only when the name changes (the database function audits every call, so a rename
  *    to the same name would write a second `account.updated`). It is not about access: if it fails
  *    nothing else was touched;
- * 2. re-enabling: the Auth server is told first (unban), then the database. If the unban fails the login
+ * 2. re-enabling, and only of a login that was disabled when the request began (enabling an enabled login
+ *    is a no-op that touches nothing, so nothing can go wrong half way and no ban can be put back on an
+ *    active login, M2): the Auth server is told first (unban), then the database. If the unban fails the login
  *    is still disabled in the database and still blocked. If the database step fails AFTER the unban,
  *    the ban is put back (best effort, reported), so the login stays blocked in both places instead of
  *    "unbanned here, disabled there". Never the reverse order, where the database would say "enabled"
@@ -61,8 +63,9 @@ const nothingToChange = () =>
  *    function audits only a change of state, so repeating a disable or an enable writes no second event.
  *
  * Two CEOs disabling and enabling the same login at the same time can interleave the two systems. The
- * worst outcome is "enabled in the database, banned in Auth": the sign-in is refused (fail closed), and
- * the next PATCH of either kind repairs it (F-92a).
+ * worst outcome is "enabled in the database, banned in Auth": the sign-in is refused (fail closed). A bare
+ * enable does not repair it (the login is already enabled, so the step is skipped, M2); a disable and
+ * then an enable does (F-92a).
  */
 export async function updateClientUser(
   deps: UpdateClientUserDeps,
@@ -84,8 +87,13 @@ export async function updateClientUser(
   }
 
   if (input.disabled === false) {
-    const enabled = await enable(deps, input.userId);
-    if (!enabled.ok) return enabled;
+    // Only a login that WAS disabled has anything to enable. For one that is already enabled the whole
+    // step is skipped, the unban included: if its database step then failed, putting the ban back would
+    // lock out a login that is active (M2).
+    if (target.value.disabled) {
+      const enabled = await enable(deps, input.userId);
+      if (!enabled.ok) return enabled;
+    }
   } else if (input.disabled === true) {
     const disabled = await deps.users.setDisabled(input.userId, true);
     if (!disabled.ok) return disabled;

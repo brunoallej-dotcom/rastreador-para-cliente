@@ -130,9 +130,10 @@ async function managementTrail(userId: string) {
 
 /**
  * A client with one login that already changed its temporary password and is signed in. The session is
- * opened straight at Auth (`sessionJarFor`): the global budget of the login route (300 per 5 minutes for
- * the WHOLE run) is shared by every test file, and tests that are not about the login must not spend it
- * (two runs in a row would otherwise exhaust it). The tests that ARE about the login call the route.
+ * opened straight at Auth (`sessionJarFor`): a test that is not about the login has no reason to go
+ * through the login route (its floor, its rate limits, the pipeline), and a file this size signs in a
+ * lot (the global budget of 300 per 5 minutes is cleared before every file, but not within one). The
+ * tests that ARE about the login call the route.
  */
 async function tenantWithSignedInLogin(label = 'Cliente') {
   const tenant = await createClient(`${label} ${randomUUID().slice(0, 8)}`);
@@ -690,17 +691,44 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
     expect(await isBannedInAuth(login.id)).toBe(false);
   });
 
-  it('F-92a: a login enabled in the database but still banned in Auth (the worst interleaving of two CEOs) is refused at sign-in, and repeating the enable repairs it', async () => {
+  it('F-92a, M2: a login enabled in the database but still banned in Auth (the worst interleaving of two CEOs) is refused at sign-in; a bare enable is a no-op, and a disable followed by an enable repairs it', async () => {
     const { tenant, login } = await tenantWithSignedInLogin();
     await adminClient().auth.admin.updateUserById(login.id, { ban_duration: '876000h' });
     expect(await statusOfSignIn(login.email, login.password)).toBe('refused');
+    const patch = (disabled: boolean) =>
+      updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled });
 
-    const response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
-      disabled: false,
-    });
+    const bare = await patch(false);
+
+    await expectContract('updateClientUser', bare);
+    expect(bare.status).toBe(200);
+    expect(await statusOfSignIn(login.email, login.password)).toBe('refused');
+    for (const response of [await patch(true), await patch(false)]) {
+      await expectContract('updateClientUser', response);
+      expect(response.status).toBe(200);
+    }
+    expect(await statusOfSignIn(login.email, login.password)).toBe(200);
+  });
+
+  it('M2: an enable that fails on a login that is already enabled does not ban it', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    const spy = spyOnSupabaseFetch((url) =>
+      url.includes('/rest/v1/rpc/set_account_disabled') ? new TypeError('fetch failed') : undefined,
+    );
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+        disabled: false,
+      });
+    } finally {
+      spy.restore();
+    }
 
     await expectContract('updateClientUser', response);
+
+    // nothing was called that could fail: the login was active and it stays active and unbanned
     expect(response.status).toBe(200);
+    expect(await isBannedInAuth(login.id)).toBe(false);
     expect(await statusOfSignIn(login.email, login.password)).toBe(200);
   });
 

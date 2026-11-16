@@ -4,6 +4,8 @@ import {
   NotFoundError,
   ok,
   ServiceUnavailableError,
+  systemClock,
+  type Clock,
   type DomainError,
   type Principal,
   type Result,
@@ -16,6 +18,7 @@ import {
 } from '../domain/client-user';
 import {
   ClientArchivedError,
+  ClientUserProvisionAnswerLostError,
   ClientUserProvisionOrphanedError,
   ClientUserProvisionRolledBackError,
   EmailAlreadyRegisteredError,
@@ -37,6 +40,8 @@ export type ProvisionClientUserDeps = {
   readonly accounts: AccountAdminGateway;
   /** Default: `generateTemporaryPassword` (20 characters from the platform CSPRNG). Tests inject one. */
   readonly generatePassword?: () => string;
+  /** Default: the system clock. It stamps the start of the attempt (see `isOwnLogin`). */
+  readonly clock?: Clock;
 };
 
 export type ProvisionClientUserInput = {
@@ -97,24 +102,51 @@ async function checkBeforeCreating(
 }
 
 /**
- * The login this very request created, found by its e-mail among the logins of the client now: it was
- * not there before the request (`known`), and it is exactly what a new login is (the temporary password
- * still in use, never signed in). That is what makes it safe to delete: a login that existed before, or
- * one somebody already uses, is never taken for the request's own.
+ * The logins that might be the one this very request created, found by their e-mail among the logins of
+ * the client now: they were not there before the request (`known`), and they are exactly what a new login
+ * is (the temporary password still in use, never signed in). A login that existed before, or one somebody
+ * already uses, is never a candidate.
+ *
+ * A candidate is a CANDIDATE, not proof: another CEO may have provisioned the same address in the same
+ * client between the snapshot and the failure, and that login looks just the same. See `isOwnLogin`.
  */
-function ownLogin(
+function candidateLogins(
   state: ClientState,
   known: readonly ClientUser[],
   email: string,
-): ClientUser | undefined {
+): readonly ClientUser[] {
   const knownIds = new Set(known.map((user) => user.id));
-  return state.users.find(
+  return state.users.filter(
     (user) =>
       user.email.toLowerCase() === email &&
       !knownIds.has(user.id) &&
       user.mustChangePassword &&
       user.lastSignInAt === null,
   );
+}
+
+/**
+ * The tolerance for the clock of the database (which stamps `createdAt`) running a little behind the
+ * clock of this process (which stamps the start of the attempt). Erring this way only ever fails closed:
+ * an own login that looks older than the attempt is not deleted.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 2_000;
+
+/**
+ * Is this candidate the login of THIS attempt, so that deleting it undoes only what the attempt did?
+ * Only when it is the ONLY candidate AND it was created at or after the moment the attempt started
+ * (less the skew tolerance): a login another CEO provisioned a moment before, with the same e-mail, was
+ * created before the attempt and is never ours. With more than one candidate nobody can tell which is
+ * ours, and nothing is deleted (M1: fail closed, no destructive action on a guess).
+ */
+function isOwnLogin(
+  candidates: readonly ClientUser[],
+  attemptStartedAt: Date,
+): ClientUser | undefined {
+  const [only] = candidates;
+  if (candidates.length !== 1 || only === undefined) return undefined;
+  const earliest = attemptStartedAt.getTime() - CLOCK_SKEW_TOLERANCE_MS;
+  return only.createdAt.getTime() >= earliest ? only : undefined;
 }
 
 type Removal =
@@ -176,16 +208,20 @@ async function recordAndRead(
  * What a creation that failed with a 503-class error (an outage, a refusal of the profile trigger that
  * Auth reports as a 500 it cannot name, or an answer without an id) really was. The Auth server cannot
  * say, so the use case looks at the client again, in this order:
- * 1. is the login there? Then the creation WORKED and only its answer was lost (E-50, E-55): the account
- *    is taken back and the answer stays a 503. Never a 422, which would say "refused" about a login that
- *    exists and that nobody was given the password of (F-90);
- * 2. only when it is not: is the client archived now, or full? Then the trigger refused it (E-52): 422.
+ * 1. is a login with the e-mail there that was not there before? Then the creation WORKED and only its
+ *    answer was lost (E-50, E-55), or ANOTHER CEO provisioned the same address a moment ago. If there is
+ *    exactly one candidate and it was created at or after the start of this attempt, it is ours: the
+ *    account is taken back and the answer stays a 503. Otherwise (more than one, or an older one) nothing
+ *    is deleted: `ClientUserProvisionAnswerLostError` (503) carries the ids for the log. Never a 422,
+ *    which would say "refused" about a login that exists and that nobody was given the password of (F-90);
+ * 2. only when there is none: is the client archived now, or full? Then the trigger refused it (E-52): 422.
  * Anything else, or a look that itself fails, leaves the original failure standing.
  */
 async function explainFailedCreation(
   deps: ProvisionClientUserDeps,
   input: ProvisionClientUserInput,
   known: readonly ClientUser[],
+  attemptStartedAt: Date,
   cause: unknown,
 ): Promise<DomainError | null> {
   let state: Result<ClientState, DomainError>;
@@ -196,8 +232,16 @@ async function explainFailedCreation(
   }
   if (!state.ok) return null;
 
-  const own = ownLogin(state.value, known, input.email);
-  if (own !== undefined) return takeBack(deps, own.id, 'answer_lost', cause);
+  const candidates = candidateLogins(state.value, known, input.email);
+  if (candidates.length > 0) {
+    const own = isOwnLogin(candidates, attemptStartedAt);
+    if (own !== undefined) return takeBack(deps, own.id, 'answer_lost', cause);
+    // fail closed: never delete on a guess
+    throw new ClientUserProvisionAnswerLostError(
+      candidates.map((candidate) => candidate.id),
+      { cause: safeCauseOf(cause) },
+    );
+  }
   return roomRefusal(state.value);
 }
 
@@ -229,6 +273,8 @@ export async function provisionClientUser(
 
   const temporaryPassword = (deps.generatePassword ?? generateTemporaryPassword)();
 
+  // the moment this attempt starts: a login created before it is never the attempt's own
+  const attemptStartedAt = (deps.clock ?? systemClock).now();
   let created: Awaited<ReturnType<AccountAdminGateway['createClientUser']>>;
   try {
     created = await deps.accounts.createClientUser({
@@ -239,7 +285,13 @@ export async function provisionClientUser(
     });
   } catch (error) {
     if (error instanceof ServiceUnavailableError) {
-      const explained = await explainFailedCreation(deps, input, before.value.users, error);
+      const explained = await explainFailedCreation(
+        deps,
+        input,
+        before.value.users,
+        attemptStartedAt,
+        error,
+      );
       if (explained !== null) return err(explained);
     }
     throw error;

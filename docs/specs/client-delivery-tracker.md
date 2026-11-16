@@ -400,10 +400,15 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     temporária na mesma chamada; chama `record_account_provisioned` e relê a lista (o 201 mostra o login
     como a lista o mostra). **Depois de qualquer falha de classe 503 do `createUser`** (queda, recusa do
     gatilho, resposta sem id), o caso de uso descobre o que aconteceu antes de responder, lendo a lista do
-    cliente de novo, **nesta ordem** (F-90): (1) o login está lá, com o e-mail do pedido, **novo** (não
-    estava na lista de antes), com a senha temporária ainda em uso e sem nenhum acesso? Então a criação
-    **funcionou** e só a resposta se perdeu (E-50, E-55): a conta é apagada e a resposta é 503, nunca 422,
-    porque um 422 diria "recusado" sobre um login que existe e cuja senha ninguém recebeu; (2) só se não
+    cliente de novo, **nesta ordem** (F-90): (1) há um login com o e-mail do pedido, **novo** (não estava
+    na lista de antes), com a senha temporária ainda em uso e sem nenhum acesso? Então a criação
+    **funcionou** e só a resposta se perdeu (E-50, E-55), **ou** outro CEO provisionou o mesmo endereço
+    um instante antes. Só se houver **exatamente um** candidato e ele tiver sido criado **no começo da
+    tentativa ou depois** (menos 2 s de tolerância para o relógio do banco) ele é da tentativa: a conta é
+    apagada e a resposta é 503, nunca 422, porque um 422 diria "recusado" sobre um login que existe e cuja
+    senha ninguém recebeu. Com mais de um candidato, ou com um criado antes da tentativa, **nada é
+    apagado** (falha fechada, sem ação destrutiva por palpite): 503, e o log traz `provision_answer_lost`
+    com o id ou os ids e `deleted: false` (M1); (2) só se não
     está: o cliente está arquivado ou cheio agora? Então o gatilho do perfil recusou (o Auth devolve só um
     500 sem nome) e a resposta é 422 `CLIENT_ARCHIVED` ou `USER_LIMIT_REACHED` (E-52). Uma criação que o
     Auth aceita e responde **sem id de usuário** é `ClientUserProvisionUnconfirmedError` (503, nunca 500):
@@ -417,7 +422,10 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     deixa de devolver o usuário: é o bloqueio que vale) e bane no Auth depois (`ban_duration` de um
     século), como segunda trava; reativar tira o ban **antes** de reativar no banco, nunca o contrário (o
     banco não pode dizer "ativo" enquanto o Auth ainda recusa o login), e, se o passo do banco falha depois
-    do desbanir, **recoloca o ban** (E-56) para o login seguir bloqueado nos dois lugares. O ban que falha
+    do desbanir, **recoloca o ban** (E-56) para o login seguir bloqueado nos dois lugares. **Só um login
+    que estava desativado no começo do pedido** passa por isso: reativar um login que já está ativo não
+    toca em nada (nem o desbanir, nem o banco, nem o re-ban), porque um re-ban depois de uma falha
+    trancaria para fora um login ativo (M2). O ban que falha
     depois de o banco desativar não desfaz nada e continua 200 (E-24), mas é registrado em `error` com o
     motivo (`unavailable`, `not_found` ou `unexpected`); só esses três são engolidos, e um erro que
     ninguém classificou sobe. Repetir o mesmo `PATCH` repara, e `{ "disabled": true }` tenta o ban de novo
@@ -425,8 +433,8 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     desativar ou reativar não grava um segundo evento; o **renomear** para o nome que o login já tem é
     pulado (a função audita toda chamada). O renomear vai antes de tudo, por não ser sobre acesso. Dois
     CEOs que desativam e reativam o mesmo login ao mesmo tempo podem intercalar os dois sistemas; o pior
-    resultado é "ativo no banco, banido no Auth", que recusa o login (falha fechada) até o próximo
-    `PATCH` consertar (F-92a).
+    resultado é "ativo no banco, banido no Auth", que recusa o login (falha fechada). Reativar de novo
+    não conserta (o login já está ativo, e o passo é pulado); **desativar e reativar** conserta (F-92a).
   - **Resetar a senha:** grava a senha nova no Auth **antes** de `require_password_change` (§3.4), que
     renova a linha de base das 72 h (F-41, E-35), exige a troca e apaga as sessões. O Auth também derruba
     as sessões do usuário quando a senha é trocada (observado no Auth local). **Qualquer** resultado ruim
@@ -1119,13 +1127,13 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
-| E-50 | Provisionar: o Auth criou a conta mas a resposta se perdeu (timeout depois do commit) | Antes de responder, o caso de uso relê a lista do cliente e acha o login novo pelo e-mail: apaga a conta e responde 503, sem nada pela metade e nunca 422 (mesmo que o cliente tenha ficado cheio por causa dela); repetir dá 201. Se a exclusão também falha: 503, `identity.client_user.provision_answer_lost` em `error` com o id e o porquê da falha; o login fica na lista, repetir dá 409 `EMAIL_ALREADY_REGISTERED` e um reset da senha o entrega |
+| E-50 | Provisionar: o Auth criou a conta mas a resposta se perdeu (timeout depois do commit) | Antes de responder, o caso de uso relê a lista do cliente e acha o login novo pelo e-mail: se há exatamente um candidato e ele foi criado no começo da tentativa ou depois, apaga a conta e responde 503, sem nada pela metade e nunca 422 (mesmo que o cliente tenha ficado cheio por causa dela); repetir dá 201. Com mais de um candidato, ou com um criado antes da tentativa (outro CEO provisionou o mesmo endereço um instante antes), **não apaga nada**: 503 e `identity.client_user.provision_answer_lost` em `error` com os ids e `deleted: false`. Se a exclusão também falha: 503, o mesmo evento com o id e o porquê da falha; o login fica na lista, repetir dá 409 `EMAIL_ALREADY_REGISTERED` e um reset da senha o entrega |
 | E-51 | Resetar: o Auth já guardou a senha nova e o passo do banco (`require_password_change`) falha por **qualquer** motivo (queda mesmo com a segunda tentativa, 403 de atestado vencido, 404, entrada recusada) | 503 e `identity.client_user.reset_incomplete` em `error`, com só o tipo, o SQLSTATE e o status. A senha antiga e as sessões já não valem; faltam `CHANGE_PASSWORD`, a linha de base nova e a auditoria. A senha nova não é mostrada; repetir o reset conclui. Se a segunda tentativa de uma queda funciona, o reset conclui na mesma chamada (e, se a primeira tinha gravado com a resposta perdida, a auditoria ganha um segundo `account.password_reset`) |
 | E-52 | Provisionar com várias chamadas disputando as últimas vagas do cliente, ou com o cliente arquivado entre a checagem e a criação | O gatilho do perfil decide (trava o cliente) e o caso de uso explica, **só depois de ver que o login não existe**: as que cabem recebem 201 e as outras 422 `USER_LIMIT_REACHED` (ou 422 `CLIENT_ARCHIVED`), nunca 503 |
 | E-53 | Provisionar: o registro falha e a compensação (apagar a conta) também | 503, `identity.client_user.provision_orphaned` em `error` com o id da conta e o porquê da falha da exclusão. O login está na lista, nascido com uma senha que ninguém recebeu; a recuperação é resetar a senha (ou desativar) |
 | E-54 | Cliente arquivado com logins que já existem | Eles continuam entrando; o CEO ainda lista, renomeia, desativa, reativa e reseta; só provisionar login novo é 422 `CLIENT_ARCHIVED` (E-16, F-58) |
 | E-55 | Provisionar: o Auth aceita a criação e responde sem id de usuário (corpo sem `user`) | 503, nunca 500. A conta existe e não tem nome: o caso de uso a acha pelo e-mail na lista do cliente e a apaga (como E-50); se não a acha, `identity.client_user.provision_unconfirmed` em `error` (sem e-mail e sem id) e o `detail` manda procurar na lista antes de repetir |
-| E-56 | Reativar: o Auth já tirou o ban e o passo do banco (`set_account_disabled`) falha | 503. O ban é recolocado (melhor esforço) para o login seguir bloqueado nos dois lugares, e `identity.client_user.reban_after_failed_enable` sai em `error` (`rebanned` diz se deu certo); repetir a reativação conclui |
+| E-56 | Reativar um login que estava desativado: o Auth já tirou o ban e o passo do banco (`set_account_disabled`) falha (reativar um login que já está ativo não chama nada, M2) | 503. O ban é recolocado (melhor esforço) para o login seguir bloqueado nos dois lugares, e `identity.client_user.reban_after_failed_enable` sai em `error` (`rebanned` diz se deu certo); repetir a reativação conclui |
 | E-25 | CEO perde o dispositivo do TOTP | Fora da API: runbook com script operacional (Onda 11) |
 | E-26 | Enroll com fator não verificado pendente | Remove o fator não verificado antigo e cria um novo |
 | E-27 | Enroll com fator já verificado | 409 `MFA_ALREADY_ENROLLED` |

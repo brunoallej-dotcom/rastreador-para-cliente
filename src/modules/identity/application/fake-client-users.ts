@@ -283,6 +283,8 @@ export function createFakeClientUsers(
         sessions: 0,
         provisioned: false,
         passwordBaselines: 1,
+        // stamped like the profile is, by the database, at the moment of the creation
+        createdAt: new Date(),
       });
       leave(lose, 'createClientUser');
       if (withoutId) {
