@@ -331,6 +331,30 @@ describe('list', () => {
     );
   });
 
+  it('the stage name is held to what the table and the contract hold: 1 to 120 CHARACTERS, counted by code point', async () => {
+    const accepted = ['A', 'a'.repeat(120), '\u{1F600}'.repeat(120)];
+    for (const name of accepted) {
+      const { events } = queriesOver([
+        PROCESS_FOUND,
+        answer([eventRow(1, 'stage.approved', null, S1)]),
+        answer([{ id: S1, position: 1, name }]),
+      ]);
+      const page = await events.list(P1, { limit: 50 });
+      expect(page?.items[0]?.details.stageName).toBe(name);
+    }
+
+    for (const name of ['', 'a'.repeat(121), '\u{1F600}'.repeat(121)]) {
+      const { events } = queriesOver([
+        PROCESS_FOUND,
+        answer([eventRow(1, 'stage.approved', null, S1)]),
+        answer([{ id: S1, position: 1, name }]),
+      ]);
+      await expect(events.list(P1, { limit: 50 })).rejects.toThrow(
+        'the stages table returned a row that is not understood',
+      );
+    }
+  });
+
   it('F-53: a position the database cannot read (class 22) is a 400 on query.cursor', async () => {
     const { events } = queriesOver([PROCESS_FOUND, failure('22003', 'bigint out of range')]);
 

@@ -16,7 +16,8 @@ import { POST as approvalsRoute } from '@/app/api/v1/admin/processes/[processId]
 import { GET as eventsRoute } from '@/app/api/v1/admin/processes/[processId]/events/route';
 import type { Process } from '@/modules/tracking/domain/process';
 import { expectToMatchContract } from './contract';
-import { adminClient, createCeo } from './fixtures';
+import { readApprovalRows, readAuditIds } from './db';
+import { createCeo } from './fixtures';
 import { bodyOf, invoke, type CookieStore, type InvokeInit } from './http';
 import { completeFirstAccess, enrollTotp, loginViaApi, verifyTotp, type CeoWithMfa } from './mfa';
 import type { ProcessDetailBody } from './processes';
@@ -123,37 +124,17 @@ export async function listAllEvents(
   throw new Error('the timeline did not end within the page limit');
 }
 
-export type ApprovalRow = {
-  id: string;
-  process_stage_id: string;
-  process_id: string;
-  approved_by: string;
-  approved_at: string;
-};
+export type { ApprovalRow } from './db';
 
-/** The approvals of a process, oldest first, read with the secret key (a fixture, not a behavior). */
-export async function approvalRowsOf(processId: string): Promise<ApprovalRow[]> {
-  const { data, error } = await adminClient()
-    .from('stage_approvals')
-    .select('id, process_stage_id, process_id, approved_by, approved_at')
-    .eq('process_id', processId)
-    .order('approved_at', { ascending: true });
-  if (error) throw new Error(`reading approvals failed: ${error.message}`);
-  return data;
-}
+/**
+ * The approvals of a process, oldest first, read in the database container (`readApprovalRows` in
+ * db.ts): a fixture to CHECK a response with, never a way to produce one, and not through the secret
+ * key, which may lose its access to `stage_approvals` (Wave 10.1, F-81).
+ */
+export const approvalRowsOf = readApprovalRows;
 
-/** The audit events of a process with their ids, oldest id first, read with the secret key. */
-export async function auditIdsOfProcess(
-  processId: string,
-): Promise<{ id: number; action: string; resource_id: string }[]> {
-  const { data, error } = await adminClient()
-    .from('audit_events')
-    .select('id, action, resource_id')
-    .eq('process_id', processId)
-    .order('id', { ascending: true });
-  if (error) throw new Error(`reading the audit trail failed: ${error.message}`);
-  return data;
-}
+/** The audit events of a process with their ids, oldest id first, read in the database container. */
+export const auditIdsOfProcess = readAuditIds;
 
 /**
  * An API body as the aggregate: dates become `Date`, the approval of a completed stage becomes the

@@ -4,6 +4,10 @@ import {
   asCeoSql,
   cancelProcessSql,
   lockProcessSql,
+  lockStageSql,
+  OPEN_TRANSACTION_SQL,
+  parseBackendPid,
+  REPORT_PID_SQL,
   type CeoIdentity,
 } from './held-transaction';
 
@@ -21,6 +25,15 @@ describe('the statements of a held transaction (what a test sends to the databas
     );
   });
 
+  it('lockStageSql takes ONLY the stage row, FOR NO KEY UPDATE: the lock an approval takes second', () => {
+    const sql = lockStageSql(STAGE_ID);
+
+    expect(sql).toBe(
+      `SELECT id FROM public.process_stages WHERE id = '${STAGE_ID}' FOR NO KEY UPDATE;`,
+    );
+    expect(sql).not.toContain('public.processes');
+  });
+
   it('asCeoSql becomes the attested CEO: the authenticated role and the claims PostgREST would set', () => {
     const sql = asCeoSql(IDENTITY);
 
@@ -32,6 +45,16 @@ describe('the statements of a held transaction (what a test sends to the databas
       aal: 'aal2',
       session_id: IDENTITY.sessionId,
     });
+  });
+
+  it('asCeoSql also sets the request id header, so the audit rows it writes carry a request_id like the API ones', () => {
+    const sql = asCeoSql(IDENTITY);
+
+    const headers = /set_config\('request\.headers', '([^']+)', true\)/.exec(sql)?.[1];
+    const requestId = (JSON.parse(headers ?? 'null') as Record<string, string>)['x-request-id'];
+    expect(requestId).toBeDefined();
+    // the same shape the audit table accepts (`audit_events.request_id` CHECK)
+    expect(requestId).toMatch(/^[A-Za-z0-9-]{1,64}$/);
   });
 
   it('cancelProcessSql and approveStageSql call the REAL functions, as the CEO, and give the role back', () => {
@@ -54,10 +77,65 @@ describe('the statements of a held transaction (what a test sends to the databas
     ['a UUID with a trailing space', `${PROCESS_ID} `],
   ])('refuses %s anywhere an id reaches the SQL text', (_label, bad) => {
     expect(() => lockProcessSql(bad)).toThrow(/not a UUID/);
+    expect(() => lockStageSql(bad)).toThrow(/not a UUID/);
     expect(() => cancelProcessSql(IDENTITY, bad)).toThrow(/not a UUID/);
     expect(() => approveStageSql(IDENTITY, bad, STAGE_ID)).toThrow(/not a UUID/);
     expect(() => approveStageSql(IDENTITY, PROCESS_ID, bad)).toThrow(/not a UUID/);
     expect(() => asCeoSql({ ...IDENTITY, userId: bad })).toThrow(/not a UUID/);
     expect(() => asCeoSql({ ...IDENTITY, sessionId: bad })).toThrow(/not a UUID/);
   });
+});
+
+describe('the limits of a held session (F-108: it never outlives its test)', () => {
+  const seconds = (limit: string) =>
+    Number(new RegExp(`${limit} = '(\\d+)s'`).exec(OPEN_TRANSACTION_SQL)?.[1]);
+
+  it('sets a lock timeout, a statement timeout and an idle-in-transaction timeout, all below the 30 s test timeout', () => {
+    for (const limit of [
+      'lock_timeout',
+      'statement_timeout',
+      'idle_in_transaction_session_timeout',
+    ]) {
+      const value = seconds(limit);
+      expect(Number.isFinite(value), limit).toBe(true);
+      expect(value, limit).toBeGreaterThan(0);
+      expect(value, limit).toBeLessThan(30);
+    }
+    // the database rolls an abandoned transaction back before vitest gives up on the test
+    expect(seconds('idle_in_transaction_session_timeout')).toBeLessThan(30);
+    expect(seconds('lock_timeout')).toBeLessThanOrEqual(seconds('statement_timeout'));
+  });
+
+  it('applies the limits before the transaction begins, so none of them is lost to a rollback', () => {
+    expect(OPEN_TRANSACTION_SQL.indexOf('lock_timeout')).toBeLessThan(
+      OPEN_TRANSACTION_SQL.indexOf('BEGIN;'),
+    );
+    expect(OPEN_TRANSACTION_SQL.endsWith('BEGIN;')).toBe(true);
+    expect(OPEN_TRANSACTION_SQL).not.toContain('SET LOCAL');
+  });
+
+  it('reports the backend pid first, with the statement a test can recognize in the output', () => {
+    expect(REPORT_PID_SQL).toBe("SELECT 'held_backend_pid=' || pg_backend_pid();");
+  });
+});
+
+describe('parseBackendPid (what the cleanup trusts to end a session)', () => {
+  it('reads the pid the session printed, whatever else psql printed around it', () => {
+    expect(parseBackendPid('held_backend_pid=4242\n__held_transaction_step_1__\n')).toBe(4242);
+    expect(parseBackendPid('noise\nheld_backend_pid=7\n')).toBe(7);
+  });
+
+  it.each([
+    ['no output', ''],
+    ['no marker', '4242\n'],
+    ['a marker with no number', 'held_backend_pid=\n'],
+    ['a marker with text', 'held_backend_pid=abc\n'],
+    ['a zero pid', 'held_backend_pid=0\n'],
+    ['a pid beyond what a number holds exactly', `held_backend_pid=${'9'.repeat(20)}\n`],
+  ])(
+    'fails on %s: a cleanup that guessed a pid could end the wrong backend, or none',
+    (_label, output) => {
+      expect(() => parseBackendPid(output)).toThrow(/did not report its backend pid/);
+    },
+  );
 });

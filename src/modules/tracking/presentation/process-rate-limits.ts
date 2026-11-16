@@ -4,8 +4,8 @@ const ONE_MINUTE_SECONDS = 60;
 
 /**
  * `x-rate-limit` of the process reads (`listClientProcesses`, `getProcess`,
- * `getDefaultStageTemplate`): 300 per minute per CEO, in the shared `reads` counter. Equal to the
- * contract; the handler tests compare them.
+ * `getDefaultStageTemplate`, `listProcessEvents`): 300 per minute per CEO, in the shared `reads`
+ * counter. Equal to the contract; the handler tests compare them.
  */
 export const PROCESS_READ_RULE = {
   scope: 'user',
@@ -15,8 +15,9 @@ export const PROCESS_READ_RULE = {
 } as const satisfies RateLimitRule;
 
 /**
- * `x-rate-limit` of the process writes (`createProcess`, `updateProcess`): 60 per minute per CEO, in
- * the shared `writes` counter. Equal to the contract; the handler tests compare them.
+ * `x-rate-limit` of the process writes (`createProcess`, `updateProcess`, `approveCurrentStage`): 60
+ * per minute per CEO, in the shared `writes` counter. Equal to the contract; the handler tests compare
+ * them.
  */
 export const PROCESS_WRITE_RULE = {
   scope: 'user',

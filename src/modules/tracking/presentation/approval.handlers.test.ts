@@ -3,11 +3,14 @@ import { fileURLToPath } from 'node:url';
 import type { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
+import { expectToMatchContract } from '../../../../tests/helpers/contract';
 import * as approvalsRoute from '@/app/api/v1/admin/processes/[processId]/approvals/route';
 import * as eventsRoute from '@/app/api/v1/admin/processes/[processId]/events/route';
 import { encodeCursor } from '@/shared/http';
 import type { NextRouteHandler, RuntimePolicy, WithRoute } from '@/shared/http/route-policy';
 import { apiRequest, createTestPipeline, principalFixture } from '@/shared/http/testing';
+import { createFakeProcessRepository } from '../application/fake-process-repository';
+import { CLIENT_A, processFixture, stageIdOf } from '../application/process-fixtures';
 import {
   approveCurrentStageHandler,
   createApproveCurrentStageHandler,
@@ -16,6 +19,14 @@ import {
   createListProcessEventsHandler,
   listProcessEventsHandler,
 } from './list-process-events.handler';
+
+// The handler builds its repository from the Supabase client of the request. The tests that reach the use case
+// (the contract of the answers, below) swap it for a fake that runs the aggregate's real transitions; the
+// others never get past the pipeline, and `forbidOutbound` proves it.
+const repositoryHolder = vi.hoisted((): { current: unknown } => ({ current: undefined }));
+vi.mock('../infrastructure/supabase-process-repository', () => ({
+  createSupabaseProcessRepository: () => repositoryHolder.current,
+}));
 
 type ContractOperation = {
   operationId: string;
@@ -345,6 +356,93 @@ describe('the pipeline in front of the approval and timeline routes (spec §3.5)
       }
       expect(outbound).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('the answers of approveCurrentStage match the contract (a fake repository behind the real pipeline)', () => {
+  const FAKE_PROCESS_ID = '00000000-0000-4000-8000-0000000001a1';
+
+  /** Calls the handler as a CEO aal2 with `expectedStageId`, against a fake holding `processes`. */
+  async function approveAgainst(
+    processes: ReturnType<typeof processFixture>[],
+    processId: string,
+    expectedStageId: string,
+  ) {
+    repositoryHolder.current = createFakeProcessRepository({ clients: [CLIENT_A], processes });
+    const { withRoute } = createTestPipeline({ principal: principalFixture() });
+    const response = await call(
+      createApproveCurrentStageHandler(withRoute),
+      { processId },
+      apiRequest(`/admin/processes/${processId}/approvals`, {
+        method: 'POST',
+        json: { expectedStageId },
+      }),
+    );
+    return { response, body: (await response.clone().json()) as Record<string, unknown> };
+  }
+
+  it('E-01: a stale stage is 409 STALE_STAGE with the id of the stage that is current', async () => {
+    const { response, body } = await approveAgainst(
+      [processFixture({ id: FAKE_PROCESS_ID })],
+      FAKE_PROCESS_ID,
+      stageIdOf(3),
+    );
+
+    expect(response.status).toBe(409);
+    expect(body).toMatchObject({ code: 'STALE_STAGE', currentStageId: stageIdOf(1) });
+    expectToMatchContract('approveCurrentStage', 409, body, response);
+  });
+
+  it('E-72: a stale stage on a process with no stage in progress is 409 with currentStageId null, and the contract allows the null', async () => {
+    // an active process with no stage in progress breaks I2: the aggregate answers StaleStageError(null)
+    const { response, body } = await approveAgainst(
+      [processFixture({ id: FAKE_PROCESS_ID, statuses: ['pending', 'pending', 'pending'] })],
+      FAKE_PROCESS_ID,
+      stageIdOf(1),
+    );
+
+    expect(response.status).toBe(409);
+    expect(body).toMatchObject({ code: 'STALE_STAGE' });
+    expect(body['currentStageId']).toBeNull();
+    expectToMatchContract('approveCurrentStage', 409, body, response);
+  });
+
+  it('E-03: a cancelled process is 422 PROCESS_NOT_ACTIVE', async () => {
+    const { response, body } = await approveAgainst(
+      [
+        processFixture({
+          id: FAKE_PROCESS_ID,
+          status: 'cancelled',
+          cancelledAt: new Date('2026-01-02T00:00:00.000Z'),
+        }),
+      ],
+      FAKE_PROCESS_ID,
+      stageIdOf(1),
+    );
+
+    expect(response.status).toBe(422);
+    expect(body).toMatchObject({ code: 'PROCESS_NOT_ACTIVE' });
+    expectToMatchContract('approveCurrentStage', 422, body, response);
+  });
+
+  it('an unknown process is 404 NOT_FOUND', async () => {
+    const { response, body } = await approveAgainst([], FAKE_PROCESS_ID, stageIdOf(1));
+
+    expect(response.status).toBe(404);
+    expect(body).toMatchObject({ code: 'NOT_FOUND' });
+    expectToMatchContract('approveCurrentStage', 404, body, response);
+  });
+
+  it('AC-16: an approval is 200 with the process, and the answer matches the contract', async () => {
+    const { response, body } = await approveAgainst(
+      [processFixture({ id: FAKE_PROCESS_ID })],
+      FAKE_PROCESS_ID,
+      stageIdOf(1),
+    );
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ status: 'active', version: 2, completedStages: 1 });
+    expectToMatchContract('approveCurrentStage', 200, body, response);
   });
 });
 

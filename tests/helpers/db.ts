@@ -435,30 +435,126 @@ export async function resetGlobalLoginBudget(): Promise<number> {
 
 /** The name of a database routine (`approve_current_stage`): lowercase words joined by underscores. */
 const ROUTINE_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
+/** A Postgres backend pid is an OS process id: a positive 32-bit integer. */
+const MAX_BACKEND_PID = 2 ** 31 - 1;
+
+function assertBackendPid(pid: number, what: string): void {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > MAX_BACKEND_PID) {
+    throw new Error(`${what}: the pid is not a positive integer`);
+  }
+}
 
 /**
  * The statement that counts the backends of this database that are WAITING FOR A LOCK while running a
- * statement that names `routine` (Wave 9: an approval parked behind a lock that a test holds in a second
- * session). A test uses it to know that every request it fired is blocked inside the function, so the
- * requests are truly simultaneous, without a sleep and without guessing a delay. The name is checked
- * against a plain-routine-name pattern and compared with `position()`, so no character of it is a
- * pattern and nothing but `[a-z0-9_]` ever reaches the SQL text.
+ * statement that names `routine`, and that are blocked by the session with pid `blockerPid`, directly or
+ * through other waiters (Wave 9: requests parked behind a lock that a test holds in a second session).
+ * A test uses it to know that every request it fired is blocked inside the function, so the requests are
+ * truly simultaneous, without a sleep and without guessing a delay.
+ *
+ * "Blocked by the held session" is the recursive part. Row-lock waiters queue: the first waits for the
+ * transaction that holds the row, and the next ones wait for the first (`pg_blocking_pids` names the
+ * first, not the holder). An approval parked behind the held session holds the process lock, so a
+ * cancellation parked behind THAT approval is blocked by the held session too, through it: counting only
+ * the direct waiters would miss exactly the case the lock-order test is about. Anything not blocked by
+ * the held session, another test's or another process's requests included, is not counted.
+ *
+ * The routine is checked against a plain-routine-name pattern and compared with `position()`, so no
+ * character of it is a pattern; the pid is a validated positive integer. Nothing else reaches the SQL.
  */
-export function lockWaitersSql(routine: string): string {
+export function lockWaitersSql(routine: string, blockerPid: number): string {
   if (!ROUTINE_PATTERN.test(routine)) {
     throw new Error('lockWaitersSql: the routine is not a plain routine name');
   }
+  assertBackendPid(blockerPid, 'lockWaitersSql');
   return (
-    'SELECT count(*)::int AS waiting FROM pg_stat_activity ' +
-    "WHERE datname = current_database() AND wait_event_type = 'Lock' " +
-    `AND position('${routine}' IN query) > 0`
+    'WITH RECURSIVE blocked (pid) AS (' +
+    'SELECT a.pid FROM pg_stat_activity a ' +
+    `WHERE a.datname = current_database() AND ${blockerPid} = ANY (pg_blocking_pids(a.pid)) ` +
+    'UNION ' +
+    'SELECT a.pid FROM pg_stat_activity a JOIN blocked b ON b.pid = ANY (pg_blocking_pids(a.pid)) ' +
+    'WHERE a.datname = current_database()' +
+    ') ' +
+    'SELECT count(*)::int AS waiting FROM pg_stat_activity a JOIN blocked b ON b.pid = a.pid ' +
+    `WHERE a.wait_event_type = 'Lock' AND position('${routine}' IN a.query) > 0`
   );
 }
 
-/** How many backends are waiting for a lock inside a statement that names `routine` (see `lockWaitersSql`). */
-export async function countLockWaiters(routine: string): Promise<number> {
-  const rows = await queryLocal(lockWaitersSql(routine));
+/**
+ * How many backends are waiting for a lock inside a statement that names `routine`, blocked by the
+ * session `blockerPid` (see `lockWaitersSql`).
+ */
+export async function countLockWaiters(routine: string, blockerPid: number): Promise<number> {
+  const rows = await queryLocal(lockWaitersSql(routine, blockerPid));
   const row = z.array(z.object({ waiting: z.number().int().nonnegative() })).parse(rows)[0];
   if (row === undefined) throw new Error('countLockWaiters: the database counted nothing');
   return row.waiting;
+}
+
+/**
+ * The statement that ends a held session from the database side (Wave 9, F-108): the test's psql was
+ * started by a test and nothing else may own it, so it is matched by user and application name as well
+ * as by pid, and a pid that was recycled by another backend (PostgREST connects as `authenticator`) is
+ * never touched. A pid that is already gone matches no row.
+ */
+export function terminateBackendSql(pid: number): string {
+  assertBackendPid(pid, 'terminateBackendSql');
+  return (
+    'SELECT pg_terminate_backend(a.pid) AS terminated FROM pg_stat_activity a ' +
+    `WHERE a.pid = ${pid} AND a.pid <> pg_backend_pid() AND a.usename = 'postgres' ` +
+    "AND a.application_name = 'psql'"
+  );
+}
+
+/** Ends a held session by pid, whatever state its psql client is in (see `terminateBackendSql`). */
+export async function terminateBackend(pid: number): Promise<void> {
+  await queryLocal(terminateBackendSql(pid));
+}
+
+/** The approvals of a process, oldest first. */
+export type ApprovalRow = {
+  id: string;
+  process_stage_id: string;
+  process_id: string;
+  approved_by: string;
+  approved_at: string;
+};
+
+const approvalRowsSchema = z.array(
+  z.object({
+    id: z.string(),
+    process_stage_id: z.string(),
+    process_id: z.string(),
+    approved_by: z.string(),
+    approved_at: z.string(),
+  }),
+);
+
+/**
+ * The approvals of a process, oldest first, read in the database container. A read for a test to CHECK
+ * a response against, never a way to produce one; it does not go through the secret key, which may lose
+ * its access to `stage_approvals` (Wave 10.1, F-81).
+ */
+export async function readApprovalRows(processId: string): Promise<ApprovalRow[]> {
+  assertUuid(processId, 'readApprovalRows');
+  const rows = await queryLocal(
+    'SELECT id, process_stage_id, process_id, approved_by, approved_at FROM public.stage_approvals ' +
+      `WHERE process_id = '${processId}' ORDER BY approved_at, id`,
+  );
+  return approvalRowsSchema.parse(rows);
+}
+
+const auditIdRowsSchema = z.array(
+  z.object({ id: z.number().int().positive(), action: z.string(), resource_id: z.string() }),
+);
+
+/** The audit events of a process with their ids, oldest id first, read in the database container. */
+export async function readAuditIds(
+  processId: string,
+): Promise<{ id: number; action: string; resource_id: string }[]> {
+  assertUuid(processId, 'readAuditIds');
+  const rows = await queryLocal(
+    'SELECT id, action, resource_id FROM public.audit_events ' +
+      `WHERE process_id = '${processId}' ORDER BY id`,
+  );
+  return auditIdRowsSchema.parse(rows);
 }

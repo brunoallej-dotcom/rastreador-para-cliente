@@ -163,6 +163,8 @@ describe('POST /admin/processes/{processId}/approvals', () => {
       const body = await expectContract<ProcessDetailBody>('approveCurrentStage', response);
 
       expect(response.status).toBe(200);
+      // AC-22: a 200 that carries who approved what is never cached
+      expect(response.headers.get('cache-control')).toBe('no-store');
       expect(body).toMatchObject({
         id: process.id,
         status: 'active',
@@ -712,24 +714,76 @@ describe('who may give the "Ok"', () => {
 
 describe('the rate limit of the approval (x-rate-limit: 60 / min per CEO)', () => {
   // A CEO of its own: the 60 writes it spends must not come out of the budget of any other test.
+  // The window is FIXED and aligned to the clock (`floor(epoch / 60) * 60`, rate_limit_hit), so a minute
+  // boundary can fall in the middle of the loop and give the CEO a fresh count. The loop therefore goes
+  // on, up to two windows and a call, until the first 429, and the test asserts what holds either way:
+  // that 429 comes only after the limit was reached once (call 61 or later), and that every call before
+  // it answered as an approval of an unknown process does (404).
   it('SEC-09: the approval after the 60th in a minute is 429 RATE_LIMITED with a Retry-After, and the answer matches the contract', async () => {
     const spender = await loginAsNamedCeo(`Eli ${uniqueProcessTitle('').trim()}`);
     const limit = 60;
+    const maxCalls = limit * 2 + 1;
 
-    for (let call = 0; call < limit; call += 1) {
+    let limited: Response | undefined;
+    let calls = 0;
+    while (limited === undefined && calls < maxCalls) {
       const response = await approveViaApi(spender.cookies, UNKNOWN_ID, {
         expectedStageId: UNKNOWN_ID,
       });
-      if (response.status !== 404) throw new Error(`call ${call + 1} answered ${response.status}`);
+      calls += 1;
+      if (response.status === 429) limited = response;
+      else if (response.status !== 404)
+        throw new Error(`call ${calls} answered ${response.status}`);
     }
-    const response = await approveViaApi(spender.cookies, UNKNOWN_ID, {
-      expectedStageId: UNKNOWN_ID,
-    });
-    const body = await expectContract<Problem>('approveCurrentStage', response);
 
-    expect(outcomeOf(response, body)).toEqual([429, 'RATE_LIMITED']);
-    expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
-  });
+    expect(limited).toBeDefined();
+    if (limited === undefined) return;
+    // the calls that got through are at most the limit of each window they fell in (two windows at most)
+    expect(calls).toBeGreaterThanOrEqual(limit + 1);
+    const body = await expectContract<Problem>('approveCurrentStage', limited);
+    expect(outcomeOf(limited, body)).toEqual([429, 'RATE_LIMITED']);
+    const retryAfter = Number(limited.headers.get('retry-after'));
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+  }, 120_000);
+});
+
+describe('the rate limit of the timeline (x-rate-limit: 300 / min per CEO, the shared reads counter)', () => {
+  const READ_LIMIT = 300;
+  const BATCH = 25;
+  /** More than two windows of reads: a minute boundary in the middle cannot hide the cap (see the approval's). */
+  const MAX_READS = READ_LIMIT * 2 + BATCH;
+
+  // A CEO of its own: the 300 reads it spends must not come out of the budget of any other test. Reading
+  // the timeline of an unknown process answers 404 and counts the same: the cap is the pipeline's.
+  it('SEC-09: the timeline read after the 300th in a minute is 429 RATE_LIMITED with a Retry-After, and the answer matches the contract', async () => {
+    const reader = await loginAsNamedCeo(`Gabi ${uniqueProcessTitle('').trim()}`);
+
+    const throttled: Response[] = [];
+    let answered = 0;
+    for (let sent = 0; sent < MAX_READS && throttled.length === 0; sent += BATCH) {
+      const batch = await Promise.all(
+        Array.from({ length: BATCH }, () => listEventsViaApi(reader.cookies, UNKNOWN_ID)),
+      );
+      for (const response of batch) {
+        if (response.status === 429) throttled.push(response);
+        else if (response.status === 404) answered += 1;
+        else throw new Error(`a read answered ${response.status}, neither 404 nor 429`);
+      }
+    }
+
+    expect(throttled.length).toBeGreaterThanOrEqual(1);
+    // the reads that got through are at most the limit of the window they fell in (two windows at most)
+    expect(answered).toBeGreaterThanOrEqual(1);
+    expect(answered).toBeLessThanOrEqual(READ_LIMIT * 2);
+    for (const response of throttled) {
+      const body = await expectContract<Problem>('listProcessEvents', response);
+      expect(outcomeOf(response, body)).toEqual([429, 'RATE_LIMITED']);
+      const retryAfter = Number(response.headers.get('retry-after'));
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(60);
+    }
+  }, 180_000);
 });
 
 // -------------------------------------------------------------------------------- concurrency ----
@@ -757,11 +811,11 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
         approveViaApi(session.cookies, process.id, { expectedStageId: stageAt(process, 1).id }),
       );
       // every request is inside approve_current_stage, blocked on the row the second session holds
-      await waitForLockWaiters('approve_current_stage', sessions.length);
+      await waitForLockWaiters(held, 'approve_current_stage', sessions.length);
       await held.commit();
       responses = await Promise.all(requests);
     } finally {
-      held.abort();
+      await held.abort();
     }
 
     expect(responses.map((response) => response.status).sort()).toEqual([200, 409, 409, 409]);
@@ -817,11 +871,11 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
       const queued = approveViaApi(bia.cookies, process.id, {
         expectedStageId: stageAt(process, 1).id,
       });
-      await waitForLockWaiters('approve_current_stage', 1);
+      await waitForLockWaiters(held, 'approve_current_stage', 1);
       await held.commit();
       response = await queued;
     } finally {
-      held.abort();
+      await held.abort();
     }
 
     await expectStale(response, stageAt(process, 2).id);
@@ -842,11 +896,11 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
       const queued = approveViaApi(ana.cookies, process.id, {
         expectedStageId: stageAt(process, 1).id,
       });
-      await waitForLockWaiters('approve_current_stage', 1);
+      await waitForLockWaiters(held, 'approve_current_stage', 1);
       await held.commit();
       response = await queued;
     } finally {
-      held.abort();
+      await held.abort();
     }
 
     // had the approval read the status before taking the lock, it would have completed a stage of a
@@ -872,11 +926,11 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
       // the REAL approve_current_stage, not committed: it holds the process lock
       await held.approveStage(approver, process.id, stageAt(process, 1).id);
       const queued = updateProcessViaApi(bia.cookies, process.id, { status: 'cancelled' });
-      await waitForLockWaiters('update_process', 1);
+      await waitForLockWaiters(held, 'update_process', 1);
       await held.commit();
       response = await queued;
     } finally {
-      held.abort();
+      await held.abort();
     }
 
     const body = await expectContract<ProcessDetailBody>('updateProcess', response);
@@ -893,7 +947,50 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
     expect(state.approvals).toEqual([stageAt(process, 1).id]);
   });
 
-  it('F-82: approvals and cancellations racing on fresh processes always end in one of the two causal histories: never an approval after the cancellation, never a 500 or a deadlock', async () => {
+  it('F-82: an approval that holds the process lock while it waits for the stage parks a cancellation behind it, and the approval goes first (stage-first ordering would let the cancellation through at once)', async () => {
+    const process = await newProcess(creator.cookies, 3);
+    const held = await openHeldTransaction();
+    let approve: Response;
+    let cancel: Response;
+    try {
+      // ONLY the current stage row is held: the process row is free
+      await held.lockStage(stageAt(process, 1).id);
+      const approving = approveViaApi(ana.cookies, process.id, {
+        expectedStageId: stageAt(process, 1).id,
+      });
+      // the approval has the process lock (taken first) and waits for the stage row
+      await waitForLockWaiters(held, 'approve_current_stage', 1);
+      const cancelling = updateProcessViaApi(bia.cookies, process.id, { status: 'cancelled' });
+      // the cancellation is parked TOO, behind the approval's process lock, so it is blocked by the held
+      // session through the approval. An approval that locked the stage before the process would not hold
+      // the process lock yet, and the cancellation would have answered at once instead of parking here.
+      await waitForLockWaiters(held, 'update_process', 1);
+      await held.commit();
+      [approve, cancel] = await Promise.all([approving, cancelling]);
+    } finally {
+      await held.abort();
+    }
+
+    const approved = await expectContract<ProcessDetailBody>('approveCurrentStage', approve);
+    const cancelled = await expectContract<ProcessDetailBody>('updateProcess', cancel);
+    expect(approve.status).toBe(200);
+    expect(cancel.status).toBe(200);
+    expect(approved).toMatchObject({ status: 'active', version: 2, completedStages: 1 });
+    expect(cancelled).toMatchObject({ status: 'cancelled', version: 3, completedStages: 1 });
+    const state = await stateOf(process.id);
+    expect(state.audit).toEqual(['process.created', 'stage.approved', 'process.cancelled']);
+    expect(state.stages).toEqual([
+      [1, 'completed'],
+      [2, 'in_progress'],
+      [3, 'pending'],
+    ]);
+    expect(state.approvals).toEqual([stageAt(process, 1).id]);
+  });
+
+  // A STRESS test, not the proof: which of the two requests takes the lock first is up to the scheduler, so a
+  // run may see only one of the histories. What it adds to the held-lock tests above is that real, unhelped
+  // concurrency never ends anywhere else. The deterministic tests are the proof of the lock order.
+  it('F-82 (stress, not proof): approvals and cancellations racing on fresh processes always end in one of the two causal histories: never an approval after the cancellation, never a 500 or a deadlock', async () => {
     const rounds = 8;
     const histories: string[] = [];
 
@@ -905,12 +1002,14 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
       ]);
 
       // a cancel of an active process always succeeds, before or after the approval
+      await expectContract('updateProcess', cancel);
       expect(cancel.status).toBe(200);
       const state = await stateOf(process.id);
       expect(state.row.status).toBe('cancelled');
       if (approve.status === 200) {
         // the approval took the lock first
         histories.push('approved-then-cancelled');
+        await expectContract<ProcessDetailBody>('approveCurrentStage', approve);
         expect(state.audit).toEqual(['process.created', 'stage.approved', 'process.cancelled']);
         expect(state.row.version).toBe(3);
         expect(state.stages).toEqual([
@@ -1059,6 +1158,9 @@ describe('GET /admin/processes/{processId}/events', () => {
     const response = await listEventsViaApi(ana.cookies, process.id);
     const body = await expectContract<ProcessEventListBody>('listProcessEvents', response);
 
+    // AC-22: the timeline names the CEOs and what they did: never cached
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
     expect(body.items.map((event) => event.action)).toEqual([
       'process.created',
       'process.updated',

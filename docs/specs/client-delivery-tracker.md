@@ -601,6 +601,7 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 | `P0001` + `PASSWORD_UNCHANGED` | `PasswordUnchangedError` | 422 `PASSWORD_UNCHANGED` |
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` (nas funções de processo só o `INVALID_INPUT`: `23514` e `22001` são 500, §3.7.2) |
+| `P0001` + `INVARIANT_VIOLATION` (só `approve_current_stage`, §3.7.3) | nenhum: não está no catálogo, é erro inesperado, com `cause` só `{ code, status }` | 500 `INTERNAL_ERROR` |
 | `P0001` + `CLIENT_NAME_TAKEN` | `ConflictError` (o `detail` não diz qual é o outro cliente) | 409 `CONFLICT` |
 | `40P01` (deadlock) e `40001` (falha de serialização), pelo SQLSTATE e qualquer que seja o status HTTP do PostgREST (que dá 500 aos dois) | `ServiceUnavailableError`: o Postgres desfez a transação inteira, sem linha nem auditoria, e repetir é seguro | 503 `SERVICE_UNAVAILABLE` com `Retry-After` |
 
@@ -781,15 +782,39 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   entrada (`INVALID_INPUT`), processo (`NOT_FOUND`), `status` (`PROCESS_NOT_ACTIVE`, que vence um `STALE_STAGE`:
   E-03) e a fase esperada (`STALE_STAGE`). Uma fase esperada que não é a atual (já concluída, ainda `pending`, de
   **outro** processo ou inexistente) é sempre `STALE_STAGE`, nunca `NOT_FOUND` e nunca pula fase (E-72). O pgTAP
-  confere a ordem no catálogo (`prosrc`), e os testes de API a provam com a trava na mão: uma segunda sessão do banco
-  segura a linha do processo (ou roda a função de verdade sem fazer COMMIT), as requisições disparadas esperam nela
-  (o teste confere no `pg_stat_activity` que todas estão bloqueadas) e só então a trava é solta, o que dá o mesmo
-  resultado em toda execução, sem `sleep`.
-- **Um instante só.** A fase concluída, a aprovação, a fase iniciada e o processo usam o mesmo instante, igual
-  ao `occurred_at` da auditoria da transação: o maior entre `now()` e o `started_at` da fase. O `now()` de uma
-  aprovação que esperou a trava é o do **começo** da transação, e pode ser anterior ao `started_at` que a aprovação
-  anterior gravou na fase seguinte (um CEO que já conhece o id da fase 2 e dá o "Ok" nela junto com o da fase 1);
-  sem o `greatest`, o CHECK `completed_at >= started_at` daria 500. O pgTAP cobre esse caso.
+  confere a ordem no catálogo (`prosrc`, sem os comentários, sem diferença de caixa), e os testes de API a provam
+  com a trava na mão: uma segunda sessão do banco segura a linha do processo (ou a da fase, ou roda a função de
+  verdade sem fazer COMMIT), as requisições disparadas esperam nela (o teste confere no `pg_stat_activity` e em
+  `pg_blocking_pids` que todas estão bloqueadas **por essa sessão**, direta ou através de outra requisição) e só então a
+  trava é solta, o que dá o mesmo resultado em toda execução, sem `sleep`. A ordem em si é provada pelo teste em que a
+  sessão segura **só a fase**: a aprovação já tem a trava do processo e espera pela fase, e um cancelamento disparado
+  nesse momento também espera, atrás dela. Com a fase travada antes do processo, o cancelamento passaria na hora e o
+  teste falha. A sessão segurada se limita sozinha (`lock_timeout`, `statement_timeout` e
+  `idle_in_transaction_session_timeout`, todos abaixo do timeout do teste) e é encerrada dos dois lados no `finally`
+  (F-108).
+- **Instantes.** A fase concluída, a aprovação, a fase iniciada e o `updated_at` e o `completed_at` do processo usam
+  o mesmo instante `v_at`: o maior entre `now()` e o `started_at` da fase. **A auditoria não usa `v_at`:**
+  `private.record_audit_event` não recebe instante, e o `occurred_at` dela é o `now()` da transação, o relógio do
+  banco e a fonte forense de T-19, que pode ser alguns milissegundos **anterior** ao `approved_at` (e é igual a ele
+  no caso comum, em que `v_at` é o `now()`). O `now()` de uma aprovação que esperou a trava é o do **começo** da
+  transação, e pode ser anterior ao `started_at` que a aprovação anterior gravou na fase seguinte (um CEO que já
+  conhece o id da fase 2 e dá o "Ok" nela junto com o da fase 1); sem o `greatest`, o CHECK
+  `completed_at >= started_at` daria 500. Pelo mesmo motivo o `updated_at` do processo pode andar alguns
+  milissegundos **para trás** entre uma aprovação e um cancelamento que esperou a trava dela, e o `occurredAt` da
+  linha do tempo também (a ordem dos fatos é a do `id` da auditoria, como descreve "Linha do tempo" mais abaixo, e não a dos instantes). O pgTAP cobre o
+  caso.
+- **A função confere o que lê e o que escreve (T-49, F-104, F-105).** Ela confia no estado em que trabalha, e esse
+  estado só é quebrado por uma linha feita à mão com a secret key (F-81: o `service_role` mantém DML nas tabelas) ou
+  por um defeito, nunca pelas funções. Por isso: (a) o `greatest` tem **teto**: um `started_at` mais de **1 minuto**
+  à frente do `now()` é `INVARIANT_VIOLATION` (a espera de uma trava dura milissegundos, no máximo o
+  `statement_timeout`; clampar até uma hora à frente gravaria um instante no futuro); (b) cada escrita confere
+  `ROW_COUNT = 1` (a fase atual, a aprovação, a fase seguinte, o processo), e a fase seguinte é a de posição seguinte
+  **e `pending`**: posições com buraco (1 e 3) não viram uma aprovação que deixa o processo sem fase em andamento;
+  (c) na última fase, nenhuma outra fase pode estar fora de `completed`, ou o processo não conclui com uma fase aberta
+  (I3). A recusa é `P0001` + `INVARIANT_VIOLATION`, **que não está no catálogo**: o app a trata como erro inesperado
+  (500, `cause` só `{ code, status }`), a transação inteira se desfaz (nenhuma fase, aprovação, versão ou auditoria
+  muda) e o pgTAP prova isso para cada caso. Uma fase atual que não existe num processo ativo continua sendo
+  `STALE_STAGE`, como na transição pura.
 - **Auditoria sem PII.** `stage.approved` (recurso `stage` = a fase aprovada) e, se era a última fase,
   `process.completed` (recurso `process`), nessa ordem, na mesma transação, sem metadados: nenhum título,
   nome de fase nem nome de pessoa. Só grava quando a aprovação acontece: recusa não audita.
@@ -808,6 +833,13 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   *Pendência do contrato:* a descrição de `approveCurrentStage` já trata o 409 como "outro CEO já aprovou ou houve
   um retry", mas não diz que o retry da última fase é 422 `PROCESS_NOT_ACTIVE`; entra no próximo bump de contrato,
   junto com a pendência de `createProcess` (§3.7.2).
+- **Requisito para o frontend (T-51, F-107).** O `expectedStageId` protege contra aprovar a **mesma** fase duas
+  vezes, mas não contra um cliente que reenvia o "Ok" com o `currentStageId` que acabou de receber: isso aprova a
+  fase **seguinte**, que o CEO nunca viu. Então o cliente da API (a Onda de frontend) **nunca reenvia uma aprovação
+  sozinho**, nem com o `currentStageId` de um 409 `STALE_STAGE`, nem depois de um 503, nem num `retry` automático da
+  biblioteca de fetch. Um 409 ou um 503 mostra ao CEO a fase atual e **quem aprovou a anterior** (do detalhe), e um
+  novo "Ok" é sempre um clique novo, sobre o que a tela mostra naquele momento. Entra no próximo bump de contrato,
+  na descrição de `approveCurrentStage`.
 - **Cliente arquivado (F-87, Q-13).** Hoje arquivar o cliente **não** congela os processos que ele já tem: aprovar
   vale, como renomear e cancelar (§3.7.2). O pgTAP registra o comportamento atual, e a decisão de produto é do
   usuário. Se arquivar passar a congelar, a mudança é pequena e igual nas duas funções: ler o `archived_at` do
@@ -836,8 +868,12 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
     ao maior `bigint`: o que o banco recebe é sempre um número que ele lê; E-74). Cursor adulterado, truncado, de outro
     endpoint ou com payload fora do formato é 400 `VALIDATION_ERROR` em `query.cursor` (E-29), e um erro da classe 22
     do banco numa posição recebida também vira esse 400. O cursor não leva o processo: o path diz qual é.
-  - **Índice.** Nenhum novo: `audit_events (process_id, occurred_at)` acha as linhas do processo (dezenas, no
-    máximo), e a ordenação por `id` é sobre elas.
+  - **Índice (F-106).** `audit_events (process_id, id) WHERE process_id IS NOT NULL`, parcial como os outros da
+    trilha: a leitura filtra `process_id = ?` e `id > ?` e ordena por `id`, então uma página é uma varredura do índice,
+    já na ordem. O `audit_events (process_id, occurred_at)` da Onda 2 acha as linhas, mas deixaria a ordenação para
+    depois, e o número de eventos de um processo **não tem teto**: cada renome grava um `process.updated` (o limite de
+    60 escritas por minuto por CEO é a única contenção). O pgTAP confere o índice. Retenção da trilha e um alerta de
+    volume por processo ficam para a Onda 11 (T-50).
 
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
@@ -1155,7 +1191,8 @@ e `private.is_ceo()`. O helper `private.request_id()` lê o `x-request-id` do Po
 | `process_stages (process_id, position)` (unique) | detalhe do processo |
 | `process_stages (process_id) WHERE status = 'in_progress'` (unique) | fase atual / invariante I2 |
 | `stage_approvals (process_id)` | detalhe de CEO |
-| `audit_events (process_id, occurred_at)` | linha do tempo |
+| `audit_events (process_id, occurred_at)` | linha do tempo (as linhas do processo) |
+| `audit_events (process_id, id) WHERE process_id IS NOT NULL` | linha do tempo, keyset por `id` (F-106) |
 | `audit_events (client_id, occurred_at)` | auditoria por cliente |
 | `audit_events (occurred_at)` | retenção |
 | `clients (lower(normalize(name, NFKC)), sem marcas de variação invisíveis, espaços reduzidos) WHERE archived_at IS NULL` (unique) | nome de cliente único entre os ativos: 409 `CONFLICT` ao criar, renomear e desarquivar (F-51) |

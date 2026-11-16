@@ -13,7 +13,7 @@ import {
   type ProcessEventQuery,
 } from '../domain/process-event';
 import type { ProcessEventQueries } from '../domain/process-event-queries';
-import { MAX_STAGES_PER_PROCESS } from '../domain/stage';
+import { MAX_STAGES_PER_PROCESS, STAGE_NAME_MAX_LENGTH } from '../domain/stage';
 import { timestampSchema } from './timestamp-schema';
 
 /** SQLSTATE class 22, "data exception": the database refused a value it was given (an id out of range...). */
@@ -42,11 +42,20 @@ const eventRowSchema = z.object({
 });
 const eventRowsSchema = z.array(eventRowSchema);
 
+/**
+ * `process_stages.name` is 1 to 120 characters (the CHECK of the table, `char_length`), and the contract's
+ * `stageName` has `maxLength: 120`: both count characters (code points), not UTF-16 units, so the bound
+ * is checked on the code points, or a name of 120 emoji would be refused for being 240 units long.
+ */
+const stageNameSchema = z
+  .string()
+  .refine((name) => name.length >= 1 && [...name].length <= STAGE_NAME_MAX_LENGTH);
+
 const stageRowsSchema = z.array(
   z.object({
     id: z.guid(),
     position: z.number().int().min(1).max(MAX_STAGES_PER_PROCESS),
-    name: z.string(),
+    name: stageNameSchema,
   }),
 );
 

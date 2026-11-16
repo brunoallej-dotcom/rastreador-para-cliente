@@ -752,6 +752,31 @@ describe('approve', () => {
     expect(JSON.stringify((error as Error).cause)).not.toContain('Secreto');
   });
 
+  it('F-105: INVARIANT_VIOLATION (the function checked its own writes and found the state broken) is an unexpected error (500), not a 400, not a 503, with only the SQLSTATE and the status as cause', async () => {
+    const { repository, queries } = repositoryOver([failure('P0001', 'INVARIANT_VIOLATION')]);
+
+    const error = await repository.approve(P1, S1).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(ServiceUnavailableError);
+    expect(error).not.toBeInstanceOf(ValidationError);
+    expect((error as Error).message).toBe('approve_current_stage failed unexpectedly');
+    expect((error as Error).cause).toEqual({ code: 'P0001', status: 400 });
+    // no re-read, no second call: the answer is a 500, and nothing was written
+    expect(queries).toHaveLength(1);
+  });
+
+  it('F-105: the code is not in the catalog, so a database message that carried a row would not reach the cause either', async () => {
+    const { repository } = repositoryOver([
+      failure('P0001', 'INVARIANT_VIOLATION: Failing row contains (Processo Secreto)'),
+    ]);
+
+    const error = await repository.approve(P1, S1).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(JSON.stringify((error as Error).cause)).not.toContain('Secreto');
+  });
+
   it('E-21: an approval saved and then lost from sight (the session ended) is a 404, not a 500', async () => {
     const { repository } = repositoryOver([answer(writeRowOf(P1)), answer(null)]);
 

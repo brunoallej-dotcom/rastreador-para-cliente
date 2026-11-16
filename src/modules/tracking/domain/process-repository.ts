@@ -54,7 +54,9 @@ export interface ProcessRepository {
    * same stage exactly one wins. `err(NotFoundError)` when the process does not exist;
    * `err(ProcessNotActiveError)` when it is completed or cancelled (this wins over a stale stage:
    * E-03); `err(StaleStageError)`, carrying the id of the stage that is current now, when
-   * `expectedStageId` is not the current stage (E-01, E-02).
+   * `expectedStageId` is not the current stage (E-01, E-02). A state the database refuses to write
+   * (`INVARIANT_VIOLATION`: a broken row it checked its own writes against, T-49) is not a domain
+   * error: it throws an unexpected error (500) and nothing was written.
    */
   approve(processId: string, expectedStageId: string): Promise<Result<Process, DomainError>>;
 

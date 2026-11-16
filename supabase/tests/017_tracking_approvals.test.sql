@@ -8,9 +8,12 @@
 -- I4, AC-19), a fase esperada velha, futura, de outro processo ou inexistente (E-01, E-02: STALE_STAGE), a
 -- precedência dos erros (papel, entrada, processo, status, fase), erros sem DETAIL nem HINT, as invariantes
 -- depois de cada passo (I2, I5, I6), escrita direta negada, o isolamento por tenant, o cliente arquivado (F-87:
--- hoje vale o atual, e o teste o registra) e o instante da aprovação depois de uma espera de trava.
+-- hoje vale o atual, e o teste o registra), o instante da aprovação depois de uma espera de trava com o teto de
+-- 1 minuto (F-104), a função que confere o que escreve (F-105, T-49: posições com buraco, fase anterior aberta,
+-- nenhuma fase atual, sempre sem escrever nada), o índice da linha do tempo (F-106) e as invariantes e contagens
+-- escopadas aos processos desta fixture (o arquivo não depende do que `pnpm test:api` deixou no banco).
 BEGIN;
-SELECT plan(107);
+SELECT plan(123);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A e B são clientes ativos; X é arquivado. a1 é login de A e b1, de B. c1 e c7 são CEOs com fator verificado;
@@ -39,6 +42,15 @@ SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c6');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c7');
 DELETE FROM auth.sessions WHERE id = '00000000-0000-4000-8000-0000000000c3';
 UPDATE public.profiles SET disabled_at = now() WHERE id = '00000000-0000-4000-8000-0000000000c4';
+-- Nenhum usuário deste arquivo está com a troca de senha pendente: o que nega ou deixa passar é só o que cada caso
+-- diz (uma mudança futura de RLS que olhe `must_change_password`, F-83, não quebra os controles positivos por
+-- outro motivo).
+UPDATE public.profiles SET must_change_password = false
+ WHERE id IN ('00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000b1',
+              '00000000-0000-4000-8000-0000000000c1', '00000000-0000-4000-8000-0000000000c2',
+              '00000000-0000-4000-8000-0000000000c3', '00000000-0000-4000-8000-0000000000c4',
+              '00000000-0000-4000-8000-0000000000c5', '00000000-0000-4000-8000-0000000000c6',
+              '00000000-0000-4000-8000-0000000000c7');
 
 -- Os processos (montados como postgres, com as fases já no estado que a função de criação deixaria):
 --   P3 (1a1): cliente A, 3 fases (2a1 em andamento, 2a2 e 2a3 pendentes): o caminho feliz inteiro.
@@ -46,14 +58,25 @@ UPDATE public.profiles SET disabled_at = now() WHERE id = '00000000-0000-4000-80
 --   PB (1b1): cliente B, 2 fases (2c1, 2c2): cancelado antes de aprovar (AC-19).
 --   PX (1d1): cliente X (arquivado), 2 fases (2d1, 2d2): aprovar e depois cancelar (F-87, I4).
 --   PD (1e1): concluído, com a aprovação da única fase (2e1).   PC (1e2): cancelado no meio (2e2 feita, 2e3 parada).
---   PF (1f1): 2 fases; a fase 2f1 começou DAQUI A UMA HORA (o `started_at` que uma aprovação que esperou a trava
---             grava na fase seguinte, com um `now()` mais antigo que ele).
+--   PF (1f1): 2 fases; a fase 2f1 começou DAQUI A UM SEGUNDO (o `started_at` que uma aprovação que esperou a trava
+--             grava na fase seguinte, com um `now()` mais antigo que ele: dentro da tolerância de 1 minuto, F-104).
+--   PG (1a3): 2 fases (2f3 em andamento, 2f4 pendente); a fase 2f3 começou DAQUI A UMA HORA, além da tolerância:
+--             linha quebrada (F-104).
+-- Os que nascem quebrados de propósito (a função precisa recusá-los e não escrever nada: F-105, T-49):
+--   PH (1a4): posições 1 e 3 (buraco; 2f5 em andamento, 2f6 pendente): a fase seguinte à atual não existe.
+--   PI (1a5): a fase 1 (2f7) ainda `pending` e a 2 (2f8), a última, em andamento: concluiria o processo com uma
+--             fase aberta.
+--   PN (1a6): processo ativo sem nenhuma fase em andamento (2f9 pendente: o ramo NOT FOUND da busca da fase atual).
 INSERT INTO public.processes (id, client_id, title, version, created_at, updated_at) VALUES
   ('00000000-0000-4000-8000-0000000001a1', '00000000-0000-4000-8000-00000000000a', 'Processo A3', 1, now() - interval '2 days', now() - interval '2 days'),
   ('00000000-0000-4000-8000-0000000001a2', '00000000-0000-4000-8000-00000000000a', 'Processo A1', 1, now() - interval '2 days', now() - interval '2 days'),
   ('00000000-0000-4000-8000-0000000001b1', '00000000-0000-4000-8000-00000000000b', 'Processo B', 1, now() - interval '2 days', now() - interval '2 days'),
   ('00000000-0000-4000-8000-0000000001d1', '00000000-0000-4000-8000-00000000000c', 'Processo X', 1, now() - interval '2 days', now() - interval '2 days'),
-  ('00000000-0000-4000-8000-0000000001f1', '00000000-0000-4000-8000-00000000000a', 'Processo F', 1, now() - interval '2 days', now() - interval '2 days');
+  ('00000000-0000-4000-8000-0000000001f1', '00000000-0000-4000-8000-00000000000a', 'Processo F', 1, now() - interval '2 days', now() - interval '2 days'),
+  ('00000000-0000-4000-8000-0000000001a3', '00000000-0000-4000-8000-00000000000a', 'Processo G', 1, now() - interval '2 days', now() - interval '2 days'),
+  ('00000000-0000-4000-8000-0000000001a4', '00000000-0000-4000-8000-00000000000a', 'Processo H', 1, now() - interval '2 days', now() - interval '2 days'),
+  ('00000000-0000-4000-8000-0000000001a5', '00000000-0000-4000-8000-00000000000a', 'Processo I', 1, now() - interval '2 days', now() - interval '2 days'),
+  ('00000000-0000-4000-8000-0000000001a6', '00000000-0000-4000-8000-00000000000a', 'Processo N', 1, now() - interval '2 days', now() - interval '2 days');
 INSERT INTO public.process_stages (id, process_id, position, name, status, started_at) VALUES
   ('00000000-0000-4000-8000-0000000002a1', '00000000-0000-4000-8000-0000000001a1', 1, 'Fase 1', 'in_progress', now() - interval '2 days'),
   ('00000000-0000-4000-8000-0000000002a2', '00000000-0000-4000-8000-0000000001a1', 2, 'Fase 2', 'pending', NULL),
@@ -63,8 +86,15 @@ INSERT INTO public.process_stages (id, process_id, position, name, status, start
   ('00000000-0000-4000-8000-0000000002c2', '00000000-0000-4000-8000-0000000001b1', 2, 'Fase do B 2', 'pending', NULL),
   ('00000000-0000-4000-8000-0000000002d1', '00000000-0000-4000-8000-0000000001d1', 1, 'Fase do X 1', 'in_progress', now() - interval '2 days'),
   ('00000000-0000-4000-8000-0000000002d2', '00000000-0000-4000-8000-0000000001d1', 2, 'Fase do X 2', 'pending', NULL),
-  ('00000000-0000-4000-8000-0000000002f1', '00000000-0000-4000-8000-0000000001f1', 1, 'Fase F 1', 'in_progress', now() + interval '1 hour'),
-  ('00000000-0000-4000-8000-0000000002f2', '00000000-0000-4000-8000-0000000001f1', 2, 'Fase F 2', 'pending', NULL);
+  ('00000000-0000-4000-8000-0000000002f1', '00000000-0000-4000-8000-0000000001f1', 1, 'Fase F 1', 'in_progress', now() + interval '1 second'),
+  ('00000000-0000-4000-8000-0000000002f2', '00000000-0000-4000-8000-0000000001f1', 2, 'Fase F 2', 'pending', NULL),
+  ('00000000-0000-4000-8000-0000000002f3', '00000000-0000-4000-8000-0000000001a3', 1, 'Fase G 1', 'in_progress', now() + interval '1 hour'),
+  ('00000000-0000-4000-8000-0000000002f4', '00000000-0000-4000-8000-0000000001a3', 2, 'Fase G 2', 'pending', NULL),
+  ('00000000-0000-4000-8000-0000000002f5', '00000000-0000-4000-8000-0000000001a4', 1, 'Fase H 1', 'in_progress', now() - interval '2 days'),
+  ('00000000-0000-4000-8000-0000000002f6', '00000000-0000-4000-8000-0000000001a4', 3, 'Fase H 3', 'pending', NULL),
+  ('00000000-0000-4000-8000-0000000002f7', '00000000-0000-4000-8000-0000000001a5', 1, 'Fase I 1', 'pending', NULL),
+  ('00000000-0000-4000-8000-0000000002f8', '00000000-0000-4000-8000-0000000001a5', 2, 'Fase I 2', 'in_progress', now() - interval '1 day'),
+  ('00000000-0000-4000-8000-0000000002f9', '00000000-0000-4000-8000-0000000001a6', 1, 'Fase N 1', 'pending', NULL);
 
 INSERT INTO public.processes (id, client_id, title, status, version, completed_at, created_at, updated_at) VALUES
   ('00000000-0000-4000-8000-0000000001e1', '00000000-0000-4000-8000-00000000000a', 'Processo concluido', 'completed', 2,
@@ -85,15 +115,22 @@ INSERT INTO public.process_stages (id, process_id, position, name, status, start
 INSERT INTO public.stage_approvals (process_stage_id, process_id, approved_by) VALUES
   ('00000000-0000-4000-8000-0000000002e2', '00000000-0000-4000-8000-0000000001e2', '00000000-0000-4000-8000-0000000000c1');
 
--- Os processos desta fixture: as contagens de tabela inteira olham só para eles, para não depender de linhas que
--- outro teste deixou no banco.
+-- Os processos desta fixture: toda contagem e toda invariante de tabela inteira olha só para eles, para não
+-- depender de linhas que outro teste deixou no banco (as de `pnpm test:api`, por exemplo: processos sem fase e
+-- auditoria sem `request_id`). `fixture_processes` são os saudáveis; `broken_processes`, os que nascem
+-- quebrados de propósito (F-105) e que ficam de fora das invariantes.
 CREATE TEMP TABLE fixture_processes (id uuid PRIMARY KEY);
 INSERT INTO fixture_processes (id) VALUES
   ('00000000-0000-4000-8000-0000000001a1'), ('00000000-0000-4000-8000-0000000001a2'),
   ('00000000-0000-4000-8000-0000000001b1'), ('00000000-0000-4000-8000-0000000001d1'),
   ('00000000-0000-4000-8000-0000000001f1'), ('00000000-0000-4000-8000-0000000001e1'),
-  ('00000000-0000-4000-8000-0000000001e2');
+  ('00000000-0000-4000-8000-0000000001e2'), ('00000000-0000-4000-8000-0000000001a3');
 GRANT SELECT ON fixture_processes TO authenticated;
+CREATE TEMP TABLE broken_processes (id uuid PRIMARY KEY);
+INSERT INTO broken_processes (id) VALUES
+  ('00000000-0000-4000-8000-0000000001a4'), ('00000000-0000-4000-8000-0000000001a5'),
+  ('00000000-0000-4000-8000-0000000001a6');
+GRANT SELECT ON broken_processes TO authenticated;
 
 -- Captura o erro de um comando, com o que ele leva (código, mensagem, DETAIL, HINT): as funções de escrita só
 -- podem levantar o código fixo, sem texto que vaze linha. Roda como quem chama (a sessão autenticada).
@@ -117,12 +154,30 @@ END;
 $$;
 GRANT EXECUTE ON FUNCTION pg_temp.try(text) TO authenticated;
 
--- O corpo de uma função sem os comentários (`--` até o fim da linha): os asserts de ordem de trava olham o SQL
--- que executa, e não o que os comentários dizem dele.
+-- O corpo de uma função sem os comentários (`/* ... */` e `--` até o fim da linha): os asserts de ordem de trava
+-- olham o SQL que executa, e não o que os comentários dizem dele. Sobra `/*` ou `*/` (um comentário aninhado ou
+-- mal fechado)? Um assert abaixo falha: o guarda falha fechado em vez de mascarar código.
 CREATE FUNCTION pg_temp.code(p_oid oid)
 RETURNS text
 LANGUAGE sql
-AS $$ SELECT regexp_replace(p.prosrc, '--[^\n]*', '', 'g') FROM pg_proc p WHERE p.oid = p_oid $$;
+AS $$
+  SELECT regexp_replace(regexp_replace(p.prosrc, '/\*.*?\*/', '', 'g'), '--[^\n]*', '', 'g')
+    FROM pg_proc p WHERE p.oid = p_oid
+$$;
+
+-- O que o banco guarda de um processo, numa linha: status, versão, fases, aprovações e auditoria. Um caso que
+-- precisa provar "não escreveu nada" compara esta linha antes e depois, como postgres.
+CREATE FUNCTION pg_temp.state_of(p_id uuid)
+RETURNS text
+LANGUAGE sql
+AS $$
+  SELECT p.status::text || '/v' || p.version || '/'
+         || (SELECT string_agg(s.position || ':' || s.status::text, ',' ORDER BY s.position)
+               FROM public.process_stages s WHERE s.process_id = p.id)
+         || '/approvals=' || (SELECT count(*) FROM public.stage_approvals a WHERE a.process_id = p.id)
+         || '/audit=' || (SELECT count(*) FROM public.audit_events e WHERE e.process_id = p.id)
+    FROM public.processes p WHERE p.id = p_id
+$$;
 
 -- Como o PostgREST faz: o app manda o id da requisição, e a auditoria o guarda.
 SELECT tests.set_request_id('req-approve-0001');
@@ -161,6 +216,15 @@ SELECT is(
   'processes',
   'approve_current_stage devolve a linha de processes (sem título em metadados nem texto de erro)'
 );
+SELECT has_index(
+  'public', 'audit_events', 'audit_events_process_id_id_idx', ARRAY['process_id', 'id'],
+  'F-106: a linha do tempo tem o índice (process_id, id) para o keyset por id'
+);
+SELECT ok(
+  (SELECT pg_get_indexdef(i.indexrelid) ~ 'WHERE \(process_id IS NOT NULL\)'
+     FROM pg_index i WHERE i.indexrelid = 'public.audit_events_process_id_id_idx'::regclass),
+  'F-106: o índice é parcial (process_id IS NOT NULL), como os outros da trilha'
+);
 
 -- F-82, T-41: a ORDEM DE TRAVA, no catálogo (a concorrência em si está nos testes de API, que seguram a trava
 -- numa segunda sessão: um teste de uma sessão só não prova a espera). O processo é a primeira linha travada, com
@@ -190,7 +254,12 @@ SELECT ok(
   'F-82: o processo é lido (e travado) ANTES de qualquer leitura das fases'
 );
 SELECT ok(
-  (SELECT regexp_count(pg_temp.code(p.oid), 'FOR NO KEY UPDATE') = 2
+  (SELECT pg_temp.code(p.oid) !~ '/\*|\*/'
+     FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
+  'F-82: nenhum comentário aninhado ou mal fechado sobra no corpo (o guarda de ordem olha código, não comentário)'
+);
+SELECT ok(
+  (SELECT regexp_count(pg_temp.code(p.oid), 'FOR NO KEY UPDATE', 1, 'i') = 2
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
   'F-82: duas travas, a do processo e a da fase, nessa ordem, e mais nenhuma'
 );
@@ -212,7 +281,7 @@ SELECT ok(
   'F-82: as duas travas vêm antes de qualquer escrita (fase, aprovação, processo)'
 );
 SELECT ok(
-  (SELECT pg_temp.code(p.oid) !~ 'FOR\s+UPDATE\M' AND pg_temp.code(p.oid) !~ 'FOR\s+(KEY\s+)?SHARE\M' AND pg_temp.code(p.oid) !~ 'public\.clients'
+  (SELECT pg_temp.code(p.oid) !~* 'FOR\s+UPDATE\M' AND pg_temp.code(p.oid) !~* 'FOR\s+(KEY\s+)?SHARE\M' AND pg_temp.code(p.oid) !~* 'public\.clients'
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
   'F-82: approve_current_stage não usa FOR UPDATE nem FOR SHARE e não toca public.clients'
 );
@@ -223,9 +292,9 @@ SELECT ok(
   'F-55: approve_current_stage abre com IF private.is_ceo() IS NOT TRUE, antes de qualquer trava'
 );
 SELECT ok(
-  (SELECT (regexp_match(pg_temp.code(p.oid), 'DECLARE(.*?)BEGIN', 's'))[1] !~ ':='
+  (SELECT (regexp_match(pg_temp.code(p.oid), 'DECLARE(.*?)BEGIN', 'is'))[1] !~* '(=|\mDEFAULT\M)'
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
-  'F-55: o DECLARE não inicializa nada (nenhum trabalho com a entrada antes da checagem de CEO)'
+  'F-55: o DECLARE não inicializa nada, nem com :=, nem com =, nem com DEFAULT (nenhum trabalho com a entrada antes da checagem de CEO)'
 );
 
 -- AC-10: anon ------------------------------------------------------------------------------------------
@@ -339,8 +408,8 @@ SELECT results_eq(
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.process_stages WHERE status = 'in_progress' AND process_id IN (SELECT id FROM fixture_processes) $$,
-  $$ VALUES (6) $$,
-  'AC-08: nenhuma chamada negada mexeu em fase (as 6 em andamento das fixtures seguem como estavam)'
+  $$ VALUES (7) $$,
+  'AC-08: nenhuma chamada negada mexeu em fase (as 7 em andamento das fixtures saudáveis seguem como estavam)'
 );
 
 -- AC-16: o CEO aprova a fase atual de P3 (fase 1 de 3) -------------------------------------------------------
@@ -632,56 +701,132 @@ SELECT results_eq(
   'I4: a auditoria mostra a aprovação ANTES do cancelamento, na ordem em que as duas travas foram tomadas'
 );
 
--- O instante da aprovação depois de uma espera de trava (F-82): a fase seguinte já começou "no futuro" ----------------------------
--- (o `now()` da aprovação que esperou é o do começo da transação, anterior ao `started_at` que a anterior gravou).
+-- F-104: o instante da aprovação depois de uma espera de trava: a fase seguinte já começou "no futuro" -----------------------------
+-- (o `now()` da aprovação que esperou é o do começo da transação, anterior ao `started_at` que a anterior gravou; a
+-- tolerância é de 1 minuto: PF começou daqui a 1 segundo, e PG, daqui a 1 hora, é linha quebrada).
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT lives_ok(
   $$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001f1', '00000000-0000-4000-8000-0000000002f1') $$,
-  'F-82: aprovar uma fase que começou depois do now() da transação não viola completed_at >= started_at'
+  'F-104: aprovar uma fase que começou depois do now() da transação, dentro da tolerância, não viola completed_at >= started_at'
 );
 SELECT tests.clear_authentication();
 SELECT results_eq(
-  $$ SELECT s.completed_at = s.started_at, s.completed_at = now() + interval '1 hour'
+  $$ SELECT s.completed_at = s.started_at, s.completed_at = now() + interval '1 second'
        FROM public.process_stages s WHERE s.id = '00000000-0000-4000-8000-0000000002f1' $$,
   $$ VALUES (true, true) $$,
-  'F-82: a fase é concluída no instante em que começou (o maior entre now() e o início), nunca antes'
+  'F-104: a fase é concluída no instante em que começou (o maior entre now() e o início), nunca antes'
 );
 SELECT results_eq(
-  $$ SELECT s.started_at = now() + interval '1 hour', a.approved_at = now() + interval '1 hour'
+  $$ SELECT s.started_at = now() + interval '1 second', a.approved_at = now() + interval '1 second'
        FROM public.process_stages s
        JOIN public.stage_approvals a ON a.process_stage_id = '00000000-0000-4000-8000-0000000002f1'
       WHERE s.id = '00000000-0000-4000-8000-0000000002f2' $$,
   $$ VALUES (true, true) $$,
-  'F-82: a aprovação e o início da fase seguinte usam esse mesmo instante'
+  'F-104: a aprovação e o início da fase seguinte usam esse mesmo instante'
+);
+SELECT results_eq(
+  $$ SELECT e.occurred_at = now(), e.occurred_at < a.approved_at
+       FROM public.audit_events e
+       JOIN public.stage_approvals a ON a.process_stage_id = e.resource_id
+      WHERE e.action = 'stage.approved' AND e.resource_id = '00000000-0000-4000-8000-0000000002f1' $$,
+  $$ VALUES (true, true) $$,
+  'F-104: a auditoria guarda o now() da transação (a fonte forense), e não o instante clampado da aprovação'
+);
+
+-- F-104, T-49: além da tolerância (1 hora à frente) não é espera de trava, é linha quebrada: recusa, e nada muda ------------------
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a3'),
+  'active/v1/1:in_progress,2:pending/approvals=0/audit=0',
+  'F-104: PG, antes: ativo, versão 1, fase 1 em andamento (começada daqui a 1 hora), nenhuma aprovação, nenhuma auditoria'
+);
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT results_eq(
+  $$ SELECT sqlstate, message, detail, hint FROM pg_temp.try(
+       $q$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001a3', '00000000-0000-4000-8000-0000000002f3') $q$) $$,
+  $$ VALUES ('P0001', 'INVARIANT_VIOLATION', NULL::text, NULL::text) $$,
+  'F-104: uma fase que começou 1 hora à frente do relógio é INVARIANT_VIOLATION, sem DETAIL nem HINT'
+);
+SELECT tests.clear_authentication();
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a3'),
+  'active/v1/1:in_progress,2:pending/approvals=0/audit=0',
+  'F-104: a recusa não gravou nada: sem aprovação, sem auditoria, mesma versão, mesmas fases'
+);
+
+-- F-105, T-49: a função confere o que escreve: posições com buraco, fase anterior aberta, nenhuma fase atual -------------------
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a4'),
+  'active/v1/1:in_progress,3:pending/approvals=0/audit=0',
+  'F-105: PH, antes: posições 1 e 3 (com buraco), fase 1 em andamento'
+);
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT results_eq(
+  $$ SELECT sqlstate, message, detail, hint FROM pg_temp.try(
+       $q$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001a4', '00000000-0000-4000-8000-0000000002f5') $q$) $$,
+  $$ VALUES ('P0001', 'INVARIANT_VIOLATION', NULL::text, NULL::text) $$,
+  'F-105: posições 1 e 3: a fase seguinte (posição 2) não existe, e a aprovação é INVARIANT_VIOLATION, sem DETAIL nem HINT'
+);
+SELECT results_eq(
+  $$ SELECT sqlstate, message, detail, hint FROM pg_temp.try(
+       $q$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001a5', '00000000-0000-4000-8000-0000000002f8') $q$) $$,
+  $$ VALUES ('P0001', 'INVARIANT_VIOLATION', NULL::text, NULL::text) $$,
+  'F-105: a última fase com uma anterior ainda aberta não conclui o processo: INVARIANT_VIOLATION'
+);
+SELECT results_eq(
+  $$ SELECT sqlstate, message, detail, hint FROM pg_temp.try(
+       $q$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001a6', '00000000-0000-4000-8000-0000000002f9') $q$) $$,
+  $$ VALUES ('P0001', 'STALE_STAGE', NULL::text, NULL::text) $$,
+  'NOT FOUND: um processo ativo sem fase em andamento (I2 quebrado) é STALE_STAGE, mesmo com a fase pending como esperada'
+);
+SELECT tests.clear_authentication();
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a4'),
+  'active/v1/1:in_progress,3:pending/approvals=0/audit=0',
+  'F-105: PH, depois da recusa: nada foi escrito (fase 1 ainda em andamento, versão 1, sem aprovação nem auditoria)'
+);
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a5'),
+  'active/v1/1:pending,2:in_progress/approvals=0/audit=0',
+  'F-105: PI, depois da recusa: nada foi escrito (a fase 2 ainda em andamento, não concluída)'
+);
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001a6'),
+  'active/v1/1:pending/approvals=0/audit=0',
+  'NOT FOUND: PN, depois da recusa: nada foi escrito'
 );
 
 -- I2, I3, I5, I6 em tudo o que a função mexeu ---------------------------------------------------------------------------------
 SELECT is_empty(
   $$ SELECT p.id FROM public.processes p
-      WHERE p.status = 'active'
+      WHERE p.id IN (SELECT id FROM fixture_processes)
+        AND p.status = 'active'
         AND (SELECT count(*) FROM public.process_stages s WHERE s.process_id = p.id AND s.status = 'in_progress') <> 1 $$,
-  'I2: todo processo ativo tem exatamente uma fase em andamento'
+  'I2: todo processo ativo desta fixture tem exatamente uma fase em andamento'
 );
 SELECT is_empty(
   $$ SELECT s.id FROM public.process_stages s
-      WHERE (s.status = 'completed') <> EXISTS (SELECT 1 FROM public.stage_approvals a WHERE a.process_stage_id = s.id) $$,
-  'I5: toda fase concluída tem aprovação, e nenhuma outra fase tem'
+      WHERE s.process_id IN (SELECT id FROM fixture_processes)
+        AND (s.status = 'completed') <> EXISTS (SELECT 1 FROM public.stage_approvals a WHERE a.process_stage_id = s.id) $$,
+  'I5: toda fase concluída desta fixture tem aprovação, e nenhuma outra fase tem'
 );
 SELECT is_empty(
   $$ SELECT p.id FROM public.processes p
-      WHERE p.status = 'completed'
+      WHERE p.id IN (SELECT id FROM fixture_processes)
+        AND p.status = 'completed'
         AND (p.completed_at IS NULL OR EXISTS (SELECT 1 FROM public.process_stages s WHERE s.process_id = p.id AND s.status <> 'completed')) $$,
   'I3: todo processo concluído tem todas as fases concluídas e completed_at'
 );
 SELECT is_empty(
   $$ SELECT a.id FROM public.stage_approvals a
        JOIN public.process_stages s ON s.id = a.process_stage_id
-      WHERE s.process_id <> a.process_id $$,
+      WHERE a.process_id IN (SELECT id FROM fixture_processes)
+        AND s.process_id <> a.process_id $$,
   'I5: a aprovação pertence ao processo da fase'
 );
 SELECT is_empty(
   $$ SELECT s.id FROM public.process_stages s
-      WHERE s.status = 'completed' AND s.completed_at < s.started_at $$,
+      WHERE s.process_id IN (SELECT id FROM fixture_processes)
+        AND s.status = 'completed' AND s.completed_at < s.started_at $$,
   'I5: nenhuma fase conclui antes de começar'
 );
 SELECT results_eq(
@@ -694,13 +839,15 @@ SELECT results_eq(
 SELECT is_empty(
   $$ SELECT a.id FROM public.audit_events a
       WHERE a.action IN ('stage.approved', 'process.completed')
+        AND a.process_id IN (SELECT id FROM fixture_processes)
         AND (a.metadata <> '{}'::jsonb
              OR a.metadata::text ~* '(Processo|Fase|Cliente|CEO|Unica)') $$,
   'SEC-16: os eventos da aprovação não levam metadados, e nenhum título, nome de fase ou nome de pessoa'
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.audit_events a
-      WHERE a.action = 'stage.approved' AND (a.actor_id IS NULL OR a.actor_role IS DISTINCT FROM 'ceo' OR a.request_id IS NULL
+      WHERE a.process_id IN (SELECT id FROM fixture_processes)
+        AND a.action = 'stage.approved' AND (a.actor_id IS NULL OR a.actor_role IS DISTINCT FROM 'ceo' OR a.request_id IS NULL
             OR a.resource_type <> 'stage' OR a.client_id IS NULL OR a.process_id IS NULL) $$,
   $$ VALUES (0) $$,
   'AC-16: todo stage.approved tem ator, papel, a fase como recurso, cliente, processo e request_id'
@@ -718,6 +865,11 @@ SELECT throws_ok(
 SELECT throws_ok(
   $$ UPDATE public.processes SET status = 'completed' WHERE id = '00000000-0000-4000-8000-0000000001b1' $$,
   '42501', NULL, 'SEC-04: nem o CEO aal2 conclui um processo com UPDATE direto'
+);
+SELECT throws_ok(
+  $$ UPDATE public.stage_approvals SET approved_by = '00000000-0000-4000-8000-0000000000c7'
+      WHERE process_id = '00000000-0000-4000-8000-0000000001a1' $$,
+  '42501', NULL, 'SEC-04: nem o CEO aal2 troca o CEO de uma aprovação com UPDATE direto'
 );
 SELECT throws_ok(
   $$ DELETE FROM public.stage_approvals $$,
@@ -742,6 +894,12 @@ SELECT is_empty(
 SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000b1');
 SELECT is_empty($$ SELECT process_id FROM public.stage_approvals $$, 'AC-09: o cliente B não lê nenhuma aprovação');
+SELECT results_eq(
+  $$ SELECT s.position::int, s.status::text FROM public.process_stages s
+      WHERE s.process_id = '00000000-0000-4000-8000-0000000001b1' ORDER BY s.position $$,
+  $$ VALUES (1, 'in_progress'), (2, 'pending') $$,
+  'AC-09: controle positivo: o cliente B lê as fases do próprio processo (o que negou o resto foi o tenant)'
+);
 SELECT is_empty(
   $$ SELECT s.id FROM public.process_stages s WHERE s.process_id = '00000000-0000-4000-8000-0000000001a1' $$,
   'AC-09: o cliente B não vê as fases de P3, que o CEO aprovou'
