@@ -4,12 +4,12 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 5 concluídas.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 6 concluídas, mais o contrato
+  `1.0.0-draft.2` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 6 (clientes), com o PR do contrato `1.0.0-draft.2` e o da troca do CodeQL
-  pelo Semgrep em paralelo; depois 6.1 (F-50 e F-41, decidida em 2026-11-16), 7 ∥ 8 e 9 ∥ 10.
+- **Próximas ondas:** 6.1 (F-50 e F-41, decidida em 2026-11-16), depois 7 ∥ 8 e 9 ∥ 10.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -21,7 +21,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
-| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | 🟡 |
+| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
@@ -325,3 +325,43 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   - 0011: contrato `draft.2`, se precisar;
   - 0012: repositório privado e Semgrep;
   - 0013: atestado da Onda 6.1.
+
+### 2026-11-16 — Onda 6: clientes, contrato `1.0.0-draft.2` e Semgrep
+
+- **PR #13 (Semgrep):** a visibilidade do repositório mudou para privado, e o CodeQL passou a
+  falhar ("Code scanning is not enabled"). O job `sast` (Semgrep CE em Docker, imagem fixada por
+  digest, sem upload) o substituiu (ADR 0012), com duas regras locais e `pnpm sast`.
+- **PR #14 (contrato `1.0.0-draft.2`, ADR 0011):**
+  - `factorId` opcional e resolvido pela sessão;
+  - `changePassword` alinhado com o comportamento real;
+  - orçamentos programáticos no `x-rate-limit`, amarrados ao código nos dois sentidos
+    (`PROGRAMMATIC_BUDGETS`);
+  - 503 nas 22 operações autenticadas.
+  - Revisões: um ALTO (invariantes de um sentido só) corrigido. O threat-modeler abriu F-60 a
+    F-63; os requisitos do F-63 vão para a Onda 6.1.
+  - O gitleaks acusou um literal de senha num teste unitário. O commit foi corrigido com fixup e
+    autosquash, e o push saiu com `--force-with-lease` na branch de feature.
+- **Onda 6 (CRUD de clientes pelo CEO):** executada por subagente Sonnet (xhigh) em worktree.
+  - Entregue:
+    - `GET/POST /admin/clients` e `GET/PATCH /admin/clients/{clientId}`;
+    - migration `tracking_clients`, com `create_client`, `update_client` e
+      `private.visible_text`, o validador único de nomes, igual ao `visibleText` do Zod;
+    - pgTAP 013, `tests/helpers/clients.ts`, `getClientStatus` no `tracking/index.ts`.
+  - Paginação keyset em duas consultas PostgREST, com cursor `admin-clients` (`created_at` em
+    microssegundos + `id`). Os contadores vêm de `count` embutidos.
+  - Revisões (threat-modeler F-51..F-59, code-reviewer, contract-guardian, rls-auditor): nenhum
+    CRÍTICO ou ALTO. Corrigidos:
+    - a validação de nome no SQL, que era mais fraca que a do Zod;
+    - a normalização antes da checagem de CEO;
+    - o cursor com ano 0000 e o surrogate isolado, que davam 500;
+    - o nome do cliente que podia ir ao log pelo `cause`;
+    - o mapeamento 409 morto e o `FOR NO KEY UPDATE`;
+    - as lacunas de contrato nos testes.
+  - **F-51 (clientes duplicados, retry da criação) fica com o usuário:** as duas correções
+    (índice único com 409, `Idempotency-Key`) mudam o contrato.
+  - Flakes antigos corrigidos sem sleep: F-01, a virada da janela de 15 min no meio do teste, e
+    F-05, o tempo da recusa sob carga.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`, já com o contrato
+  `draft.2` na main: `pnpm verify` → 1861 unit + 673 pgTAP; `pnpm db:lint` ok; `pnpm db:types` sem diff;
+  `pnpm test:api` → 247/247; `pnpm test:api -t "AC-11|E-29"` → 47 verdes; `pnpm test:int` → 22/22;
+  `build` e `format:check` ok; `pnpm sast` sem achados (subagente).
