@@ -29,6 +29,14 @@ const INVISIBLE_FILLERS: ReadonlySet<string> = new Set(
 );
 const hasInvisibleFiller = (text: string) => Array.from(text).some((c) => INVISIBLE_FILLERS.has(c));
 
+/**
+ * A lone UTF-16 surrogate (what the JSON text `"\ud800"` decodes to) is not text: Postgres refuses it
+ * (22P02) and a name that passed validation would become a 500 (F-54). With the `u` flag a surrogate
+ * PAIR is one code point, so only a lone one matches `\p{Surrogate}` (the same test as
+ * `!value.isWellFormed()`, without needing the ES2024 string typings).
+ */
+const LONE_SURROGATE = /\p{Surrogate}/u;
+
 /** At least one letter or number, so a name cannot be only symbols or punctuation. */
 const HAS_LETTER_OR_NUMBER = /[\p{L}\p{N}]/u;
 
@@ -40,7 +48,8 @@ const codePointLength = (text: string) => Array.from(text).length;
  * 2. trimmed;
  * 3. checked against `min`/`max` on the TRIMMED value, counted in code points (as the database's
  *    `char_length` and JSON Schema's `minLength`/`maxLength` do);
- * 4. rejected if it contains a control, format, line-separator or paragraph-separator character
+ * 4. rejected if it holds a lone UTF-16 surrogate (not valid text; the database would refuse it), or
+ *    if it contains a control, format, line-separator or paragraph-separator character
  *    (`\n`, zero-width space, bidi override, tag characters, U+2028...) or an invisible filler
  *    (U+3164, U+2800, U+115F, U+1160, U+17B4, U+17B5, U+FFA0), which could hide or reorder text in
  *    the UI;
@@ -56,6 +65,10 @@ export function visibleText({ min, max }: { readonly min: number; readonly max: 
     .transform((value) => value.normalize('NFC').trim())
     .pipe(
       z.string().superRefine((value, context) => {
+        if (LONE_SURROGATE.test(value)) {
+          context.addIssue({ code: 'custom', message: 'Must be valid Unicode text' });
+          return;
+        }
         const length = codePointLength(value);
         if (length < min) {
           context.addIssue({

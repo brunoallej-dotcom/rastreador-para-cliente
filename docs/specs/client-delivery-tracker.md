@@ -394,8 +394,8 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
 | `current_principal()` | authenticated | Retorna o principal (ou nenhuma linha): sessão viva, perfil ativo, papel, cliente, nome de exibição, `aal`, `has_verified_totp`, `must_change_password` |
-| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente. Evento `client.created` |
-| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva. Eventos `client.updated` / `client.archived` / `client.unarchived` |
+| `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente e devolve a linha. Evento `client.created` (§3.7.1) |
+| `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva; `NULL` = não mexe. Eventos `client.updated` / `client.archived` / `client.unarchived`, só quando algo muda (§3.7.1) |
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
 | `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`) |
 | `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
@@ -421,6 +421,50 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` |
 | `23505` | `ConflictError` | 409 `CONFLICT` |
+
+#### 3.7.1 Clientes (Onda 6)
+
+- **Escrita.** `create_client` e `update_client` checam `private.is_ceo() IS NOT TRUE` antes de qualquer
+  trabalho com a entrada (papel `ceo`, `aal2`, fator TOTP verificado, sessão viva, perfil ativo: senão
+  42501; F-55). O nome passa por `private.visible_text(texto, 160)`, o mesmo que as Ondas 8 e 9 usam
+  para títulos e nomes de fase, e que faz o que o `visibleText` do Zod faz (E-30): entrada acima de
+  16 KiB é recusada antes de qualquer trabalho; NFC; pontas aparadas com o conjunto do `trim` do JavaScript (não só o espaço:
+  NBSP, U+3000, o BOM e os demais); de 1 a 160 caracteres; nenhum caractere de controle ou de formatação
+  Unicode; nenhum "filler" invisível (U+115F, U+1160, U+17B4, U+17B5, U+2800, U+3164, U+FFA0); e ao menos
+  uma letra ou um número. Qualquer falha é `INVALID_INPUT` (F-52). Duas diferenças aceitas: o banco
+  usa `[[:alnum:]]`, que depende do locale do banco ser Unicode (o pgTAP confere com japonês e grego) e
+  é um pouco mais estrito que `\p{L}\p{N}` do Zod em números como "²"; e o CHECK de `clients.name`
+  (Onda 2) segue mais fraco, como última barreira. As duas funções devolvem a linha de `clients`, sem
+  os contadores: a criação responde com contadores zero e a atualização lê o cliente de novo (o
+  PostgREST não restringe o `count` embutido ao status `active` no resultado de uma função); se essa
+  releitura não acha o cliente, a resposta é 404. `update_client` com `p_name` e `p_archived` nulos é
+  `INVALID_INPUT`, cliente inexistente é `NOT_FOUND`, e uma chamada que não muda nada (nome igual
+  depois da normalização, estado de arquivamento igual) devolve a linha como está, sem auditar e sem
+  mexer em `updated_at` (arquivar quem já está arquivado mantém o `archived_at` original). Renomear e
+  arquivar na mesma chamada grava dois eventos, nessa ordem. A linha é travada com `FOR NO KEY UPDATE`:
+  as escritas do mesmo cliente se serializam (a última vence, sem controle otimista: T-37) e a criação
+  de processos e logins, que só referenciam o cliente, não espera.
+- **Auditoria sem PII.** Os metadados não levam o nome do cliente: `client.updated` guarda só
+  `{"fields":["name"]}`, e os demais eventos não têm metadados. Recurso e `client_id` são o próprio
+  cliente.
+- **Leitura.** O app lê `clients` com o client do usuário (RLS), nunca com a secret key. Os contadores
+  da API (`activeProcessCount`, `processCount`) vêm de dois `count` embutidos do PostgREST sobre
+  `processes`, o segundo restrito a `status = 'active'` por filtro embutido; o RLS vale para as
+  linhas embutidas também.
+- **Paginação.** A lista segue `created_at DESC, id ASC` (índice `clients (created_at DESC, id)`) e
+  usa keyset. O PostgREST não compara tuplas e `.or()` não pode levar valor (§3.8), então a página
+  seguinte são duas consultas simples: as linhas com o **mesmo** `created_at` e `id` maior, e, se a
+  página não encheu, as mais antigas (`created_at <` posição). O cursor é opaco, do `kind`
+  `admin-clients`, e leva `{ c, i }`: o `created_at` exatamente como o banco o devolveu (com
+  microssegundos, que um `Date` perderia) e o `id`. Cursor adulterado, truncado, de outro endpoint ou
+  com payload fora do formato é 400 `VALIDATION_ERROR` em `query.cursor` (E-29). O `c` precisa ser um
+  instante de 2000 em diante e com offset de até 15:59 (o que o Postgres lê; ano 0000 ou offset de
+  23:59 seriam um 500, F-53), e um erro da classe 22 do banco numa posição recebida também vira esse
+  400. Um cursor bem formado só move a posição dentro do que o CEO já pode ler.
+- **Para outros módulos.** `tracking/index.ts` exporta `getClientStatus(supabase, clientId)`: `{ id,
+  name, archived }` ou `null` (o RLS esconde o que a sessão não vê). `getClientSummary` é a mesma
+  leitura sem o `archived`. A Onda 7 usa o status para recusar login novo de cliente arquivado
+  (E-16).
 
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
@@ -809,7 +853,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-18 | Limite de 10 logins por cliente atingido | 422 `USER_LIMIT_REACHED` |
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
-| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`; escritas são atômicas, então o retry é seguro |
+| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o de um `POST` que cria sem chave natural (cliente, processo) **pode duplicar**, então o CEO confere a lista antes de repetir (F-51) |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
@@ -818,7 +862,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-27 | Enroll com fator já verificado | 409 `MFA_ALREADY_ENROLLED` |
 | E-28 | Código TOTP errado | 422 `INVALID_MFA_CODE`; conta no rate limit (5 / 5 min) |
 | E-29 | Cursor de paginação adulterado | 400 `VALIDATION_ERROR` |
-| E-30 | Texto com caracteres de controle ou Unicode não normalizado | Normaliza para NFC e rejeita caracteres de controle (400) |
+| E-30 | Texto com caracteres de controle ou Unicode não normalizado | Normaliza para NFC e rejeita caracteres de controle e de formatação, "fillers" invisíveis, texto sem nenhuma letra ou número e surrogate UTF-16 solto (400) |
 | E-31 | Verify sem `factorId` e a conta sem fator TOTP, ou com mais de um fator no mesmo estado | 422 `INVALID_MFA_CODE`, igual a código errado; conta nos dois limites; o log diz `factor_not_found` ou `factor_ambiguous` |
 
 ---

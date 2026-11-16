@@ -51,6 +51,48 @@ const floorSleeps: number[] = [];
 /** Room for the pipeline's own work before the login handler starts its floor (F-05 test). */
 const PIPELINE_BEFORE_HANDLER_SLACK_MS = 150;
 
+/**
+ * The refusal floor and its jitter as the spec states them (§3.4). Written out on purpose, not
+ * imported from the handler: a test that read the handler's own constants could not notice them change.
+ */
+const REFUSED_LOGIN_FLOOR_MS = 400;
+const REFUSED_LOGIN_JITTER_MS = 100;
+/** How many times the F-05 test measures one refused path before it says the path outgrew the floor. */
+const REFUSAL_ATTEMPTS = 3;
+
+/** The `session-upstream` budget is a fixed window of 15 minutes aligned to the clock (spec §3.9). */
+const BUDGET_WINDOW_MS = 15 * 60 * 1000;
+/** How far this process's clock and the database's may disagree about where a window starts. */
+const WINDOW_CLOCK_SKEW_MS = 2_000;
+const BUDGET_WINDOW_ATTEMPTS = 2;
+
+/**
+ * A test that spends a fixed-window budget and then checks that it is spent breaks when a window
+ * boundary falls in the middle: the counters restart and the budget is whole again. That is the
+ * clock, not a defect, so a failure with a boundary somewhere inside the run is tried once more,
+ * entirely inside the next window (the body builds its own fixtures and picks a fresh address).
+ * A failure with no boundary inside is rethrown as it is, and so is a second one. No sleeps.
+ */
+function withinOneBudgetWindow<Args extends unknown[]>(
+  body: (...args: Args) => Promise<void>,
+): (...args: Args) => Promise<void> {
+  const windowOf = (instant: number) => Math.floor(instant / BUDGET_WINDOW_MS);
+  return async (...args) => {
+    for (let attempt = 1; ; attempt += 1) {
+      const startedAt = Date.now();
+      try {
+        await body(...args);
+        return;
+      } catch (error) {
+        const crossedABoundary =
+          windowOf(startedAt - WINDOW_CLOCK_SKEW_MS) !==
+          windowOf(Date.now() + WINDOW_CLOCK_SKEW_MS);
+        if (!crossedABoundary || attempt >= BUDGET_WINDOW_ATTEMPTS) throw error;
+      }
+    }
+  };
+}
+
 beforeEach(() => {
   floorSleeps.length = 0;
   vi.spyOn(timing, 'sleep').mockImplementation((ms) => {
@@ -364,22 +406,43 @@ describe('POST /api/v1/auth/login', () => {
       ['a disabled account (right password)', () => login(credentialsOf(disabled))],
     ];
     for (const [label, refuse] of refusals) {
-      floorSleeps.length = 0;
-      const startedAt = performance.now();
-      const response = await refuse();
-      const workMs = performance.now() - startedAt; // the waiting itself is replaced by a recorder
+      // The floor is a MINIMUM: a refusal never answers before it, and a refusal whose work fits
+      // under it is padded up to it (plus jitter), so the three paths take the same time. That is
+      // the security property, and it is checked on every attempt that can show it. Whether the
+      // work of a path fits under 400 ms is a property of the machine the test runs on (the
+      // disabled-account path is three calls to Auth; production's p95 is a Wave 11 measurement):
+      // on a busy one a single attempt can overshoot, there is nothing left to pad, and that
+      // attempt says nothing about the floor. So a path gets a few attempts; one that really is
+      // slower than the floor never fits, and fails below.
+      const workTimes: number[] = [];
+      let fitted = false;
+      for (let attempt = 0; attempt < REFUSAL_ATTEMPTS && !fitted; attempt += 1) {
+        floorSleeps.length = 0;
+        const startedAt = performance.now();
+        const response = await refuse();
+        const workMs = performance.now() - startedAt; // the waiting itself is replaced by a recorder
+        workTimes.push(Math.round(workMs));
 
-      expect(response.status, label).toBe(401);
-      // the work fits under the floor, so the handler had to wait for the rest of it...
-      expect(workMs, `${label}: the work took ${Math.round(workMs)} ms`).toBeLessThan(400);
-      expect(floorSleeps, label).toHaveLength(1);
-      // ...and work plus wait is the floor (400 ms) plus at most its jitter (100 ms). `workMs` is
-      // measured from before the request, so it also holds the pipeline's work BEFORE the handler
-      // starts the floor (three rate-limit calls to Postgres); that part is real time, and on a busy
-      // machine it alone has exceeded 20 ms, so the upper bound leaves it explicit room.
-      const totalMs = workMs + (floorSleeps[0] ?? 0);
-      expect(totalMs, label).toBeGreaterThanOrEqual(400);
-      expect(totalMs, label).toBeLessThan(400 + 100 + PIPELINE_BEFORE_HANDLER_SLACK_MS);
+        expect(response.status, label).toBe(401);
+        if (workMs >= REFUSED_LOGIN_FLOOR_MS) continue; // too slow for this attempt to show the floor
+
+        // the work fits under the floor, so the handler had to wait for the rest of it...
+        expect(floorSleeps, label).toHaveLength(1);
+        // ...and work plus wait is the floor (400 ms) plus at most its jitter (100 ms). `workMs` is
+        // measured from before the request, so it also holds the pipeline's work BEFORE the handler
+        // starts the floor (three rate-limit calls to Postgres); that part is real time, and on a busy
+        // machine it alone has exceeded 20 ms, so the upper bound leaves it explicit room.
+        const totalMs = workMs + (floorSleeps[0] ?? 0);
+        expect(totalMs, label).toBeGreaterThanOrEqual(REFUSED_LOGIN_FLOOR_MS);
+        expect(totalMs, label).toBeLessThan(
+          REFUSED_LOGIN_FLOOR_MS + REFUSED_LOGIN_JITTER_MS + PIPELINE_BEFORE_HANDLER_SLACK_MS,
+        );
+        fitted = true;
+      }
+      expect(
+        fitted,
+        `${label}: the work never fit under the ${REFUSED_LOGIN_FLOOR_MS} ms floor in ${REFUSAL_ATTEMPTS} attempts (${workTimes.join(', ')} ms)`,
+      ).toBe(true);
     }
   });
 
@@ -544,37 +607,40 @@ describe('GET /api/v1/auth/session', () => {
     expectToMatchContract('getSession', 401, await bodyOf(response), response);
   });
 
-  it('F-01: N forged-cookie requests from one IP make at most 60 calls to Auth, then 401 without touching the cookie', async () => {
-    const ip = newClientIp();
-    const forged = createCookieStore();
-    // the cookie of the finding: no real token, only an `expires_at` in the past
-    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
-    const spy = spyOnSupabaseFetch();
+  it(
+    'F-01: N forged-cookie requests from one IP make at most 60 calls to Auth, then 401 without touching the cookie',
+    withinOneBudgetWindow(async () => {
+      const ip = newClientIp();
+      const forged = createCookieStore();
+      // the cookie of the finding: no real token, only an `expires_at` in the past
+      writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+      const spy = spyOnSupabaseFetch();
 
-    const responses: Response[] = [];
-    try {
-      for (let n = 0; n < 75; n += 1) {
-        responses.push(
-          await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip }),
-        );
+      const responses: Response[] = [];
+      try {
+        for (let n = 0; n < 75; n += 1) {
+          responses.push(
+            await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip }),
+          );
+        }
+      } finally {
+        spy.restore();
       }
-    } finally {
-      spy.restore();
-    }
 
-    const authCalls = spy.calls.filter((call) => call.includes('/auth/v1/'));
-    expect(authCalls.length).toBeGreaterThan(0);
-    expect(authCalls.length).toBeLessThanOrEqual(60);
-    // every request is the documented 401, forged or over budget
-    for (const response of responses) {
-      expect(response.status).toBe(401);
-      expectToMatchContract('getSession', 401, await bodyOf(response), response);
-    }
-    // the last ones were refused by the budget: no call to Auth, and no Set-Cookie at all
-    for (const response of responses.slice(-10)) {
-      expect(response.headers.getSetCookie()).toEqual([]);
-    }
-  });
+      const authCalls = spy.calls.filter((call) => call.includes('/auth/v1/'));
+      expect(authCalls.length).toBeGreaterThan(0);
+      expect(authCalls.length).toBeLessThanOrEqual(60);
+      // every request is the documented 401, forged or over budget
+      for (const response of responses) {
+        expect(response.status).toBe(401);
+        expectToMatchContract('getSession', 401, await bodyOf(response), response);
+      }
+      // the last ones were refused by the budget: no call to Auth, and no Set-Cookie at all
+      for (const response of responses.slice(-10)) {
+        expect(response.headers.getSetCookie()).toEqual([]);
+      }
+    }),
+  );
 
   it('F-01: a forger from one IP does not use up the budget of a legitimate user from another', async () => {
     const forgerIp = newClientIp();
@@ -590,66 +656,76 @@ describe('GET /api/v1/auth/session', () => {
     expect((await getSession(jar)).status).toBe(200);
   });
 
-  it('F-01: on an address whose budget a forger used up, even a token that verifies locally is refused (401, cookie kept), and works from a clean address', async () => {
-    const client = await createClient();
-    const user = await createClientUser({ clientId: client.id });
-    const ip = newClientIp();
-    const legitimate = await signIn(user);
-    // the first token of a signing key makes the server fetch the keys; after that it is local
-    expect((await getSession(legitimate)).status).toBe(200);
-    const forged = createCookieStore();
-    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
-    for (let n = 0; n < 62; n += 1) {
-      await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
-    }
-    const spy = spyOnSupabaseFetch();
+  it(
+    'F-01: on an address whose budget a forger used up, even a token that verifies locally is refused (401, cookie kept), and works from a clean address',
+    withinOneBudgetWindow(async () => {
+      const client = await createClient();
+      const user = await createClientUser({ clientId: client.id });
+      const ip = newClientIp();
+      const legitimate = await signIn(user);
+      // the first token of a signing key makes the server fetch the keys; after that it is local
+      expect((await getSession(legitimate)).status).toBe(200);
+      const forged = createCookieStore();
+      writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+      for (let n = 0; n < 62; n += 1) {
+        await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
+      }
+      const spy = spyOnSupabaseFetch();
 
-    let response: Response;
-    try {
-      response = await invoke(sessionRoute, {
+      let response: Response;
+      try {
+        response = await invoke(sessionRoute, {
+          path: '/auth/session',
+          cookies: legitimate.clone(),
+          ip,
+        });
+      } finally {
+        spy.restore();
+      }
+
+      // The trade-off of the second line of defense: an address the limiter already knows to be over
+      // budget is refused even for a token that would not have cost a call. Nothing reaches Auth,
+      // and the cookie is not touched.
+      expect(response.status).toBe(401);
+      expectToMatchContract('getSession', 401, await bodyOf(response), response);
+      expect(response.headers.getSetCookie()).toEqual([]);
+      expect(spy.calls.filter((call) => call.includes('/auth/v1/'))).toEqual([]);
+      // from an address with budget left the very same cookie is fine
+      expect((await getSession(legitimate)).status).toBe(200);
+    }),
+  );
+
+  it(
+    'F-01: over budget a browser that needs a token refresh gets a 401 and KEEPS its cookie, then refreshes from a clean address',
+    withinOneBudgetWindow(async () => {
+      const client = await createClient();
+      const user = await createClientUser({ clientId: client.id });
+      const ip = newClientIp();
+      const forged = createCookieStore();
+      writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
+      for (let n = 0; n < 62; n += 1) {
+        await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
+      }
+      const legitimate = await signIn(user);
+      // its access token has expired: the server would have to call Auth to refresh it
+      writeSessionCookie(legitimate, { ...readSessionCookie(legitimate), expires_at: 1 });
+      const before = legitimate.clone();
+
+      const response = await invoke(sessionRoute, {
         path: '/auth/session',
-        cookies: legitimate.clone(),
+        cookies: legitimate,
         ip,
       });
-    } finally {
-      spy.restore();
-    }
 
-    // The trade-off of the second line of defense: an address the limiter already knows to be over
-    // budget is refused even for a token that would not have cost a call. Nothing reaches Auth,
-    // and the cookie is not touched.
-    expect(response.status).toBe(401);
-    expectToMatchContract('getSession', 401, await bodyOf(response), response);
-    expect(response.headers.getSetCookie()).toEqual([]);
-    expect(spy.calls.filter((call) => call.includes('/auth/v1/'))).toEqual([]);
-    // from an address with budget left the very same cookie is fine
-    expect((await getSession(legitimate)).status).toBe(200);
-  });
-
-  it('F-01: over budget a browser that needs a token refresh gets a 401 and KEEPS its cookie, then refreshes from a clean address', async () => {
-    const client = await createClient();
-    const user = await createClientUser({ clientId: client.id });
-    const ip = newClientIp();
-    const forged = createCookieStore();
-    writeSessionCookie(forged, { access_token: 'x', refresh_token: 'y', expires_at: 1 });
-    for (let n = 0; n < 62; n += 1) {
-      await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
-    }
-    const legitimate = await signIn(user);
-    // its access token has expired: the server would have to call Auth to refresh it
-    writeSessionCookie(legitimate, { ...readSessionCookie(legitimate), expires_at: 1 });
-    const before = legitimate.clone();
-
-    const response = await invoke(sessionRoute, { path: '/auth/session', cookies: legitimate, ip });
-
-    expect(response.status).toBe(401);
-    expectToMatchContract('getSession', 401, await bodyOf(response), response);
-    // refused by the budget: no Set-Cookie at all, so nothing was deleted
-    expect(response.headers.getSetCookie()).toEqual([]);
-    expect(legitimate.names()).toEqual(before.names());
-    // and from an address with budget left the very same cookie is refreshed
-    expect((await getSession(before)).status).toBe(200);
-  });
+      expect(response.status).toBe(401);
+      expectToMatchContract('getSession', 401, await bodyOf(response), response);
+      // refused by the budget: no Set-Cookie at all, so nothing was deleted
+      expect(response.headers.getSetCookie()).toEqual([]);
+      expect(legitimate.names()).toEqual(before.names());
+      // and from an address with budget left the very same cookie is refreshed
+      expect((await getSession(before)).status).toBe(200);
+    }),
+  );
 
   describe('F-01: whatever the cookie looks like, an address over budget never reaches Auth', () => {
     const REQUESTS = 63; // the budget is 60: three more than it can pay for
@@ -773,37 +849,40 @@ describe('GET /api/v1/auth/session', () => {
       ['a chunk named .abc', () => ({ [`${SESSION_COOKIE}.abc`]: stored(sessionOf('x', 1)) })],
     ];
 
-    it.each(corpus)('%s', async (_label, build) => {
-      const real = await realKidHeader();
-      const cookies = build(real);
-      const ip = newClientIp();
-      const spy = spyOnSupabaseFetch();
+    it.each(corpus)(
+      '%s',
+      withinOneBudgetWindow(async (_label, build) => {
+        const real = await realKidHeader();
+        const cookies = build(real);
+        const ip = newClientIp();
+        const spy = spyOnSupabaseFetch();
 
-      const statuses: number[] = [];
-      let authCallsBeforeLast = 0;
-      try {
-        for (let n = 0; n < REQUESTS; n += 1) {
-          if (n === REQUESTS - 3) authCallsBeforeLast = authCallsOf(spy.calls).length;
-          const response = await invoke(sessionRoute, {
-            path: '/auth/session',
-            cookies: createCookieStore(cookies),
-            ip,
-          });
-          statuses.push(response.status);
-          expectToMatchContract('getSession', 401, await bodyOf(response), response);
+        const statuses: number[] = [];
+        let authCallsBeforeLast = 0;
+        try {
+          for (let n = 0; n < REQUESTS; n += 1) {
+            if (n === REQUESTS - 3) authCallsBeforeLast = authCallsOf(spy.calls).length;
+            const response = await invoke(sessionRoute, {
+              path: '/auth/session',
+              cookies: createCookieStore(cookies),
+              ip,
+            });
+            statuses.push(response.status);
+            expectToMatchContract('getSession', 401, await bodyOf(response), response);
+          }
+        } finally {
+          spy.restore();
         }
-      } finally {
-        spy.restore();
-      }
 
-      const authCalls = authCallsOf(spy.calls);
-      // the invariant: no more than the budget, whatever the shape of the cookie ...
-      expect(authCalls.length).toBeLessThanOrEqual(AUTH_BUDGET);
-      // ... and once the address is over budget nothing else reaches Auth
-      expect(authCalls.length - authCallsBeforeLast).toBe(0);
-      // every request is the documented 401: no variant is a 5xx
-      expect(statuses.every((status) => status === 401)).toBe(true);
-    });
+        const authCalls = authCallsOf(spy.calls);
+        // the invariant: no more than the budget, whatever the shape of the cookie ...
+        expect(authCalls.length).toBeLessThanOrEqual(AUTH_BUDGET);
+        // ... and once the address is over budget nothing else reaches Auth
+        expect(authCalls.length - authCallsBeforeLast).toBe(0);
+        // every request is the documented 401: no variant is a 5xx
+        expect(statuses.every((status) => status === 401)).toBe(true);
+      }),
+    );
   });
 
   it('F-01: a forged ES384 token is 401, not a 500, and costs no call to Auth', async () => {

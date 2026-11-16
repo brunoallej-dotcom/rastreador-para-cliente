@@ -13,7 +13,7 @@
 | 3 | Identidade: login, logout, sessão, rate limit real | 1, 2 | — | ✅ |
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
-| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | 🟡 |
+| 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
