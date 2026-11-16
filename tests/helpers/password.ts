@@ -51,9 +51,9 @@ export type PasswordBody = {
 /**
  * `POST /auth/password` through the real route, with a fresh client IP per call.
  *
- * Every answer the contract documents for the operation is checked against it right here (ADR 0008),
- * so no test can forget: a 204 has no body, the rest are `problem+json` of the documented codes. The
- * one answer left out is 503: the contract documents none for this operation (E-21 can still cause it).
+ * Every answer is checked against the contract right here, so no test can forget: a 204 has no body
+ * (and an optional `Set-Cookie`), the rest are `problem+json` of the documented codes, the 503 of an
+ * outage included (documented since contract 1.0.0-draft.2, ADR 0011).
  */
 export async function changePassword(
   cookies: CookieStore | undefined,
@@ -67,15 +67,12 @@ export async function changePassword(
     ...(cookies === undefined ? {} : { cookies }),
     ...options,
   });
-  if (response.status !== SERVICE_UNAVAILABLE) {
-    const answered = response.status === NO_CONTENT ? undefined : await bodyOf(response);
-    expectToMatchContract('changePassword', response.status, answered, response);
-  }
+  const answered = response.status === NO_CONTENT ? undefined : await bodyOf(response);
+  expectToMatchContract('changePassword', response.status, answered, response);
   return response;
 }
 
 const NO_CONTENT = 204;
-const SERVICE_UNAVAILABLE = 503;
 
 /** Does the database see a live principal behind this access token? (`current_principal()`, no pipeline.) */
 export async function hasLivePrincipal(accessToken: string): Promise<boolean> {

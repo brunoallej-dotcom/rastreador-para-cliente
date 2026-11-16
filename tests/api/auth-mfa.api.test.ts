@@ -646,11 +646,11 @@ describe('POST /api/v1/auth/mfa/totp/verify', () => {
     ['a code that is a number', { factorId: '99999999-9999-4999-8999-999999999999', code: 123456 }],
     ['a factor id that is not a UUID', { factorId: 'abc', code: '123456' }],
     ['no code', { factorId: '99999999-9999-4999-8999-999999999999' }],
-    ['no factor id', { code: '123456' }],
+    ['a factor id that is null', { factorId: null, code: '123456' }],
   ])('AC-23: %s is 400 VALIDATION_ERROR, and the value is not echoed', async (_label, input) => {
     const { cookies } = await loginAsCeoReadyToEnroll();
 
-    const response = await verifyTotpViaApi(cookies, input as { factorId: string; code: string });
+    const response = await verifyTotpViaApi(cookies, input as { factorId?: string; code: string });
 
     expect(response.status).toBe(400);
     const body = await bodyOf(response);
@@ -963,6 +963,302 @@ describe('POST /api/v1/auth/mfa/totp/verify: the daily cap (F-22)', () => {
     const other = await loginAsCeoReadyToEnroll();
     await verifyTotp(other.cookies, await enrollTotp(other.cookies));
     expect((await callAdmin(other.cookies)).status).toBe(200);
+  });
+});
+
+// ----------------------------------------------- the factor of the session (no factorId) ----
+
+describe('POST /api/v1/auth/mfa/totp/verify without a factorId (contract 1.0.0-draft.2)', () => {
+  it('AC-07: a new device: a CEO with a verified factor logs in on a fresh session (VERIFY_MFA), sends only the code, and gets aal2', async () => {
+    const first = await loginAsCeoWithMfa();
+    const fresh = await signInCeoWithMfa(first, { verify: false });
+    // the new device never learned the factor id: all it has is the session and the authenticator
+    expect(await getSession(fresh).then(bodyOf)).toMatchObject({
+      aal: 'aal1',
+      pendingActions: ['VERIFY_MFA'],
+    });
+    expect((await callAdmin(fresh)).status).toBe(403);
+    logged.lines.length = 0;
+
+    const response = await verifyTotpViaApi(fresh, { code: nextTotpCode(first.secret) });
+    const body = await bodyOf(response);
+
+    expect(response.status).toBe(200);
+    expectToMatchContract('verifyTotp', 200, body, response);
+    expect(body).toEqual({
+      user: { id: first.ceo.id, role: 'ceo', displayName: first.ceo.displayName },
+      client: null,
+      aal: 'aal2',
+      pendingActions: [],
+    });
+    // the pending is gone for good: the session, the cookies it got and a CEO route all agree
+    expect(claimsOf(readSessionCookie(fresh).access_token)['aal']).toBe('aal2');
+    expect(await getSession(fresh).then(bodyOf)).toMatchObject({
+      aal: 'aal2',
+      pendingActions: [],
+    });
+    expect((await callAdmin(fresh)).status).toBe(200);
+    // the factor was the CEO's own, resolved by the server; nothing was activated or revoked
+    expect(events('auth.mfa.verified')).toEqual([
+      expect.objectContaining({
+        userId: first.ceo.id,
+        factorId: first.factorId,
+        factorSource: 'session',
+        activated: false,
+      }),
+    ]);
+    expect((await callAdmin(first.cookies)).status).toBe(200);
+    expect(await factorsOf(first.ceo.id)).toEqual([
+      { id: first.factorId, type: 'totp', status: 'verified' },
+    ]);
+  });
+
+  it('AC-07: the first enrollment: enroll, then verify with only the code: the factor is activated, the session is aal2 and the other sessions are signed out (F-20)', async () => {
+    const ceo = await completeFirstAccess(await createCeo());
+    const otherSession = await loginViaApi(ceo);
+    const own = await loginViaApi(ceo);
+    const enrollment = await enrollTotp(own);
+    logged.lines.length = 0;
+
+    const response = await verifyTotpViaApi(own, { code: nextTotpCode(enrollment.secret) });
+    const body = await bodyOf(response);
+
+    expect(response.status).toBe(200);
+    expectToMatchContract('verifyTotp', 200, body, response);
+    expect(body).toMatchObject({ aal: 'aal2', pendingActions: [] });
+    expect(await factorsOf(ceo.id)).toEqual([
+      { id: enrollment.factorId, type: 'totp', status: 'verified' },
+    ]);
+    expect((await callAdmin(own)).status).toBe(200);
+    expect((await getSession(otherSession)).status).toBe(401);
+    expect(events('auth.mfa.verified')).toEqual([
+      expect.objectContaining({
+        factorId: enrollment.factorId,
+        factorSource: 'session',
+        activated: true,
+      }),
+    ]);
+  });
+
+  it('E-28: the factorId of ANOTHER CEO is 422 INVALID_MFA_CODE, even with a code that is right for the caller own factor; and the same code without the id then works', async () => {
+    const victim = await loginAsCeoWithMfa();
+    const mine = await loginAsCeoWithMfa();
+    const code = nextTotpCode(mine.secret);
+    const newDevice = await signInCeoWithMfa(mine, { verify: false });
+    logged.lines.length = 0;
+
+    const foreign = await verifyTotpViaApi(newDevice, { factorId: victim.factorId, code });
+    const foreignBody = await bodyOf(foreign);
+    const wrong = await verifyTotpViaApi(newDevice, {
+      code: wrongTotpCode(mine.secret),
+    });
+
+    expect(foreign.status).toBe(422);
+    expectToMatchContract('verifyTotp', 422, foreignBody, foreign);
+    expect(withoutRequestId(foreignBody)).toEqual(withoutRequestId(await bodyOf(wrong)));
+    expect(foreign.headers.getSetCookie()).toEqual([]);
+    expect(await getSession(newDevice).then(bodyOf)).toMatchObject({ aal: 'aal1' });
+    expect((await callAdmin(newDevice)).status).toBe(403);
+    // the log tells them apart; the response does not
+    expect(events('auth.mfa.failed')).toEqual([
+      expect.objectContaining({
+        reason: 'factor_not_found',
+        factorId: victim.factorId,
+        factorSource: 'request',
+      }),
+      expect.objectContaining({
+        reason: 'invalid_code',
+        factorId: mine.factorId,
+        factorSource: 'session',
+      }),
+    ]);
+
+    // the foreign attempt burned nothing of the caller's: the right code still opens the session
+    const ok = await verifyTotpViaApi(newDevice, { code });
+    expect(ok.status).toBe(200);
+    expect((await callAdmin(newDevice)).status).toBe(200);
+    // and the victim was never touched
+    expect(await factorsOf(victim.ceo.id)).toEqual([
+      { id: victim.factorId, type: 'totp', status: 'verified' },
+    ]);
+  });
+
+  it('F-21: the replay of a code sent without the factorId is 422 INVALID_MFA_CODE (code_reused), like a wrong code, whichever way the factor is named the second time', async () => {
+    const first = await loginAsCeoWithMfa();
+    const second = await signInCeoWithMfa(first, { verify: false });
+    const code = nextTotpCode(first.secret);
+    expect((await verifyTotpViaApi(second, { code })).status).toBe(200);
+    // after the success: the Auth server itself ends the aal1 sessions a verification leaves behind
+    const third = await signInCeoWithMfa(first, { verify: false });
+    logged.lines.length = 0;
+
+    const replay = await verifyTotpViaApi(third, { code });
+    const replayWithId = await verifyTotpViaApi(third, { factorId: first.factorId, code });
+    const wrong = await verifyTotpViaApi(third, { code: wrongTotpCode(first.secret) });
+
+    expect([replay.status, replayWithId.status]).toEqual([422, 422]);
+    const replayBody = await bodyOf(replay);
+    expectToMatchContract('verifyTotp', 422, replayBody, replay);
+    expectToMatchContract('verifyTotp', 422, await bodyOf(replayWithId), replayWithId);
+    expect(withoutRequestId(replayBody)).toEqual(withoutRequestId(await bodyOf(wrong)));
+    expect(replay.headers.getSetCookie()).toEqual([]);
+    expect(await getSession(third).then(bodyOf)).toMatchObject({
+      aal: 'aal1',
+      pendingActions: ['VERIFY_MFA'],
+    });
+    // keyed by the resolved factor: the same one the explicit id names
+    expect(events('auth.mfa.failed').map((event) => [event['reason'], event['factorId']])).toEqual([
+      ['code_reused', first.factorId],
+      ['code_reused', first.factorId],
+      ['invalid_code', first.factorId],
+    ]);
+  });
+
+  it('E-31: a CEO that never enrolled has no factor to resolve: 422 INVALID_MFA_CODE (factor_not_found), the same answer as a wrong code, and nothing changes', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const reference = await loginAsCeoReadyToEnroll();
+    const enrollment = await enrollTotp(reference.cookies);
+    logged.lines.length = 0;
+
+    const response = await verifyTotpViaApi(cookies, { code: '123456' });
+    const body = await bodyOf(response);
+    const wrong = await verifyTotpViaApi(reference.cookies, {
+      code: wrongTotpCode(enrollment.secret),
+    });
+
+    expect(response.status).toBe(422);
+    expectToMatchContract('verifyTotp', 422, body, response);
+    expect(withoutRequestId(body)).toEqual(withoutRequestId(await bodyOf(wrong)));
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(await factorsOf(ceo.id)).toEqual([]);
+    expect(await getSession(cookies).then(bodyOf)).toMatchObject({
+      aal: 'aal1',
+      pendingActions: ['ENROLL_MFA'],
+    });
+    expect(events('auth.mfa.failed')[0]).toMatchObject({
+      reason: 'factor_not_found',
+      factorSource: 'session',
+    });
+    expect(events('auth.mfa.failed')[0]).not.toHaveProperty('factorId');
+  });
+
+  it('E-31: two unverified factors and none verified are ambiguous: 422 (factor_ambiguous), no code is tried on either, and naming the factor is the way out', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const first = await enrollTotp(cookies);
+    // what the app never does (its enrollment keeps one factor) but Auth allows with a name: a
+    // second candidate, created straight at the Auth server with the user's own session
+    const direct = publishableClient();
+    const signedIn = await direct.auth.signInWithPassword({
+      email: ceo.email,
+      password: ceo.password,
+    });
+    expect(signedIn.error).toBeNull();
+    const extra = await direct.auth.mfa.enroll({ factorType: 'totp', friendlyName: 'second' });
+    expect(extra.error).toBeNull();
+    expect(await factorsOf(ceo.id)).toHaveLength(2);
+    logged.lines.length = 0;
+
+    const ambiguous = await verifyTotpViaApi(cookies, { code: nextTotpCode(first.secret) });
+    const wrong = await verifyTotpViaApi(cookies, { code: wrongTotpCode(first.secret) });
+
+    expect(ambiguous.status).toBe(422);
+    expectToMatchContract('verifyTotp', 422, await bodyOf(ambiguous), ambiguous);
+    expect(withoutRequestId(await bodyOf(ambiguous))).toEqual(
+      withoutRequestId(await bodyOf(wrong)),
+    );
+    expect(events('auth.mfa.failed').map((event) => event['reason'])).toEqual([
+      'factor_ambiguous',
+      'factor_ambiguous',
+    ]);
+    // nothing was tried: both factors are still unverified, the session still aal1
+    expect((await factorsOf(ceo.id)).map((factor) => factor.status)).toEqual([
+      'unverified',
+      'unverified',
+    ]);
+    expect(await getSession(cookies).then(bodyOf)).toMatchObject({ aal: 'aal1' });
+
+    // the deprecated field is exactly for this: the factor named is the caller's own, and it works
+    const named = await verifyTotpViaApi(cookies, {
+      factorId: first.factorId,
+      code: nextTotpCode(first.secret),
+    });
+    expect(named.status).toBe(200);
+    expect((await callAdmin(cookies)).status).toBe(200);
+  });
+
+  it('E-28: the 5 / 5 min limit counts a request without a factorId like any other: the 6th is 429 with Retry-After, even with the right code', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const enrollment = await enrollTotp(cookies);
+
+    for (let attempt = 1; attempt <= VERIFY_LIMIT; attempt += 1) {
+      const response = await verifyTotpViaApi(cookies, {
+        code: wrongTotpCode(enrollment.secret, attempt),
+      });
+      expect(response.status, `attempt ${attempt}`).toBe(422);
+    }
+    const throttled = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+
+    expect(throttled.status).toBe(429);
+    expectToMatchContract('verifyTotp', 429, await bodyOf(throttled), throttled);
+    expect(await factorsOf(ceo.id)).toEqual([
+      { id: enrollment.factorId, type: 'totp', status: 'unverified' },
+    ]);
+  });
+
+  it('F-22: the daily cap counts a request without a factorId too: after 20 attempts the next is 429, and neither the factors nor the code reach Auth', async () => {
+    const { ceo, cookies } = await loginAsCeoReadyToEnroll();
+    const enrollment = await enrollTotp(cookies);
+    const limiter = createPostgresRateLimiter();
+    for (let spent = 1; spent <= VERIFY_DAILY_BUDGET.limit; spent += 1) {
+      const decision = await limiter.consume(
+        {
+          scope: 'user',
+          group: VERIFY_DAILY_BUDGET.group,
+          bucket: `user:${VERIFY_DAILY_BUDGET.group}`,
+          subject: ceo.id,
+        },
+        { scope: 'user', ...VERIFY_DAILY_BUDGET },
+      );
+      expect(decision.allowed, `unit ${spent}`).toBe(true);
+    }
+    logged.lines.length = 0;
+
+    const spy = spyOnSupabaseFetch();
+    let response: Response;
+    try {
+      response = await verifyTotpViaApi(cookies, { code: nextTotpCode(enrollment.secret) });
+    } finally {
+      spy.restore();
+    }
+
+    expect(response.status).toBe(429);
+    expectToMatchContract('verifyTotp', 429, await bodyOf(response), response);
+    expect(events('auth.rate_limited')).toEqual([
+      expect.objectContaining({ scope: 'user', group: 'totp-verify-daily' }),
+    ]);
+    // the cap decided before the factor was resolved: no listing of factors, no challenge, no verify
+    expect(spy.calls.filter((call) => /\/auth\/v1\/(user|factors)/.test(call))).toEqual([]);
+    expect(await factorsOf(ceo.id)).toEqual([
+      { id: enrollment.factorId, type: 'totp', status: 'unverified' },
+    ]);
+  });
+
+  it('SEC-16: resolving the factor logs ids only: no code, no secret and no token', async () => {
+    const first = await loginAsCeoWithMfa();
+    const fresh = await signInCeoWithMfa(first, { verify: false });
+    logged.lines.length = 0;
+    const right = nextTotpCode(first.secret);
+    const wrong = wrongTotpCode(first.secret);
+
+    expect((await verifyTotpViaApi(fresh, { code: wrong })).status).toBe(422);
+    expect((await verifyTotpViaApi(fresh, { code: right })).status).toBe(200);
+
+    const values = records().flatMap(valuesOf);
+    expect(values).not.toContain(right);
+    expect(values).not.toContain(wrong);
+    expect(logged.lines.join('\n')).not.toContain(first.secret);
+    expect(logged.lines.join('\n')).not.toMatch(/eyJ[\w-]+\./);
+    expect(records().flatMap((record) => Object.keys(record))).not.toContain('code');
   });
 });
 

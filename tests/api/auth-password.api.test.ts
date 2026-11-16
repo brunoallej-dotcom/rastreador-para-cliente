@@ -30,6 +30,7 @@ import {
   createCookieStore,
   invoke,
   readSessionCookie,
+  writeSessionCookie,
   type CookieStore,
 } from '../helpers/http';
 import {
@@ -237,6 +238,30 @@ describe('AC-06: the change of password', () => {
     expect(sessionIdOfToken(readSessionCookie(jar).access_token)).toBe(
       sessionIdOfToken(before.access_token),
     );
+  });
+
+  it('AC-06: when the access token is renewed during the call, the 204 carries the renewed session cookie (Set-Cookie is optional in the contract), and it keeps working', async () => {
+    const user = await clientUser();
+    const jar = await sessionJarFor(user);
+    const before = readSessionCookie(jar);
+    // the client library decides to refresh from `expires_at`: make the token look expired
+    writeSessionCookie(jar, { ...before, expires_at: 1 });
+
+    const response = await changePassword(jar, {
+      currentPassword: user.password,
+      newPassword: FRESH,
+    });
+
+    expect(response.status).toBe(204);
+    // `changePassword` already checked the 204 against the contract, header included
+    const cookies = response.headers.getSetCookie();
+    expect(cookies.length).toBeGreaterThan(0);
+    for (const cookie of cookies) expect(cookie).toMatch(/^__Host-rt-session(\.\d+)?=/);
+    const after = readSessionCookie(jar);
+    expect(after.refresh_token).not.toBe(before.refresh_token);
+    expect(sessionIdOfToken(after.access_token)).toBe(sessionIdOfToken(before.access_token));
+    expect(await mustChangePassword(user.id)).toBe(false);
+    expect((await getSession(jar)).status).toBe(200);
   });
 
   it('AC-06: it revokes the OTHER sessions of the user and keeps the current one', async () => {
@@ -563,6 +588,10 @@ describe('E-12: the new password follows the policy', () => {
     ['73 bytes', 'a'.repeat(73)],
     ['74 bytes in 37 two-byte letters', 'é'.repeat(37)],
     ['an empty password', ''],
+    [
+      '5000 characters (the contract declares no maximum: it is the policy that refuses)',
+      'x'.repeat(5000),
+    ],
   ])(
     'E-12: %s is 422 WEAK_PASSWORD (contract), not 400, and Auth is not even called',
     async (_label, newPassword) => {
@@ -695,6 +724,11 @@ describe('POST /auth/password: access, input and limits', () => {
         'a current password of 73 bytes',
         () => ({ currentPassword: 'x'.repeat(73), newPassword: FRESH }),
       ],
+      [
+        // 37 characters, so within the schema's `maxLength: 72`, but 74 BYTES: the limit is bytes
+        'a current password of 74 bytes in 37 two-byte letters',
+        () => ({ currentPassword: 'é'.repeat(37), newPassword: FRESH }),
+      ],
     ];
 
     for (const [label, body] of cases) {
@@ -710,6 +744,21 @@ describe('POST /auth/password: access, input and limits', () => {
       expect(await mustChangePassword(user.id), label).toBe(true);
       expect(await canSignIn(user.email, user.password), label).toBe(true);
     }
+  });
+
+  it('a current password of exactly 72 bytes (36 two-byte letters) is NOT a 400: the size is bytes, and a wrong one of that size is 422 INVALID_CURRENT_PASSWORD', async () => {
+    const user = await clientUser();
+    const jar = await sessionJarFor(user);
+
+    const response = await changePassword(jar, {
+      currentPassword: 'é'.repeat(36),
+      newPassword: FRESH,
+    });
+
+    expect(response.status).toBe(422);
+    const body = await bodyOf(response);
+    expect(body).toMatchObject({ code: 'INVALID_CURRENT_PASSWORD' });
+    expectToMatchContract('changePassword', 422, body, response);
   });
 
   it('SEC-06: the 400 for an unknown field names the field', async () => {
