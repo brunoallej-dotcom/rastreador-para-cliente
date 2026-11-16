@@ -27,7 +27,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/modules/*/domain/**', 'src/modules/*/application/**'],
-      exclude: ['**/*.test.ts'],
+      // The in-memory fakes and the fixtures that only tests import are not code under test: counting
+      // them would let an easy 100% in a fake pay for an untested use case.
+      exclude: ['**/*.test.ts', '**/fake-*.ts', '**/*-fixtures.ts'],
       reporter: ['text-summary', 'lcov'],
       // RNF-06: at least 80% in the domain and application layers of tracking (Wave 8). The glob
       // matches a threshold per pattern: a drop below it fails `pnpm test:coverage`.
