@@ -15,4 +15,9 @@ metadata:
   under GoTrue's role from SQL; that needs an integration test via `auth.admin.createUser`.
 - `pnpm db:test` and `pnpm db:lint` are allowed; never `db:reset`/`db:start` during an audit.
 
+- Canonical memory lives in the main checkout `.claude/agent-memory/rls-auditor/`. When run from a
+  worktree, the worktree copy may be deleted mid-run; read and write the main-checkout copy.
+- Manager-run audits may forbid `db:test`/`db:lint` (shared DB not reset to the branch): then audit
+  statically and say the gates were not run.
+
 Related: [[supabase-privilege-pitfalls]].

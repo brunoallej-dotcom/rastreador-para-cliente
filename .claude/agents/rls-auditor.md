@@ -10,7 +10,7 @@ description: >
   RLS", "revisa a migration", "checa isolamento de tenant" ou "o banco está seguro?".
 tools: Read, Grep, Glob, Bash(git diff *), Bash(git status *), Bash(git log *), Bash(git show *), Bash(pnpm db:test), Bash(pnpm db:lint)
 model: inherit
-maxTurns: 25
+maxTurns: 35
 memory: project
 ---
 

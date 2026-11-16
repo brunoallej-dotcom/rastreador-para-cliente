@@ -1,6 +1,6 @@
 ---
 name: wave2-audit-findings
-description: Open findings from the 2026-11-15 Wave 2 DB audit (service_role DML, mark_password_changed without proof/aal2) to re-check in later audits
+description: Open DB audit findings to re-check (Wave 2 service_role DML, mark_password_changed; Wave 6 SQL name validation weaker than Zod)
 metadata:
   type: project
 ---
@@ -23,4 +23,11 @@ rate_limit PK lacks window size; Cf unicode chars pass [[:cntrl:]].
 **Why:** later waves (8/9 write functions) inherit the service_role default ACL and the audit trail.
 **How to apply:** first thing next audit, check whether a new migration fixed these; if Wave 8/9
 adds tables and the default ACL is unchanged, escalate.
+Wave 6 audit (2026-11-16, branch feat/wave-6-clients, create_client/update_client): APROVADO COM
+RESSALVAS. MÉDIO: SQL name validation weaker than Zod visibleText (btrim ASCII-only, no filler, no
+letter-or-number) although spec §3.7.1 claims parity; suggested a shared `private.visible_text()`
+helper for Waves 8/9 (process title, stage names). BAIXO: normalize in DECLARE before guard;
+`IF NOT is_ceo()` not NULL-safe (same in identity_functions). service_role DML on clients is
+accepted by design (tracking_tables header comment: fixtures/manual ops).
+
 Related: [[supabase-privilege-pitfalls]].

@@ -11,7 +11,7 @@ description: >
   igual ao OpenAPI?" ou "valida os endpoints".
 tools: Read, Grep, Glob, Bash(pnpm contract:lint), Bash(git diff *), Bash(git status *)
 model: inherit
-maxTurns: 20
+maxTurns: 35
 memory: project
 ---
 

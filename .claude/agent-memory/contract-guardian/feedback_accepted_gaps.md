@@ -7,7 +7,7 @@ metadata:
 
 Do not re-report these as divergences:
 
-- **503 on infrastructure failure** (limiter or Supabase down, E-21/E-22) in operations whose `responses` lack 503 (e.g. `logout`, `getSession`). Accepted in `docs/adr/0008-contrato-estrito-e-entrada-nao-declarada.md`; tests intentionally do not run `expectToMatchContract` on those 503s.
+- **503 on infrastructure failure** (ONLY while the contract is `1.0.0-draft.1`; `1.0.0-draft.2` documents 503 on every authenticated op and ADR 0011 partly supersedes ADR 0008, so after it merges a 503 without `expectToMatchContract` is a real gap) (limiter or Supabase down, E-21/E-22) in operations whose `responses` lack 503 (e.g. `logout`, `getSession`). Accepted in `docs/adr/0008-contrato-estrito-e-entrada-nao-declarada.md`; tests intentionally do not run `expectToMatchContract` on those 503s.
 - Routes without a body schema do not read the body (no 400/413/415); routes without a query schema ignore unknown params.
 - Rate-limit `group` names (`login`, `writes`, `reads`, `health`...) are an implementation detail; compare only scope/limit/windowSeconds against `x-rate-limit`.
 
