@@ -1533,4 +1533,91 @@ describe('Supabase failing', () => {
     expect(repeated.status).toBe(200);
     expect(body).toMatchObject({ title, version: 2 });
   });
+
+  it('E-60, E-21: a cancel whose answer was lost (503) and is repeated is 422 PROCESS_NOT_ACTIVE: it was saved, the retry undoes nothing', async () => {
+    const tenant = await createClient();
+    const created = await createProcessOrFail(outageCeo.cookies, tenant.id);
+    const realFetch = globalThis.fetch;
+    // the function runs and commits; what the app never receives is its answer
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      const answer = await realFetch(input, init);
+      if (!url.includes('/rest/v1/rpc/update_process')) return answer;
+      void answer.body?.cancel();
+      throw new TypeError('fetch failed');
+    });
+    let lost: Response;
+    try {
+      lost = await updateProcessViaApi(outageCeo.cookies, created.id, { status: 'cancelled' });
+    } finally {
+      spy.mockRestore();
+    }
+    await expectUnavailable('updateProcess', lost);
+    const saved = await processRowOf(created.id);
+    expect(saved).toMatchObject({ status: 'cancelled', version: 2 });
+
+    const repeated = await updateProcessViaApi(outageCeo.cookies, created.id, {
+      status: 'cancelled',
+    });
+    const body = await expectContract<Problem>('updateProcess', repeated);
+
+    expect(outcomeOf(repeated, body)).toEqual([422, 'PROCESS_NOT_ACTIVE']);
+    expect(await processRowOf(created.id)).toEqual(saved);
+    // the CEO reads the process to see what the lost answer would have said
+    const detail = await expectContract<ProcessDetailBody>(
+      'getProcess',
+      await getProcessViaApi(outageCeo.cookies, created.id),
+    );
+    expect(detail).toMatchObject({ status: 'cancelled', version: 2 });
+    expect((await auditOfProcess(created.id)).map((row) => row.action)).toEqual([
+      'process.created',
+      'process.cancelled',
+    ]);
+  });
+});
+
+describe('the rate limit of the process reads (x-rate-limit: 300 / min per CEO)', () => {
+  // A CEO of its own: the 300 reads it spends must not come out of the budget of any other test.
+  const READ_LIMIT = 300;
+  const BATCH = 30;
+  /** More than two windows of reads: a minute boundary in the middle cannot hide the cap. */
+  const MAX_READS = READ_LIMIT * 2 + BATCH;
+
+  it('SEC-09: the read after the 300th in a minute is 429 RATE_LIMITED with a Retry-After, and the answer matches the contract', async () => {
+    const limited = await loginAsCeoWithMfa();
+
+    const throttled: Response[] = [];
+    let ok = 0;
+    for (let sent = 0; sent < MAX_READS && throttled.length === 0; sent += BATCH) {
+      const batch = await Promise.all(
+        Array.from({ length: BATCH }, () => getStageTemplateViaApi(limited.cookies)),
+      );
+      for (const response of batch) {
+        if (response.status === 429) throttled.push(response);
+        else if (response.status === 200) ok += 1;
+        else throw new Error(`a read answered ${response.status}, neither 200 nor 429`);
+      }
+    }
+
+    expect(throttled.length).toBeGreaterThanOrEqual(1);
+    // the reads that got through are at most the limit of the window they fell in (two windows at most)
+    expect(ok).toBeGreaterThanOrEqual(1);
+    expect(ok).toBeLessThanOrEqual(READ_LIMIT * 2);
+    for (const response of throttled) {
+      const body = await expectContract<Problem>('getDefaultStageTemplate', response);
+      expect(body.code).toBe('RATE_LIMITED');
+      const retryAfter = Number(response.headers.get('retry-after'));
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(60);
+    }
+  }, 180_000);
+
+  it('SEC-09: the budget is the CEO’s own: another CEO still reads after the first one is throttled', async () => {
+    const other = await loginAsCeoWithMfa();
+
+    const response = await getStageTemplateViaApi(other.cookies);
+    await expectContract<StageTemplateBody>('getDefaultStageTemplate', response);
+
+    expect(response.status).toBe(200);
+  });
 });
