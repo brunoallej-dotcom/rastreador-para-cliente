@@ -6,7 +6,8 @@ const fromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url))
 // Slower projects (int/api) share ONE local Supabase: files run one at a time.
 const dbProject = {
   globalSetup: ['tests/setup/local-env.ts'],
-  setupFiles: ['tests/setup/apply-local-env.ts'],
+  // The env first, then the wait for PostgREST (it reads the env): see the header of the setup file.
+  setupFiles: ['tests/setup/apply-local-env.ts', 'tests/setup/wait-for-postgrest.ts'],
   fileParallelism: false,
   testTimeout: 30_000,
   hookTimeout: 60_000,
