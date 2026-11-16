@@ -5,7 +5,9 @@ import type { Client, ClientListQuery, ClientPage, ClientPatch } from './client'
  * Clients of the CURRENT request's session (the database decides what the session may do: reads by
  * RLS, writes by `SECURITY DEFINER` functions that check the CEO role, `aal2` and the TOTP factor).
  *
- * Every method throws `ServiceUnavailableError` when the database is slow or down (E-21). A refusal
+ * Every method throws `ServiceUnavailableError` when the database is slow or down (E-21); so do
+ * `create` and `update` when Postgres rolled the transaction back (deadlock, serialization failure:
+ * nothing was written, repeating is safe). A refusal
  * by the database comes back as an `err` of the matching domain error (spec §3.7):
  * `ForbiddenError` (42501: the pipeline should have stopped this caller), `NotFoundError`,
  * `ValidationError` (invalid input) or `ConflictError` (the name is already an active client's:

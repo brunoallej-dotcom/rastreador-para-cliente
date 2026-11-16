@@ -399,6 +399,25 @@ describe('create', () => {
     }
   });
 
+  it.each([
+    ['40P01', 500],
+    ['40001', 500],
+    ['40P01', 400],
+    ['40001', 409],
+  ])(
+    'F-51: %s (HTTP %i) on create is a ServiceUnavailableError (503), with the SQLSTATE only in the cause',
+    async (code, status) => {
+      const message = 'deadlock detected Process 1 waits for ... Key (name)=(Cliente Secreto)';
+      const { supabase } = fakeSupabase([failure(code, message, status)]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const error: unknown = await repository.create('Acme').catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      expect((error as { cause?: unknown }).cause).toEqual({ code, status });
+    },
+  );
+
   it('F-51: a raw 23505 is not the documented path: it is unexpected (500), with the SQLSTATE only', async () => {
     // The database functions turn the violation of the name index into CLIENT_NAME_TAKEN; a bare
     // unique violation would be any other index, so it must not become a 409.
@@ -530,6 +549,27 @@ describe('update', () => {
         expect(result.error).toBeInstanceOf(ConflictError);
         expect(result.error.detail).toBe('A client with this name already exists.');
       }
+      expect(queries).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['40P01', 500],
+    ['40001', 500],
+    ['40P01', 400],
+    ['40001', 409],
+  ])(
+    'F-51: %s (HTTP %i) is a ServiceUnavailableError (503): the transaction rolled back, repeating is safe',
+    async (code, status) => {
+      const { supabase, queries } = fakeSupabase([failure(code, 'deadlock detected', status)]);
+      const repository = createSupabaseClientRepository(supabase, { logger: logger() });
+
+      const error: unknown = await repository
+        .update(A, { name: 'Novo' })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      expect((error as { cause?: unknown }).cause).toEqual({ code, status });
       expect(queries).toHaveLength(1);
     },
   );

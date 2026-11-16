@@ -8,6 +8,7 @@ import {
   ForbiddenError,
   NotFoundError,
   ok,
+  ServiceUnavailableError,
   ValidationError,
   type DomainError,
   type Result,
@@ -33,6 +34,15 @@ const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
  * §3.7.1, F-51), so a raw `23505` is never expected here.
  */
 const NAME_TAKEN_MESSAGE = 'CLIENT_NAME_TAKEN';
+/**
+ * Postgres rolled the whole transaction back and nothing of it persisted (no row, no audit event), so
+ * repeating the call is safe: `deadlock_detected` (two renames that cross wait on each other's
+ * name, F-51) and `serialization_failure`. PostgREST answers both with HTTP 500 (probed on the local
+ * stack; 23505 gets 409), which `upstreamFailure` would already turn into a 503; the SQLSTATE is
+ * matched on its own, whatever the status, so a PostgREST that changes it does not turn a retry
+ * into a 500.
+ */
+const ROLLED_BACK_TRANSIENTLY: ReadonlySet<string> = new Set(['40P01', '40001']);
 
 /**
  * Columns of the read, explicit (no `select *`): the client plus two counters taken from the
@@ -180,6 +190,13 @@ export function createSupabaseClientRepository(
       error.code === STRING_DATA_RIGHT_TRUNCATION
     ) {
       return invalidInput(error.code);
+    }
+    if (error.code !== undefined && ROLLED_BACK_TRANSIENTLY.has(error.code)) {
+      // 503 with Retry-After, like any transient failure: the caller repeats and gets the 409 or
+      // the 200 the first call would have had.
+      throw new ServiceUnavailableError(`${operation}: the transaction was rolled back`, {
+        cause: safeCause(error, status),
+      });
     }
     throw upstreamFailure(operation, safeCause(error, status), status);
   }
