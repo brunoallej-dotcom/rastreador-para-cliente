@@ -2,12 +2,14 @@
 -- `clients_active_name_key`, e `create_client` e `update_client` trocando a violação por
 -- `CLIENT_NAME_TAKEN` (P0001), sem auditoria. Cobre: o índice (único, parcial, só sobre expressões
 -- IMMUTABLE, com comentário), a escrita direta (secret key), a autorização antes da checagem do nome,
--- a criação e a renomeação recusadas por 16 variantes da mesma chave (maiúsculas, largura total,
--- espaços Unicode e repetidos, acento decomposto, ligadura, sinal Kelvin), os nomes que continuam
+-- a criação e a renomeação recusadas por 24 variantes da mesma chave (maiúsculas, largura total,
+-- espaços Unicode e repetidos, acento decomposto, ligadura, sinal Kelvin, marcas de variação
+-- invisíveis), o locale do banco, o formato do erro CLIENT_NAME_TAKEN (sem detalhe, dica nem
+-- constraint), uma violação de outro índice que sobe crua (23505), os nomes que continuam
 -- livres (outro nome, só arquivados, homóglifo cirílico), o desarquivamento, renomear e arquivar na
 -- mesma chamada, e que nenhuma recusa deixa linha nem evento.
 BEGIN;
-SELECT plan(72);
+SELECT plan(95);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- CA, CB, CC, CF, CK, CH e CH2 são clientes ativos; CG, CD1, CD2, CU e CR, arquivados (dois deles com o
@@ -31,7 +33,8 @@ SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 
 -- Grafias que, depois de `visible_text` (NFC, pontas aparadas) e da chave do índice
--- (`lower(normalize(.., NFKC))`, espaços repetidos reduzidos a um), são o nome de um cliente ativo
+-- (`lower(normalize(.., NFKC))`, sem as marcas de variação invisíveis, espaços repetidos reduzidos a
+-- um), são o nome de um cliente ativo
 -- acima: "Acme Ltda" (CA), "Café Central" (CC), "Financeira Ltda" (CF) e "Kilo Ltda" (CK).
 CREATE TEMP TABLE taken_names (label text PRIMARY KEY, value text NOT NULL);
 INSERT INTO taken_names (label, value) VALUES
@@ -51,7 +54,15 @@ INSERT INTO taken_names (label, value) VALUES
   ('acento em maiuscula', 'CAF' || chr(201) || ' CENTRAL'),
   ('acento decomposto em maiuscula', 'CAFE' || chr(769) || ' CENTRAL'),
   ('ligadura fi', chr(64257) || 'nanceira Ltda'),
-  ('sinal Kelvin', chr(8490) || 'ilo Ltda');
+  ('sinal Kelvin', chr(8490) || 'ilo Ltda'),
+  ('U+034F (junção de grafemas) entre as letras', 'Ac' || chr(847) || 'me Ltda'),
+  ('seletor de variacao VS16 U+FE0F', 'Acme' || chr(65039) || ' Ltda'),
+  ('seletor de variacao mongol U+180B', 'Acme' || chr(6155) || ' Ltda'),
+  ('seletor de variacao mongol U+180C', 'Acme' || chr(6156) || ' Ltda'),
+  ('seletor de variacao mongol U+180D', 'Acme' || chr(6157) || ' Ltda'),
+  ('seletor de variacao mongol U+180F', 'Acme' || chr(6159) || ' Ltda'),
+  ('seletor de variacao VS17 U+E0100', 'Acme' || chr(917760) || ' Ltda'),
+  ('marca invisivel entre dois espacos', 'Acme ' || chr(847) || ' Ltda');
 GRANT SELECT ON taken_names TO authenticated;
 
 -- O índice -----------------------------------------------------------------------------------------------
@@ -88,9 +99,18 @@ SELECT is_empty(
   'F-51: lower, normalize e regexp_replace, as funções da expressão do índice, são IMMUTABLE'
 );
 SELECT ok(
-  pg_get_expr(i.indexprs, i.indrelid) ~* 'regexp_replace\(lower\(normalize\(name, NFKC\)\)',
-  'F-51: a expressão é regexp_replace(lower(normalize(name, NFKC)), ..), e só isso (o Postgres 17 não tem casefold)'
+  pg_get_expr(i.indexprs, i.indrelid) ~* 'regexp_replace\(regexp_replace\(lower\(normalize\(name, NFKC\)\)',
+  'F-51: a expressão é regexp_replace(regexp_replace(lower(normalize(name, NFKC)), ..), ..), e só isso (o Postgres 17 não tem casefold)'
 ) FROM pg_index i WHERE i.indexrelid = 'public.clients_active_name_key'::regclass;
+
+-- O `lower()` do índice só dobra letras fora do ASCII se o locale do banco for Unicode (como o `[[:alnum:]]`
+-- de visible_text, conferido no 013): sem isso "CAFÉ" e "café" teriam chaves diferentes.
+SELECT ok(
+  lower('CAF' || chr(201)) = 'caf' || chr(233)
+  AND lower(chr(913) || chr(914) || chr(915)) = chr(945) || chr(946) || chr(947)
+  AND lower(chr(1040)) = chr(1072),
+  'F-51: o lower() do banco dobra o "É" latino, as maiúsculas gregas e o "А" cirílico (o locale é Unicode)'
+);
 
 -- Escrita direta (a secret key das fixtures, ou quem for postgres): o índice vale para todos -------------
 SELECT throws_ok(
@@ -321,6 +341,83 @@ SELECT is_empty(
       WHERE e.action LIKE 'client.%' AND e.metadata::text ~* '(Acme|Beta|Kilo|Delta|Gamma|Unarchive)' $$,
   'E-40: nenhum nome de cliente foi para os metadados da auditoria'
 );
+
+-- O erro CLIENT_NAME_TAKEN não carrega nada além do código e da mensagem: nem DETAIL (que traria o nome
+-- normalizado), nem HINT, nem o nome do constraint, da tabela ou do esquema (o que diria qual índice, e
+-- portanto qual cliente). Lido com GET STACKED DIAGNOSTICS dentro de um DO, como o CEO aal2.
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+DO $$
+DECLARE
+  v_calls text[] := ARRAY[
+    $c$SELECT public.create_client('ACME LTDA')$c$,
+    $c$SELECT public.update_client('00000000-0000-4000-8000-00000000a002', 'ACME LTDA', NULL)$c$,
+    $c$SELECT public.update_client('00000000-0000-4000-8000-00000000a007', NULL, false)$c$
+  ];
+  v_sql        text;
+  v_i          integer := 0;
+  v_state      text;
+  v_message    text;
+  v_detail     text;
+  v_hint       text;
+  v_constraint text;
+  v_table      text;
+  v_schema     text;
+  v_column     text;
+  v_datatype   text;
+BEGIN
+  FOREACH v_sql IN ARRAY v_calls LOOP
+    v_i := v_i + 1;
+    BEGIN
+      EXECUTE v_sql;
+      PERFORM set_config('probe.shape' || v_i, 'no error', true);
+    EXCEPTION WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS
+        v_state = RETURNED_SQLSTATE, v_message = MESSAGE_TEXT, v_detail = PG_EXCEPTION_DETAIL,
+        v_hint = PG_EXCEPTION_HINT, v_constraint = CONSTRAINT_NAME, v_table = TABLE_NAME,
+        v_schema = SCHEMA_NAME, v_column = COLUMN_NAME, v_datatype = PG_DATATYPE_NAME;
+      PERFORM set_config(
+        'probe.shape' || v_i,
+        concat_ws('|', v_state, v_message, coalesce(v_detail, ''), coalesce(v_hint, ''),
+                  coalesce(v_constraint, ''), coalesce(v_table, ''), coalesce(v_schema, ''),
+                  coalesce(v_column, ''), coalesce(v_datatype, '')),
+        true
+      );
+    END;
+  END LOOP;
+END $$;
+SELECT is(
+  current_setting('probe.shape1'), concat_ws('|', 'P0001', 'CLIENT_NAME_TAKEN', '', '', '', '', '', '', ''),
+  'F-51: create_client recusa com SQLSTATE e mensagem apenas (DETAIL, HINT, constraint, tabela e esquema vazios)'
+);
+SELECT is(
+  current_setting('probe.shape2'), concat_ws('|', 'P0001', 'CLIENT_NAME_TAKEN', '', '', '', '', '', '', ''),
+  'F-51: update_client ao renomear recusa com SQLSTATE e mensagem apenas'
+);
+SELECT is(
+  current_setting('probe.shape3'), concat_ws('|', 'P0001', 'CLIENT_NAME_TAKEN', '', '', '', '', '', '', ''),
+  'F-51: update_client ao desarquivar recusa com SQLSTATE e mensagem apenas'
+);
+SELECT tests.clear_authentication();
+
+-- Só a violação do NOSSO índice vira CLIENT_NAME_TAKEN: a de outro índice da tabela sobe crua (23505, com
+-- o nome do índice dela). Dois clientes "Probe" violam um índice único de teste, criado só nesta transação.
+CREATE UNIQUE INDEX zz_probe_one_client ON public.clients ((name IS NOT NULL)) WHERE name LIKE 'Probe %';
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT lives_ok(
+  $$ SELECT * FROM public.create_client('Probe 1') $$,
+  'F-51: o primeiro cliente "Probe" é criado'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_client('Probe 2') $$,
+  '23505', 'duplicate key value violates unique constraint "zz_probe_one_client"',
+  'F-51: create_client não traduz a violação de outro índice: sobe como 23505'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000a002', 'Probe 3', NULL) $$,
+  '23505', 'duplicate key value violates unique constraint "zz_probe_one_client"',
+  'F-51: update_client não traduz a violação de outro índice: sobe como 23505'
+);
+SELECT tests.clear_authentication();
 
 SELECT * FROM finish();
 ROLLBACK;
