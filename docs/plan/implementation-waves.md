@@ -14,7 +14,7 @@
 | 4 | Identidade: troca de senha obrigatória + script `ceo:create` | 3 | 5, 6 | ✅ |
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
-| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ⬜ |
+| 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ⬜ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
@@ -374,7 +374,20 @@ tempo):
     `CHANGE_PASSWORD`.
   - **Scripts operacionais de CEO**, sem os quais um CEO pode ficar trancado:
     - reset de senha (F-41: a senha temporária vence em 72 h);
-    - reset de MFA (E-25).
+    - reset de MFA (E-25), nesta ordem: apagar o fator TOTP do usuário pela Admin API do Auth
+      (o que leva junto as linhas dele no registro de fatores do backend) e depois a linha dele
+      em `private.mfa_first_activations` (F-64, F-75). Sem isso, o CEO que perde o celular não
+      cadastra outro fator, por desenho.
+  - **Alerta sobre `audit_events`** com `auth.mfa_attestation_refused` e `auth.mfa.reenrollment_refused`
+    (F-68, F-75), e não só sobre o log do app.
+  - **Conferências no Supabase hospedado** (Onda 6.1 e F-51):
+    - triggers em `auth.mfa_factors` e `REFERENCES` para `auth.sessions` e `auth.mfa_factors`
+      permitidos;
+    - retenção dos challenges de MFA por pelo menos 120 s (oráculo do F-50 b, F-71);
+    - locale do banco com `lower()` Unicode (índice `clients_active_name_key`).
+  - **Runbook de upgrade do Auth:** o trigger `on_mfa_factor_verified` depende da coluna
+    `auth.mfa_factors.status`. Uma migration do GoTrue que mude essa coluna falha com o trigger no
+    lugar, então o runbook é: remover o trigger, fazer o upgrade e recriar o trigger.
   - **F-23:** `refresh_token_reuse_interval` mais baixo no projeto hospedado.
 - **Também na Onda 11, decididos em 2026-11-16**:
   - **F-03 (c):** cookie de dispositivo, na linha da recomendação da OWASP. O navegador que já
