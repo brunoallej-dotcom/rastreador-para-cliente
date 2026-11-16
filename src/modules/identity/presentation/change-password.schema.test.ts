@@ -32,11 +32,11 @@ describe('changePasswordBodySchema', () => {
   it('accepts both passwords as given, without trimming or normalizing them', () => {
     const parsed = changePasswordBodySchema.parse({
       currentPassword: '  spaces around  ',
-      newPassword: 'café-café-café',
+      newPassword: 'cafe\u0301-cafe\u0301-cafe\u0301',
     });
     expect(parsed).toEqual({
       currentPassword: '  spaces around  ',
-      newPassword: 'café-café-café',
+      newPassword: 'cafe\u0301-cafe\u0301-cafe\u0301',
     });
   });
 

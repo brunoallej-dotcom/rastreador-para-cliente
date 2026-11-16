@@ -93,7 +93,7 @@ describe('parseCeoArguments', () => {
     ],
     [
       'a name with an invisible character',
-      ['--email', 'a@b.test', '--name', 'Ma​ria'],
+      ['--email', 'a@b.test', '--name', 'Ma\u200bria'],
       '--name must be',
     ],
     [
