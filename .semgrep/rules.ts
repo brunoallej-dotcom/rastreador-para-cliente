@@ -64,3 +64,55 @@ function postgrestFilters() {
   // ok: no-interpolated-postgrest-filter
   [userInput].filter((value) => value === `${userInput}`);
 }
+
+function authAdmin() {
+  // ruleid: no-auth-admin-outside-facade
+  supabase.auth.admin.createUser({});
+  // ruleid: no-auth-admin-outside-facade
+  supabase.auth?.admin.listUsers();
+  // ruleid: no-auth-admin-outside-facade
+  supabase.auth['admin'].deleteUser('id');
+  // ruleid: no-auth-admin-outside-facade
+  supabase['auth']['admin'].getUserById('id');
+  // ruleid: no-auth-admin-outside-facade
+  auth.admin.updateUserById('id', {});
+  // ruleid: no-auth-admin-outside-facade
+  const { admin } = supabase.auth;
+  // ruleid: no-auth-admin-outside-facade
+  const { admin: named } = supabase.auth;
+  // ruleid: no-auth-admin-outside-facade
+  const {
+    auth: { admin: nested },
+  } = supabase;
+  // ruleid: no-auth-admin-outside-facade
+  const { admin: fromBare } = auth;
+
+  // ok: no-auth-admin-outside-facade
+  supabase.auth.getClaims();
+  // ok: no-auth-admin-outside-facade
+  supabase.auth.mfa.enroll({ factorType: 'totp' });
+  // ok: no-auth-admin-outside-facade
+  const administrator = { admin: true };
+}
+
+function appMetadata() {
+  // ruleid: no-app-metadata-role-but-client
+  const ceo = { email: 'a@b.test', app_metadata: { role: 'ceo', display_name: 'x' } };
+  // ruleid: no-app-metadata-role-but-client
+  const variable = { app_metadata: { role: userInput } };
+  // ruleid: no-app-metadata-role-but-client
+  const spread = { app_metadata: { ...userInput, role: 'client' } };
+  // ruleid: no-app-metadata-role-but-client
+  const whole = { app_metadata: userInput };
+  // ruleid: no-app-metadata-role-but-client
+  const noRole = { app_metadata: { display_name: 'x' } };
+  // ruleid: no-app-metadata-role-but-client
+  supabase.auth.updateUser({ app_metadata: { role: 'ceo' } });
+
+  // ok: no-app-metadata-role-but-client
+  const client = { email: 'a@b.test', app_metadata: { role: 'client', client_id: userInput } };
+  // ok: no-app-metadata-role-but-client
+  const read = supabase.user.app_metadata.role;
+  // ok: no-app-metadata-role-but-client
+  const other = { metadata: { role: 'ceo' } };
+}

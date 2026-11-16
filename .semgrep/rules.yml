@@ -28,6 +28,62 @@ rules:
       - pattern: const { ..., getSession, ... } = auth
       - pattern: 'const { ..., getSession: $ALIAS, ... } = auth'
 
+  - id: no-auth-admin-outside-facade
+    languages: [typescript, javascript]
+    severity: ERROR
+    # The facade is the one file of src/ that talks to the Auth Admin API; the operator's script
+    # (scripts/create-ceo.ts) and the fixtures of the tests build their own client.
+    paths:
+      exclude:
+        - tests/
+        - scripts/
+        - '*.test.ts'
+        - /src/shared/db/admin-client.ts
+    message: >-
+      The Auth Admin API (`auth.admin`) can create a user with any role and read or change any account.
+      Under src/ only the typed operations of src/shared/db/admin-client.ts may use it (F-91, ADR 0006).
+    metadata:
+      category: security
+      cwe: 'CWE-250: Execution with Unnecessary Privileges'
+    pattern-either:
+      - pattern: $CLIENT.auth.admin
+      - pattern: $CLIENT.auth?.admin
+      - pattern: $CLIENT.auth['admin']
+      - pattern: $CLIENT['auth']['admin']
+      - pattern: auth.admin
+      - pattern: const { ..., admin, ... } = $CLIENT.auth
+      - pattern: 'const { ..., admin: $ALIAS, ... } = $CLIENT.auth'
+      - pattern: 'const { ..., auth: { ..., admin, ... }, ... } = $CLIENT'
+      - pattern: 'const { ..., auth: { ..., admin: $ALIAS, ... }, ... } = $CLIENT'
+      - pattern: const { ..., admin, ... } = auth
+      - pattern: 'const { ..., admin: $ALIAS, ... } = auth'
+
+  - id: no-app-metadata-role-but-client
+    languages: [typescript, javascript]
+    severity: ERROR
+    # `app_metadata` is what the profile trigger builds the role from (AC-31). Under src/ the only
+    # account a request path may create is a client login, so every `app_metadata` that is WRITTEN must be
+    # an inline literal whose role is `client`. Reading `user.app_metadata.role` is not affected.
+    paths:
+      exclude:
+        - tests/
+        - scripts/
+        # unit tests beside the code send hostile input on purpose (a body with `app_metadata`)
+        - '*.test.ts'
+    message: >-
+      `app_metadata` written under src/ must be an inline object with `role: 'client'`: the role of a new
+      account is never a variable, never `ceo` and never left to the caller (AC-31, F-91). CEO accounts
+      are created by `pnpm ceo:create` (scripts/) only.
+    metadata:
+      category: security
+      cwe: 'CWE-269: Improper Privilege Management'
+    pattern-either:
+      - patterns:
+          - pattern: '{ ..., app_metadata: $META, ... }'
+          - pattern-not: "{ ..., app_metadata: { ..., role: 'client', ... }, ... }"
+      # a spread lets the caller bring its own `role` (the last key wins)
+      - pattern: '{ ..., app_metadata: { ..., ...$SPREAD, ... }, ... }'
+
   - id: no-interpolated-postgrest-filter
     languages: [typescript, javascript]
     severity: ERROR
