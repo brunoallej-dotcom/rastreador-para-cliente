@@ -415,6 +415,8 @@ export function createConfig({ typeAware = true } = {}) {
       'venv/',
       'coverage/',
       '.claude/',
+      // Semgrep rule fixtures: not part of the TS project, and they break the rules on purpose.
+      '.semgrep/',
       'supabase/',
       'src/shared/db/database.types.ts',
       'next-env.d.ts',
