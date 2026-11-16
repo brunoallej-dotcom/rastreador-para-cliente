@@ -239,6 +239,8 @@ export function createFakeClientUsers(
       const record = records.get(userId);
       if (record === undefined) return Promise.resolve(notFound());
       record.password = password;
+      // like the real Auth server: replacing a password drops the sessions of the user
+      record.sessions = 0;
       leave(lose, 'setPassword');
       return Promise.resolve(ok(undefined));
     },

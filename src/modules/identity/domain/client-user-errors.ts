@@ -76,9 +76,10 @@ export class ClientUserProvisionOrphanedError extends ServiceUnavailableError {
 
 /**
  * The new password of a reset is stored in the Auth server but the database step that makes the user
- * change it (and revokes the sessions) failed: the old password no longer works, the sessions are still
- * alive and the pending `CHANGE_PASSWORD` is not set. The temporary password was never shown. Safe to
- * repeat: the repeat stores another password and finishes the job. A 503, with an error-level log event.
+ * change it failed: the old password no longer works and the sessions are gone (the Auth server drops
+ * them when a password is replaced), but the pending `CHANGE_PASSWORD`, the new baseline of the 72 h and
+ * the audit event are not recorded. The temporary password was never shown. Safe to repeat: the repeat
+ * stores another password and finishes the job. A 503, with an error-level log event.
  */
 export class ClientUserResetIncompleteError extends ServiceUnavailableError {
   constructor(options?: DomainErrorOptions) {

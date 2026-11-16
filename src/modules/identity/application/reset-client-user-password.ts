@@ -38,11 +38,13 @@ const REQUIRE_CHANGE_ATTEMPTS = 2;
  * "change" the user never made.
  *
  * What a failure in the middle leaves behind is safe and repeatable:
- * - the Auth call fails: nothing changed that matters (or the new password is set and nobody knows it:
- *   the old one no longer works, the sessions stay alive until the repeat). 503, repeat the reset;
+ * - the Auth call fails: nothing changed (or the new password is set and its answer was lost: nobody
+ *   knows it, the old one no longer works). 503, repeat the reset;
  * - the database step fails after the Auth call: `ClientUserResetIncompleteError` (503, error log). The old
- *   password no longer works and the new one was never shown; the sessions and the pending action are
- *   not touched yet. The repeat stores another password and finishes the job.
+ *   password no longer works, the new one was never shown, and the user's sessions are already gone (the
+ *   Auth server drops them when a password is replaced, observed on the local stack). What is missing is
+ *   the database side: `CHANGE_PASSWORD`, the new baseline and the audit event. The repeat stores another
+ *   password and finishes the job.
  * The temporary password is shown only when BOTH steps worked.
  */
 export async function resetClientUserPassword(

@@ -127,11 +127,13 @@ describe('resetClientUserPassword', () => {
     const attempt = resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
 
     await expect(attempt).rejects.toBeInstanceOf(ClientUserResetIncompleteError);
-    // what the error says is the documented recovery: the sessions are alive, the old password is gone
+    // what the error says is the documented state: the old password is gone and so are the sessions
+    // (the Auth server drops them), but the database side (pending action, baseline) is not recorded
     expect(world.records.get(USER_A1)).toMatchObject({
       password: PASSWORD,
       mustChangePassword: false,
-      sessions: 1,
+      sessions: 0,
+      passwordBaselines: 0,
     });
   });
 
