@@ -1,23 +1,26 @@
--- Onda 6: create_client e update_client (spec §3.7). Cobre: privilégios e search_path das funções
--- (AC-25), anon (AC-10), cliente (AC-08, AC-09: não executa nem lê o outro cliente), CEO aal1, CEO
--- aal2 sem fator TOTP verificado (F-24), CEO com sessão morta ou desativado, escrita direta negada,
--- o caminho feliz (AC-11), as regras do nome espelhadas do Zod (E-30), a idempotência das mudanças
--- e a auditoria gravada na mesma transação (ator, papel, recurso, cliente, request_id, sem PII).
+-- Onda 6: private.visible_text, create_client e update_client (spec §3.7, §3.7.1). Cobre: privilégios e
+-- search_path das funções (AC-25), anon (AC-10), cliente com aal1 e com aal2 no JWT (AC-08, AC-09: não
+-- executa nem lê o outro cliente), CEO aal1, CEO aal2 sem fator TOTP verificado (F-24), CEO com sessão
+-- morta ou desativado, escrita direta negada, o caminho feliz (AC-11), as regras do nome iguais às do
+-- Zod (E-30, F-52: espaços Unicode nas pontas, fillers, "ao menos uma letra ou número", NFC), a
+-- idempotência das mudanças e a auditoria gravada na mesma transação (ator, papel, recurso, cliente,
+-- request_id, sem PII).
 BEGIN;
-SELECT plan(73);
+SELECT plan(143);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
--- A e B são os clientes das fixtures (A ativo, B arquivado há 3 dias), com datas no passado para
--- provar quando `updated_at` mexe. D é um terceiro cliente, ativo, para renomear e arquivar numa
--- chamada só. a1 é login de A. c1 é CEO com fator verificado; c2, CEO sem fator; c3, CEO com fator e
--- sessão apagada; c4, CEO com fator e perfil desativado.
+-- A, B, D e E são os clientes das fixtures (A ativo, B arquivado há 3 dias, D e E ativos), com datas no
+-- passado para provar quando `updated_at` mexe. a1 é login de A. c1 é CEO com fator verificado; c2, CEO
+-- sem fator; c3, CEO com fator e sessão apagada; c4, CEO com fator e perfil desativado.
 INSERT INTO public.clients (id, name, archived_at, created_at, updated_at) VALUES
   ('00000000-0000-4000-8000-00000000000a', 'Cliente A', NULL,
    now() - interval '2 days', now() - interval '2 days'),
   ('00000000-0000-4000-8000-00000000000b', 'Cliente B', now() - interval '3 days',
    now() - interval '4 days', now() - interval '4 days'),
   ('00000000-0000-4000-8000-00000000000d', 'Cliente D', NULL,
-   now() - interval '5 days', now() - interval '5 days');
+   now() - interval '5 days', now() - interval '5 days'),
+  ('00000000-0000-4000-8000-00000000000e', 'Cliente E', NULL,
+   now() - interval '6 days', now() - interval '6 days');
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
@@ -29,6 +32,54 @@ SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c3');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c4');
 DELETE FROM auth.sessions WHERE id = '00000000-0000-4000-8000-0000000000c3';
 UPDATE public.profiles SET disabled_at = now() WHERE id = '00000000-0000-4000-8000-0000000000c4';
+
+-- Nomes que o Zod (`visibleText`) recusa e que o banco também tem de recusar, na criação e na
+-- atualização (um por linha; o NULL só vale para a criação).
+CREATE TEMP TABLE bad_names (label text PRIMARY KEY, value text);
+INSERT INTO bad_names (label, value) VALUES
+  ('nulo', NULL),
+  ('vazio', ''),
+  ('so espacos', '   '),
+  ('so NBSP', chr(160)),
+  ('so U+3000', chr(12288)),
+  ('so BOM', chr(65279)),
+  ('so filler Hangul U+3164', chr(12644)),
+  ('filler Hangul no meio', 'a' || chr(12644) || 'b'),
+  ('filler U+115F', chr(4447) || 'a'),
+  ('filler U+1160', 'a' || chr(4448)),
+  ('filler U+FFA0', 'a' || chr(65440)),
+  ('filler Khmer U+17B4', 'a' || chr(6068)),
+  ('braille em branco U+2800', 'a' || chr(10240)),
+  ('so pontuacao', '***'),
+  ('so travessoes e ponto medio', chr(8212) || ' ' || chr(183) || ' ' || chr(8212)),
+  ('so espacos e pontuacao', ' . , '),
+  ('so emoji', chr(128512)),
+  ('161 caracteres', repeat('a', 161)),
+  ('acima de 16 KiB', repeat('a', 20000)),
+  ('quebra de linha', 'Linha' || chr(10) || 'dupla'),
+  ('tabulacao interna', 'a' || chr(9) || 'b'),
+  ('NEL interno U+0085', 'a' || chr(133) || 'b'),
+  ('separador de linha U+2028', 'a' || chr(8232) || 'b'),
+  ('largura zero U+200B', 'Zero' || chr(8203) || 'width'),
+  ('override bidi U+202E', 'Bidi' || chr(8238) || 'override'),
+  ('BOM no meio', 'Bom' || chr(65279) || 'marca'),
+  ('hifen suave U+00AD', 'a' || chr(173) || 'b');
+GRANT SELECT ON bad_names TO authenticated;
+
+-- Nomes que o Zod aceita (e como ficam guardados).
+CREATE TEMP TABLE good_names (label text PRIMARY KEY, value text NOT NULL, expected text NOT NULL);
+INSERT INTO good_names (label, value, expected) VALUES
+  ('espacos nas pontas', '  Cliente Novo  ', 'Cliente Novo'),
+  ('NBSP e U+3000 nas pontas', chr(160) || 'Acme' || chr(12288), 'Acme'),
+  ('BOM nas pontas', chr(65279) || 'Acme BOM' || chr(65279), 'Acme BOM'),
+  ('NFC (e + acento combinante)', 'Cafe' || chr(769), 'Caf' || chr(233)),
+  ('japones', chr(26085) || chr(26412), chr(26085) || chr(26412)),
+  ('grego', chr(913) || chr(946) || chr(947), chr(913) || chr(946) || chr(947)),
+  ('digitos arabe-indicos', chr(1633) || chr(1634), chr(1633) || chr(1634)),
+  ('pontuacao com letras', 'A&B - Consultoria (S/A)', 'A&B - Consultoria (S/A)'),
+  ('so numeros', '2026', '2026'),
+  ('160 caracteres', repeat('a', 160), repeat('a', 160));
+GRANT SELECT ON good_names TO authenticated;
 
 -- Como o PostgREST faz: o app manda o id da requisição, e a auditoria o guarda.
 SELECT tests.set_request_id('req-clients-0001');
@@ -79,9 +130,50 @@ SELECT is_empty(
        FROM pg_proc p
       CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
       WHERE p.oid IN ('public.create_client(text)'::regprocedure,
-                      'public.update_client(uuid, text, boolean)'::regprocedure)
+                      'public.update_client(uuid, text, boolean)'::regprocedure,
+                      'private.visible_text(text, integer)'::regprocedure)
         AND a.grantee = 0 AND a.privilege_type = 'EXECUTE' $$,
-  'AC-25: create_client e update_client não concedem EXECUTE a PUBLIC'
+  'AC-25: create_client, update_client e visible_text não concedem EXECUTE a PUBLIC'
+);
+
+-- private.visible_text: configuração, privilégios e comportamento -------------------------------------
+SELECT is(
+  (SELECT p.provolatile::text FROM pg_proc p WHERE p.oid = 'private.visible_text(text, integer)'::regprocedure),
+  'i',
+  'visible_text: IMMUTABLE'
+);
+SELECT ok(
+  (SELECT 'search_path=""' = ANY (p.proconfig) FROM pg_proc p WHERE p.oid = 'private.visible_text(text, integer)'::regprocedure),
+  'visible_text: search_path vazio'
+);
+SELECT is_empty(
+  $$ SELECT r.role
+       FROM (VALUES ('anon'), ('authenticated'), ('service_role')) r (role)
+      WHERE has_function_privilege(r.role, 'private.visible_text(text, integer)', 'EXECUTE') $$,
+  'visible_text: nenhum papel da API a executa (só as funções SECURITY DEFINER do mesmo dono)'
+);
+SELECT ok(
+  chr(26085) ~ '[[:alnum:]]' AND chr(945) ~ '[[:alnum:]]' AND chr(1633) ~ '[[:alnum:]]' AND chr(233) ~ '[[:alnum:]]',
+  'visible_text: o [[:alnum:]] do banco é Unicode (japonês, grego, dígito arábico-índico, é): senão a regra "ao menos uma letra ou número" recusaria nomes legítimos'
+);
+SELECT is(
+  private.visible_text(chr(160) || 'Acme' || chr(12288), 160), 'Acme',
+  'visible_text: tira NBSP e U+3000 das pontas'
+);
+SELECT is(
+  private.visible_text('Cafe' || chr(769), 160), 'Caf' || chr(233),
+  'visible_text: normaliza para NFC'
+);
+SELECT is(
+  private.visible_text(repeat(' ', 5000) || 'a' || repeat(chr(160), 5000), 160), 'a',
+  'visible_text: uma corrida longa de espaços nas pontas não pesa'
+);
+SELECT ok(private.visible_text('abc', 2) IS NULL, 'visible_text: acima do máximo é NULL');
+SELECT ok(private.visible_text('abc', NULL) IS NULL, 'visible_text: máximo nulo é NULL');
+SELECT ok(private.visible_text(NULL, 160) IS NULL, 'visible_text: texto nulo é NULL');
+SELECT ok(
+  private.visible_text(repeat('a', 20000), 30000) IS NULL,
+  'visible_text: acima de 16 KiB é NULL antes de qualquer trabalho'
 );
 
 -- AC-10: anon ------------------------------------------------------------------------------------------
@@ -117,7 +209,7 @@ SELECT throws_ok(
 SELECT results_eq(
   $$ SELECT id FROM public.clients $$,
   $$ VALUES ('00000000-0000-4000-8000-00000000000a'::uuid) $$,
-  'AC-09: cliente A lê só a própria linha de clients (não vê B nem D)'
+  'AC-09: cliente A lê só a própria linha de clients (não vê B, D nem E)'
 );
 SELECT throws_ok(
   $$ INSERT INTO public.clients (name) VALUES ('Escrita direta') $$,
@@ -130,6 +222,23 @@ SELECT throws_ok(
 SELECT throws_ok(
   $$ DELETE FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a' $$,
   '42501', NULL, 'SEC-04: cliente não faz DELETE direto em clients'
+);
+SELECT tests.clear_authentication();
+
+-- AC-08: cliente com `aal2` no JWT (um claim que ele mesmo não deveria conseguir; vale a checagem de papel) ----
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000a1', 'aal2');
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_client('Cliente com aal2') $$,
+  '42501', 'FORBIDDEN', 'AC-08: cliente com aal2 no JWT não executa create_client'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Renomeado com aal2', NULL) $$,
+  '42501', 'FORBIDDEN', 'AC-08: cliente com aal2 no JWT não executa update_client'
+);
+SELECT results_eq(
+  $$ SELECT id FROM public.clients $$,
+  $$ VALUES ('00000000-0000-4000-8000-00000000000a'::uuid) $$,
+  'AC-09: cliente com aal2 no JWT continua lendo só a própria linha de clients'
 );
 SELECT tests.clear_authentication();
 
@@ -175,6 +284,10 @@ SELECT throws_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Renomeado sem sessão', NULL) $$,
   '42501', 'FORBIDDEN', 'E-08: CEO com a sessão apagada não executa update_client'
 );
+SELECT is_empty(
+  $$ SELECT id FROM public.clients $$,
+  'E-08: CEO com a sessão apagada não lê nenhum cliente'
+);
 SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c4', 'aal2');
 SELECT throws_ok(
@@ -185,6 +298,22 @@ SELECT throws_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Renomeado desativado', NULL) $$,
   '42501', 'FORBIDDEN', 'E-08: CEO desativado não executa update_client'
 );
+SELECT is_empty(
+  $$ SELECT id FROM public.clients $$,
+  'E-08: CEO desativado não lê nenhum cliente'
+);
+SELECT tests.clear_authentication();
+
+-- F-55: a autorização vem antes de qualquer trabalho com a entrada (um nome inválido não muda a resposta) -----
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000a1');
+SELECT throws_ok(
+  $$ SELECT * FROM public.create_client(repeat('a', 20000)) $$,
+  '42501', 'FORBIDDEN', 'F-55: cliente com um nome enorme recebe FORBIDDEN, não INVALID_INPUT'
+);
+SELECT throws_ok(
+  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', chr(10), NULL) $$,
+  '42501', 'FORBIDDEN', 'F-55: cliente com um nome inválido recebe FORBIDDEN, não INVALID_INPUT'
+);
 SELECT tests.clear_authentication();
 
 SELECT is_empty(
@@ -193,71 +322,39 @@ SELECT is_empty(
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.clients $$,
-  $$ VALUES (3) $$,
-  'AC-08: nenhuma chamada negada criou cliente (só as 3 fixtures)'
+  $$ VALUES (4) $$,
+  'AC-08: nenhuma chamada negada criou cliente (só as 4 fixtures)'
 );
 
 -- AC-11: CEO aal2 com fator verificado, criação ---------------------------------------------------------------
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 
 SELECT results_eq(
-  $$ SELECT name, archived_at FROM public.create_client('  Cliente Novo  ') $$,
-  $$ VALUES ('Cliente Novo', NULL::timestamptz) $$,
-  'AC-11: create_client devolve o cliente com o nome aparado e ativo'
+  $$ SELECT name, archived_at FROM public.create_client('Cliente Dois') $$,
+  $$ VALUES ('Cliente Dois', NULL::timestamptz) $$,
+  'AC-11: create_client devolve o cliente ativo'
 );
-SELECT results_eq(
-  $$ SELECT name FROM public.create_client('Cafe' || chr(769)) $$,
-  $$ VALUES ('Caf' || chr(233)) $$,
-  'E-30: create_client guarda o nome em NFC (e + acento combinante vira é)'
-);
-SELECT lives_ok(
-  $$ SELECT * FROM public.create_client(repeat('a', 160)) $$,
-  'AC-11: create_client aceita o nome com 160 caracteres'
-);
+SELECT is(
+  (SELECT c.name FROM public.create_client(g.value) c), g.expected,
+  'E-30: create_client aceita e guarda "' || g.label || '"'
+) FROM good_names g ORDER BY g.label;
 SELECT throws_ok(
-  $$ SELECT * FROM public.create_client(NULL) $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: create_client recusa nome nulo'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('') $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: create_client recusa nome vazio'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('   ') $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: create_client recusa nome só de espaços'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client(repeat('a', 161)) $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: create_client recusa nome com 161 caracteres'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('Linha' || chr(10) || 'dupla') $$,
-  'P0001', 'INVALID_INPUT', 'E-30: create_client recusa quebra de linha no nome'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('Zero' || chr(8203) || 'width') $$,
-  'P0001', 'INVALID_INPUT', 'E-30: create_client recusa caractere de largura zero no nome'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('Bidi' || chr(8238) || 'override') $$,
-  'P0001', 'INVALID_INPUT', 'E-30: create_client recusa override bidirecional no nome'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.create_client('Bom' || chr(65279) || 'marca') $$,
-  'P0001', 'INVALID_INPUT', 'E-30: create_client recusa BOM no nome'
-);
+  format('SELECT * FROM public.create_client(%L)', b.value),
+  'P0001', 'INVALID_INPUT',
+  'E-30: create_client recusa o nome: ' || b.label
+) FROM bad_names b ORDER BY b.label;
 SELECT tests.clear_authentication();
 
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.clients $$,
-  $$ VALUES (6) $$,
-  'AC-11: só os 3 clientes válidos foram criados; os nomes inválidos não deixaram linha'
+  $$ SELECT (4 + 1 + count(*))::int FROM good_names $$,
+  'AC-11: só os nomes válidos criaram cliente; os inválidos não deixaram linha'
 );
 SELECT results_eq(
   $$ SELECT e.action, e.actor_id, e.actor_role::text, e.resource_type, e.resource_id = c.id,
             e.client_id = c.id, e.process_id, e.request_id, e.metadata
        FROM public.audit_events e
-       JOIN public.clients c ON c.id = e.resource_id
+      JOIN public.clients c ON c.id = e.resource_id
       WHERE c.name = 'Cliente Novo' $$,
   $$ VALUES ('client.created', '00000000-0000-4000-8000-0000000000c1'::uuid, 'ceo', 'client',
              true, true, NULL::uuid, 'req-clients-0001', '{}'::jsonb) $$,
@@ -265,7 +362,7 @@ SELECT results_eq(
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.audit_events WHERE action = 'client.created' $$,
-  $$ VALUES (3) $$,
+  $$ SELECT (1 + count(*))::int FROM good_names $$,
   'SEC-16: uma linha de auditoria por cliente criado'
 );
 
@@ -273,15 +370,21 @@ SELECT results_eq(
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 
 SELECT results_eq(
+  $$ SELECT name, updated_at = now() - interval '2 days'
+       FROM public.update_client('00000000-0000-4000-8000-00000000000a', ' ' || chr(160) || 'Cliente A' || chr(12288), NULL) $$,
+  $$ VALUES ('Cliente A', true) $$,
+  'AC-11: renomear para o mesmo nome (depois da normalização) não muda nada nem mexe em updated_at'
+);
+SELECT results_eq(
   $$ SELECT name, archived_at, updated_at > created_at
        FROM public.update_client('00000000-0000-4000-8000-00000000000a', '  Cliente A Renomeado ', NULL) $$,
   $$ VALUES ('Cliente A Renomeado', NULL::timestamptz, true) $$,
   'AC-11: update_client renomeia (nome aparado), mantém ativo e move updated_at'
 );
 SELECT results_eq(
-  $$ SELECT name FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Cliente A Renomeado', NULL) $$,
+  $$ SELECT name FROM public.update_client('00000000-0000-4000-8000-00000000000a', chr(160) || 'Cliente A Renomeado' || chr(12288), NULL) $$,
   $$ VALUES ('Cliente A Renomeado') $$,
-  'AC-11: renomear para o mesmo nome devolve o cliente como está'
+  'AC-11: renomear para o mesmo nome com espaços Unicode nas pontas devolve o cliente como está'
 );
 SELECT results_eq(
   $$ SELECT archived_at IS NOT NULL
@@ -314,29 +417,27 @@ SELECT results_eq(
 );
 SELECT results_eq(
   $$ SELECT name, archived_at IS NOT NULL
-       FROM public.update_client('00000000-0000-4000-8000-00000000000d', 'Cliente D Novo', true) $$,
-  $$ VALUES ('Cliente D Novo', true) $$,
-  'AC-11: update_client renomeia e arquiva numa chamada só'
+       FROM public.update_client('00000000-0000-4000-8000-00000000000d', 'Cafe' || chr(769), true) $$,
+  $$ VALUES ('Caf' || chr(233), true) $$,
+  'AC-11: update_client renomeia (em NFC) e arquiva numa chamada só'
+);
+SELECT results_eq(
+  $$ SELECT name FROM public.update_client('00000000-0000-4000-8000-00000000000e', chr(26085) || chr(26412), NULL) $$,
+  $$ VALUES (chr(26085) || chr(26412)) $$,
+  'E-30: update_client aceita um nome em japonês (o [[:alnum:]] é Unicode)'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', NULL, NULL) $$,
   'P0001', 'INVALID_INPUT', 'AC-11: update_client recusa a chamada sem nada para mudar'
 );
 SELECT throws_ok(
-  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', '', NULL) $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: update_client recusa nome vazio'
-);
+  format('SELECT * FROM public.update_client(%L, %L, NULL)', '00000000-0000-4000-8000-00000000000a', b.value),
+  'P0001', 'INVALID_INPUT',
+  'E-30: update_client recusa o nome: ' || b.label
+) FROM bad_names b WHERE b.value IS NOT NULL ORDER BY b.label;
 SELECT throws_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', repeat('a', 161), true) $$,
-  'P0001', 'INVALID_INPUT', 'AC-11: update_client recusa nome com 161 caracteres'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Quebra' || chr(10) || 'de linha', NULL) $$,
-  'P0001', 'INVALID_INPUT', 'E-30: update_client recusa caractere de controle no nome'
-);
-SELECT throws_ok(
-  $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000000a', 'Largura' || chr(8203) || 'zero', NULL) $$,
-  'P0001', 'INVALID_INPUT', 'E-30: update_client recusa caractere de formatação no nome'
+  'P0001', 'INVALID_INPUT', 'AC-11: um nome inválido recusa a chamada inteira, mesmo com archived'
 );
 SELECT throws_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-0000000000ff', 'Cliente inexistente', NULL) $$,
@@ -347,9 +448,9 @@ SELECT throws_ok(
   'P0001', 'NOT_FOUND', 'AC-11: update_client sem id é NOT_FOUND'
 );
 SELECT results_eq(
-  $$ SELECT name FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a' $$,
-  $$ VALUES ('Cliente A Renomeado') $$,
-  'AC-11: as chamadas inválidas não mudaram o cliente'
+  $$ SELECT name, archived_at IS NULL FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a' $$,
+  $$ VALUES ('Cliente A Renomeado', false) $$,
+  'AC-11: as chamadas inválidas não mudaram o cliente (só o nome e o arquivamento dos casos válidos)'
 );
 
 -- SEC-04: nem o CEO aal2 escreve direto na tabela ----------------------------------------------------------------
@@ -367,8 +468,8 @@ SELECT throws_ok(
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.clients $$,
-  $$ VALUES (6) $$,
-  'AC-09: CEO aal2 lê todos os clientes (3 fixtures e 3 criados)'
+  $$ SELECT (4 + 1 + count(*))::int FROM good_names $$,
+  'AC-09: CEO aal2 lê todos os clientes (fixtures e criados)'
 );
 SELECT tests.clear_authentication();
 
@@ -382,7 +483,8 @@ SELECT results_eq(
             ('00000000-0000-4000-8000-00000000000a', 'client.archived'),
             ('00000000-0000-4000-8000-00000000000b', 'client.unarchived'),
             ('00000000-0000-4000-8000-00000000000d', 'client.updated'),
-            ('00000000-0000-4000-8000-00000000000d', 'client.archived') $$,
+            ('00000000-0000-4000-8000-00000000000d', 'client.archived'),
+            ('00000000-0000-4000-8000-00000000000e', 'client.updated') $$,
   'SEC-16: só as mudanças de verdade foram auditadas, na ordem (renomear antes de arquivar)'
 );
 SELECT is_empty(
@@ -405,7 +507,7 @@ SELECT results_eq(
 SELECT is_empty(
   $$ SELECT e.id
        FROM public.audit_events e
-      WHERE e.action LIKE 'client.%' AND e.metadata::text ~* '(Renomeado|Cliente|Novo)' $$,
+      WHERE e.action LIKE 'client.%' AND e.metadata::text ~* '(Renomeado|Cliente|Novo|Acme)' $$,
   'SEC-16: nenhum nome de cliente vai para os metadados da auditoria'
 );
 SELECT is_empty(
@@ -418,8 +520,8 @@ SELECT is_empty(
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.audit_events WHERE action LIKE 'client.%' $$,
-  $$ VALUES (8) $$,
-  'SEC-16: 3 criações e 5 mudanças, nenhuma linha a mais'
+  $$ SELECT (1 + count(*) + 6)::int FROM good_names $$,
+  'SEC-16: as criações e 6 mudanças, nenhuma linha a mais'
 );
 
 SELECT * FROM finish();
