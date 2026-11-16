@@ -38,24 +38,179 @@ afterEach(() => {
 });
 
 describe('getAdminFacade', () => {
-  it('SEC-15: hands out a narrow facade, never the Supabase client: the Auth Admin API and named RPC wrappers only', () => {
+  it('SEC-15, F-91: hands out a narrow facade, never the Supabase client and never the Auth Admin API: four typed client-login operations and named RPC wrappers only', () => {
     const facade = getAdminFacade();
 
     expect(Object.keys(facade).sort()).toEqual([
       'attestMfaSession',
-      'authAdmin',
       'consumeTotpCode',
+      'createClientUser',
+      'deleteUser',
       'rateLimitHit',
       'recordBackendMfaChallenge',
       'registerBackendTotpFactor',
+      'setBan',
+      'setPassword',
     ]);
-    // nothing of a session-bearing or table-reaching client leaks through
-    for (const name of ['from', 'rpc', 'auth', 'storage', 'schema', 'signInWithPassword']) {
+    // nothing of a session-bearing, table-reaching or account-reading client leaks through
+    for (const name of [
+      'from',
+      'rpc',
+      'auth',
+      'authAdmin',
+      'admin',
+      'storage',
+      'schema',
+      'signInWithPassword',
+      'createUser',
+      'updateUserById',
+      'getUserById',
+      'listUsers',
+    ]) {
       expect(facade).not.toHaveProperty(name);
     }
-    expect(facade.authAdmin).not.toHaveProperty('signInWithPassword');
-    expect(facade.authAdmin).not.toHaveProperty('signUp');
-    expect(facade.authAdmin).not.toHaveProperty('getSession');
+  });
+
+  describe('F-91: the Auth Admin operations for client logins', () => {
+    const CLIENT_ID = '00000000-0000-4000-8000-00000000000a';
+    const USER_ID = '00000000-0000-4000-8000-0000000000a1';
+    const PASSWORD = 'p'.repeat(20);
+    const created = (id: unknown) => json({ id: 'ignored', user: { id }, email: 'a@b.test' });
+
+    it('createClientUser: the role is `client` and the tenant is the argument; no caller can pass app_metadata', async () => {
+      const calls = stubFetch(() => created(USER_ID));
+
+      const answer = await getAdminFacade().createClientUser({
+        email: 'pessoa@cliente.test',
+        password: PASSWORD,
+        displayName: 'Maria',
+        clientId: CLIENT_ID,
+      });
+
+      expect(answer).toEqual({ data: { id: USER_ID }, error: null });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.url).toMatch(/\/auth\/v1\/admin\/users$/);
+      expect(calls[0]?.headers.get('apikey')).toBe(FAKE_ENV.SUPABASE_SECRET_KEY);
+      expect(JSON.parse(calls[0]?.body ?? '{}')).toEqual({
+        email: 'pessoa@cliente.test',
+        password: PASSWORD,
+        email_confirm: true,
+        app_metadata: { role: 'client', client_id: CLIENT_ID, display_name: 'Maria' },
+      });
+    });
+
+    it('createClientUser: an accepted creation whose answer has no usable id is `{ id: null }`, not an error and not nothing', async () => {
+      stubFetch(() => created('not-a-uuid'));
+      const first = await getAdminFacade().createClientUser({
+        email: 'a@cliente.test',
+        password: PASSWORD,
+        displayName: 'A',
+        clientId: CLIENT_ID,
+      });
+      vi.restoreAllMocks();
+      stubFetch(() => json({}));
+      const second = await getAdminFacade().createClientUser({
+        email: 'a@cliente.test',
+        password: PASSWORD,
+        displayName: 'A',
+        clientId: CLIENT_ID,
+      });
+
+      expect(first).toEqual({ data: { id: null }, error: null });
+      expect(second).toEqual({ data: { id: null }, error: null });
+    });
+
+    it('createClientUser: a refusal comes back as the kind, status and code of the error, never its message', async () => {
+      stubFetch(() =>
+        json(
+          { code: 422, error_code: 'email_exists', msg: 'pessoa@cliente.test is registered' },
+          422,
+        ),
+      );
+
+      const answer = await getAdminFacade().createClientUser({
+        email: 'pessoa@cliente.test',
+        password: PASSWORD,
+        displayName: 'A',
+        clientId: CLIENT_ID,
+      });
+
+      expect(answer.data).toBeNull();
+      expect(answer.error).toEqual({ name: 'AuthApiError', status: 422, code: 'email_exists' });
+      expect(JSON.stringify(answer)).not.toContain('pessoa');
+    });
+
+    it('createClientUser: an id that is not a UUID is refused before any call', async () => {
+      const calls = stubFetch(() => created(USER_ID));
+
+      await expect(
+        getAdminFacade().createClientUser({
+          email: 'a@cliente.test',
+          password: PASSWORD,
+          displayName: 'A',
+          clientId: 'x/../y',
+        }),
+      ).rejects.toThrow('the client id is not a UUID');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('setBan: bans for a century and unbans with none, through updateUserById', async () => {
+      const calls = stubFetch(() => json({ id: USER_ID }));
+
+      await getAdminFacade().setBan(USER_ID, true);
+      await getAdminFacade().setBan(USER_ID, false);
+
+      expect(calls.map((call) => call.url.replace(/^.*\/auth\/v1/, ''))).toEqual([
+        `/admin/users/${USER_ID}`,
+        `/admin/users/${USER_ID}`,
+      ]);
+      expect(JSON.parse(calls[0]?.body ?? '{}')).toEqual({ ban_duration: '876000h' });
+      expect(JSON.parse(calls[1]?.body ?? '{}')).toEqual({ ban_duration: 'none' });
+    });
+
+    it('setPassword: stores the password and sends nothing else with it', async () => {
+      const calls = stubFetch(() => json({ id: USER_ID }));
+
+      const answer = await getAdminFacade().setPassword(USER_ID, PASSWORD);
+
+      expect(answer).toEqual({ data: null, error: null });
+      expect(JSON.parse(calls[0]?.body ?? '{}')).toEqual({ password: PASSWORD });
+    });
+
+    it('deleteUser: deletes by id, and a refusal of the Auth server is a failure result', async () => {
+      const calls = stubFetch(() =>
+        json({ code: 404, error_code: 'user_not_found', msg: 'x' }, 404),
+      );
+
+      const answer = await getAdminFacade().deleteUser(USER_ID);
+
+      expect(calls[0]?.url).toContain(`/auth/v1/admin/users/${USER_ID}`);
+      expect(answer.error).toEqual({ name: 'AuthApiError', status: 404, code: 'user_not_found' });
+    });
+
+    it('a user id that is not a UUID never reaches the URL of the Auth Admin API', async () => {
+      const calls = stubFetch(() => json({}));
+
+      for (const run of [
+        () => getAdminFacade().deleteUser('../admin'),
+        () => getAdminFacade().setPassword('1; drop', PASSWORD),
+        () => getAdminFacade().setBan('', true),
+      ]) {
+        await expect(run()).rejects.toThrow('the user id is not a UUID');
+      }
+      expect(calls).toHaveLength(0);
+    });
+
+    it('a call that cannot reach the Auth server comes back as an AuthRetryableFetchError result (auth-js catches it; the gateway maps it to a 503)', async () => {
+      vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('fetch failed'));
+
+      const attempt = getAdminFacade().setBan(USER_ID, true);
+
+      await expect(attempt).resolves.toMatchObject({
+        data: null,
+        error: { name: 'AuthRetryableFetchError' },
+      });
+    });
   });
 
   it('is frozen and a singleton: nobody can add a method to the shared object', () => {

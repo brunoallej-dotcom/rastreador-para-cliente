@@ -4,12 +4,12 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 6.1 concluídas, mais os contratos
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 8 concluídas, mais os contratos
   `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 7 (em revisão), depois 9 ∥ 10 e 10.1 (endurecimento do banco).
+- **Próximas ondas:** 9 ∥ 10, depois 10.1 (endurecimento do banco).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -23,7 +23,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
-| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
+| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
@@ -474,3 +474,31 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   + 1323 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` → 389/389 duas vezes;
   `test:api -t "AC-1[59]|E-(16|20)"` → 49; `test:int` → 22/22; `test:coverage` ok; `build` e
   `format:check` ok; `pnpm sast` sem achados (subagente).
+
+### 2026-11-16 — Onda 7: logins de cliente
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 8, e retomada depois da
+  queda da sessão.
+- **Entregue:** `GET/POST /admin/clients/{clientId}/users`, `PATCH .../users/{userId}` e o reset de
+  senha.
+  - O provisionamento cria no Auth pela Admin API, com papel fixo `client`, e registra no banco.
+  - O desativar grava no banco e depois bane no Auth.
+  - O reset troca a senha no Auth e depois exige a troca no banco, o que renova a validade de 72 h.
+- **Revisões** (threat-modeler F-90..F-96, code-reviewer, contract-guardian, rls-auditor, mais uma
+  segunda passada): nenhum CRÍTICO. Corrigidos:
+  - **ALTO:** conta criada sem resposta confirmada virava 500 sem compensação. Depois de qualquer
+    falha ambígua do Auth, a lista é relida. Só se apaga o login que é comprovadamente desta
+    tentativa (um candidato, criado depois do início dela); no resto, 503 e log.
+  - **F-91:** o facade de admin perdeu o `auth.admin` genérico. Sobraram `createClientUser` (papel
+    fixo), `setPassword`, `setBan` e `deleteUser`, com regras Semgrep contra uso do admin fora do
+    facade e contra `app_metadata.role` diferente de `client`.
+  - Reset incompleto é sempre `reset_incomplete`. O re-ban depois de uma reativação falha só vale
+    para quem estava desativado. `ban_failed` leva o motivo.
+  - **Prontidão do PostgREST depois do `db:reset`:** era a causa da falha intermitente nos
+    `beforeAll`. Agora há uma espera compartilhada no setup dos projetos `int` e `api`.
+- **Planejado:** F-92b e F-93 vão para a Onda 10.1. F-94/F-95 (alerta `ban_failed` e
+  reconciliação) vão para a Onda 11. F-96 aceito.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`, já com a Onda 8 na
+  main: `pnpm verify` → 2520 unit + 1323 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` →
+  454/454 duas vezes; `test:api -t "AC-1[234]|E-(1[6789]|2[34])"` → 37; `test:int` → 22/22;
+  `test:coverage`, `build` e `format:check` ok; `pnpm sast` sem achados (subagente).

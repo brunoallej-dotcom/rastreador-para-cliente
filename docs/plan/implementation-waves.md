@@ -15,7 +15,7 @@
 | 5 | Identidade: MFA TOTP obrigatório para CEOs | 3 | 4 | ✅ |
 | 6 | Rastreamento: clientes (CRUD de CEO) | 5 | 4 | ✅ |
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
-| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ⬜ |
+| 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
