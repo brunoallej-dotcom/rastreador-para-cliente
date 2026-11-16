@@ -565,7 +565,8 @@ stateDiagram-v2
 
 Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXECUTE` revogado de
 `PUBLIC`/`anon` e concedido só ao papel necessário, valida os inputs (espelhando o Zod), grava
-`audit_events` na mesma transação e trava as linhas afetadas (`SELECT … FOR UPDATE`).
+`audit_events` na mesma transação e trava as linhas afetadas (`SELECT … FOR NO KEY UPDATE` no pai:
+cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funções).
 
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
@@ -594,7 +595,7 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
 |-------|-----------------|---------------|
 | SQLSTATE `42501` | `ForbiddenError` (também gera log `warn`: indica bypass da camada 1) | 403 `FORBIDDEN` |
 | `P0001` + `NOT_FOUND` | `NotFoundError` | 404 `NOT_FOUND` |
-| `P0001` + `STALE_STAGE` | `StaleStageError` | 409 `STALE_STAGE` |
+| `P0001` + `STALE_STAGE` | `StaleStageError` (o `currentStageId` vem de uma releitura do processo, §3.7.3: o erro do banco não leva a linha) | 409 `STALE_STAGE` |
 | `P0001` + `PROCESS_NOT_ACTIVE` | `ProcessNotActiveError` | 422 `PROCESS_NOT_ACTIVE` |
 | `P0001` + `CLIENT_ARCHIVED` | `ClientArchivedError` | 422 `CLIENT_ARCHIVED` |
 | `P0001` + `PASSWORD_UNCHANGED` | `PasswordUnchangedError` | 422 `PASSWORD_UNCHANGED` |
@@ -760,6 +761,83 @@ Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXE
   linha (o título). Pelo mesmo motivo, os CHECKs de `default_stage_template` exigem o mesmo texto que a API
   aceita (nome e descrição passam por `visible_text` e já estão normalizados): um template com nome inválido não
   entra, em vez de falhar na primeira criação de processo.
+
+#### 3.7.3 Aprovação e linha do tempo (Onda 9)
+
+- **Escrita.** `approve_current_stage(p_process_id, p_expected_stage_id)` checa `private.is_ceo() IS NOT TRUE`
+  antes de qualquer trabalho com a entrada (papel `ceo`, sessão `aal2` **atestada**, fator verificado, sessão viva,
+  perfil ativo: senão 42501, F-55), e só o `authenticated` a executa (nem o `service_role`). O "Ok" é do CEO da
+  **sessão**: `approved_by` é `auth.uid()`, nunca um argumento, e o processo e a fase vêm do path e do corpo só
+  como ids a conferir. A fase esperada nula é `INVALID_INPUT`. Devolve a linha de `processes`; o app lê o
+  detalhe de novo (§3.7.2) e, se ele não aparece mais, responde 404. As regras são as da transição pura
+  `approveCurrentStage` do agregado (`tracking/domain/process.ts`: só a fase atual, uma aprovação por fase, a
+  última fase conclui o processo, `completed_at` e `version` mudam uma vez), e um teste de API compara, passo
+  a passo, o que o banco grava com o que a transição pura prevê.
+- **Ordem de trava e de erro (F-82, T-41).** A função trava **primeiro a linha do processo**, com `FOR NO KEY
+  UPDATE` (a mesma consulta e o mesmo modo de `update_process`, então as duas se serializam), lê o `status` **depois
+  da trava** e só então trava a fase em andamento, também com `FOR NO KEY UPDATE`. Nenhuma escrita vem antes
+  das duas travas e nada trava `public.clients`. Nunca `FOR UPDATE` no processo (cruzaria com o outro modo) e
+  nunca a fase antes do processo (deadlock com o cancelamento). A precedência dos erros é: papel (42501),
+  entrada (`INVALID_INPUT`), processo (`NOT_FOUND`), `status` (`PROCESS_NOT_ACTIVE`, que vence um `STALE_STAGE`:
+  E-03) e a fase esperada (`STALE_STAGE`). Uma fase esperada que não é a atual (já concluída, ainda `pending`, de
+  **outro** processo ou inexistente) é sempre `STALE_STAGE`, nunca `NOT_FOUND` e nunca pula fase (E-72). O pgTAP
+  confere a ordem no catálogo (`prosrc`), e os testes de API a provam com a trava na mão: uma segunda sessão do banco
+  segura a linha do processo (ou roda a função de verdade sem fazer COMMIT), as requisições disparadas esperam nela
+  (o teste confere no `pg_stat_activity` que todas estão bloqueadas) e só então a trava é solta, o que dá o mesmo
+  resultado em toda execução, sem `sleep`.
+- **Um instante só.** A fase concluída, a aprovação, a fase iniciada e o processo usam o mesmo instante, igual
+  ao `occurred_at` da auditoria da transação: o maior entre `now()` e o `started_at` da fase. O `now()` de uma
+  aprovação que esperou a trava é o do **começo** da transação, e pode ser anterior ao `started_at` que a aprovação
+  anterior gravou na fase seguinte (um CEO que já conhece o id da fase 2 e dá o "Ok" nela junto com o da fase 1);
+  sem o `greatest`, o CHECK `completed_at >= started_at` daria 500. O pgTAP cobre esse caso.
+- **Auditoria sem PII.** `stage.approved` (recurso `stage` = a fase aprovada) e, se era a última fase,
+  `process.completed` (recurso `process`), nessa ordem, na mesma transação, sem metadados: nenhum título,
+  nome de fase nem nome de pessoa. Só grava quando a aprovação acontece: recusa não audita.
+- **`STALE_STAGE` e `currentStageId`.** O erro do banco é o código fixo, sem `DETAIL` nem `HINT`. O app relê o
+  processo (uma requisição, como em §3.7.2) e devolve como `currentStageId` a fase `in_progress` dele **agora**,
+  ou `null` se o processo já não está ativo (o contrato descreve o campo assim). Entre o erro e a releitura outra
+  aprovação pode ter andado, e a resposta diz onde o processo está quando ela é montada, que é o que o CEO precisa
+  para repetir. Se a releitura não acha o processo, 404; se o banco cai, 503.
+- **Retry depois de um 503 (E-02, E-21, E-70).** Um 503 não diz se o COMMIT aconteceu, mas **o "Ok" nunca aprova
+  duas vezes**, porque a fase esperada é a chave de concorrência (I6): se a primeira chamada foi gravada, o retry
+  com o mesmo `expectedStageId` responde **409 `STALE_STAGE`** com a fase seguinte em `currentStageId` (ou
+  **422 `PROCESS_NOT_ACTIVE`**, se era a última fase ou se o processo foi cancelado depois), e o processo fica como a
+  primeira chamada o deixou; se não foi gravada, o retry é a própria aprovação, 200. Isso vale também quando a
+  função gravou e só a releitura que devolve o corpo falhou. O CEO que recebe o 409 ou o 422 de um retry lê o
+  detalhe (`GET /admin/processes/{processId}`): `stages[].approval` diz que a fase foi concluída e por quem.
+  *Pendência do contrato:* a descrição de `approveCurrentStage` já trata o 409 como "outro CEO já aprovou ou houve
+  um retry", mas não diz que o retry da última fase é 422 `PROCESS_NOT_ACTIVE`; entra no próximo bump de contrato,
+  junto com a pendência de `createProcess` (§3.7.2).
+- **Cliente arquivado (F-87, Q-13).** Hoje arquivar o cliente **não** congela os processos que ele já tem: aprovar
+  vale, como renomear e cancelar (§3.7.2). O pgTAP registra o comportamento atual, e a decisão de produto é do
+  usuário. Se arquivar passar a congelar, a mudança é pequena e igual nas duas funções: ler o `archived_at` do
+  cliente na mesma consulta que trava o processo (um `JOIN`, sem travar `public.clients`: a ordem de trava do
+  processo antes do cliente seria o inverso da de `create_process`) e levantar o erro escolhido (`CLIENT_ARCHIVED`
+  ou `PROCESS_NOT_ACTIVE`) logo depois da trava do processo.
+- **Linha do tempo (RF-12, AC-28).** `GET /admin/processes/{processId}/events` é um query service próprio
+  (`supabase-process-event-queries.ts`), não o repositório do agregado. Lê, como o CEO (RLS), quatro coisas simples,
+  nenhuma com valor numa string de filtro do PostgREST: o processo (inexistente: 404); uma página de `audit_events`
+  do processo, só com as cinco ações do contrato (`process.created`, `.updated`, `.cancelled`, `.completed` e
+  `stage.approved`), `ORDER BY id`; as fases que os `stage.approved` da página nomeiam (`id`, `position`, `name`); e
+  os perfis dos atores (`display_name`). A trilha não tem chave estrangeira para as fases nem para os perfis (a
+  história sobrevive a eles), então a junção é feita no app. Uma ação nova na trilha nunca chega ao CEO até entrar
+  na lista e no contrato.
+  - **Ordem.** Crescente pelo `id` do evento (sequencial). Toda escrita do mesmo processo pega a trava da linha do
+    processo antes de gravar a auditoria, então um evento posterior sempre tem `id` maior: o `id` é a ordem em que as
+    escritas aconteceram. O `occurredAt` é o instante de **início** da transação (`now()`): uma escrita que esperou a
+    trava pode mostrar um instante alguns milissegundos anterior ao do evento que a antecedeu, e a ordem do `id`
+    prevalece (por isso a ordenação não é por `occurred_at`).
+  - **Detalhes.** `stage.approved` traz `stageId` (o recurso do evento) e, da linha da fase (que nenhuma operação
+    renomeia), `stagePosition` e `stageName`; os outros eventos têm `details: {}`. Nunca `previousTitle` nem
+    `newTitle` (E-73). `actor` é `{ id, displayName }` do perfil do ator, ou `null` (E-75).
+  - **Paginação.** Keyset pelo `id`: uma consulta só (`id > posição`, `ORDER BY id`, `LIMIT limite + 1`; o `id` é
+    único, então não há empate e não precisa das duas consultas de §3.7.1). O cursor é opaco, do `kind`
+    `admin-process-events`, e leva `{ i }`, o `id` do último evento da página como `bigint` em decimal canônico (de 1
+    ao maior `bigint`: o que o banco recebe é sempre um número que ele lê; E-74). Cursor adulterado, truncado, de outro
+    endpoint ou com payload fora do formato é 400 `VALIDATION_ERROR` em `query.cursor` (E-29), e um erro da classe 22
+    do banco numa posição recebida também vira esse 400. O cursor não leva o processo: o path diz qual é.
+  - **Índice.** Nenhum novo: `audit_events (process_id, occurred_at)` acha as linhas do processo (dezenas, no
+    máximo), e a ordenação por `id` é sobre elas.
 
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
@@ -1151,8 +1229,8 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 
 | # | Situação | Comportamento |
 |---|----------|---------------|
-| E-01 | Dois CEOs dão "Ok" ao mesmo tempo, com o mesmo `expectedStageId` | `FOR UPDATE` serializa: um recebe 200 e o outro 409 `STALE_STAGE` com `currentStageId` |
-| E-02 | Retry de aprovação após timeout | 409 `STALE_STAGE`; o detalhe mostra que a fase foi concluída e por quem. Nunca avança duas fases |
+| E-01 | Dois CEOs dão "Ok" ao mesmo tempo, com o mesmo `expectedStageId` | A trava `FOR NO KEY UPDATE` da linha do processo serializa: um recebe 200 e os outros 409 `STALE_STAGE` com `currentStageId` (§3.7.3) |
+| E-02 | Retry de aprovação após timeout | Se a primeira chamada foi gravada: 409 `STALE_STAGE` com a fase seguinte como `currentStageId` (o detalhe mostra que a fase foi concluída e por quem) ou, se era a última fase, 422 `PROCESS_NOT_ACTIVE` (E-70). Nunca avança duas fases |
 | E-03 | Aprovar processo `completed` ou `cancelled` | 422 `PROCESS_NOT_ACTIVE` |
 | E-04 | Processo com uma única fase | A primeira aprovação conclui o processo |
 | E-05 | Cliente pede processo de outro cliente, ou UUID inexistente | 404 `NOT_FOUND` (resposta idêntica nos dois casos) |
@@ -1213,6 +1291,12 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-61 | `PATCH` de processo ativo que renomeia para o mesmo título (depois da normalização), repetido ou não; ou que renomeia e cancela juntos | O mesmo título: 200 com o processo como está, sem auditoria, sem nova versão (o retry é seguro). Título novo e `status: "cancelled"` na mesma chamada: 200, uma versão a mais, dois eventos (`process.updated` e `process.cancelled`, nessa ordem). Cancelar não muda as fases: a que estava em andamento continua |
 | E-62 | Criar processo com o template, e o template tem buracos nas posições ou está vazio | Com buracos (1, 3, 5, 9), o processo tem as fases 1 a n, na ordem do template. Vazio: 500 (defeito de migration, `TEMPLATE_EMPTY` no banco), e nunca um processo sem fases |
 | E-63 | Fase com descrição vazia ou só de espaços, ou com chave que o contrato não tem (`position`, `status`, `id`) | Pela API, a descrição vazia ou em branco é "sem descrição" (`description: null` na resposta) e a chave desconhecida é 400 `VALIDATION_ERROR`. Direto na função do banco, a descrição vazia é `INVALID_INPUT` e a chave desconhecida também |
+| E-70 | Retry do "Ok" depois de um 503 (a resposta se perdeu, ou só a releitura que devolve o corpo falhou) | Primeira chamada **não** gravada: o retry é a própria aprovação, 200. Gravada e **não** era a última fase: 409 `STALE_STAGE` com a fase seguinte em `currentStageId`. Gravada e **era** a última: 422 `PROCESS_NOT_ACTIVE`. Gravada e o processo foi cancelado depois: 422. Em nenhum caso aprova duas vezes; o CEO lê o detalhe para ver o que a primeira chamada fez (§3.7.3) |
+| E-71 | "Ok" e cancelamento ao mesmo tempo no mesmo processo (F-82, T-41) | Serializam pela trava da linha do processo, e vale quem a pegar primeiro: aprovação primeiro, as duas dão 200 e a fase seguinte fica em andamento, congelada; cancelamento primeiro, a aprovação dá 422 `PROCESS_NOT_ACTIVE`. Nunca uma fase concluída num processo já cancelado, nunca deadlock, nunca 500 |
+| E-72 | `expectedStageId` de uma fase futura (ainda `pending`), já concluída, de **outro** processo ou que não existe | 409 `STALE_STAGE` com a fase atual: nunca 404 e nunca pula fase. Num processo concluído ou cancelado, qualquer um deles dá 422 `PROCESS_NOT_ACTIVE` (E-03) |
+| E-73 | Linha do tempo de um processo renomeado | `process.updated` sem `previousTitle` nem `newTitle`: a trilha não guarda títulos (SEC-16, §3.7.2), e o título de hoje estaria errado depois de um renome seguinte. Nenhum título aparece na resposta |
+| E-74 | Cursor da linha do tempo adulterado, de outro endpoint, com um id que não é decimal canônico (zero, zero à esquerda, sinal) ou acima do maior `bigint` | 400 `VALIDATION_ERROR` em `query.cursor` (E-29). O maior `bigint` é uma posição válida: página vazia |
+| E-75 | Evento da linha do tempo cujo ator não tem perfil legível, ou `stage.approved` cuja fase não é achada | `actor: null`, ou só `details.stageId` (os detalhes do contrato são opcionais): a linha do tempo mostra o que há, sem 500 |
 
 ---
 

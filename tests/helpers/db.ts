@@ -432,3 +432,33 @@ export async function resetGlobalLoginBudget(): Promise<number> {
   const rows = await queryLocal(globalBudgetResetSql(LOGIN_GLOBAL_BUDGET.group));
   return rows.length;
 }
+
+/** The name of a database routine (`approve_current_stage`): lowercase words joined by underscores. */
+const ROUTINE_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
+
+/**
+ * The statement that counts the backends of this database that are WAITING FOR A LOCK while running a
+ * statement that names `routine` (Wave 9: an approval parked behind a lock that a test holds in a second
+ * session). A test uses it to know that every request it fired is blocked inside the function, so the
+ * requests are truly simultaneous, without a sleep and without guessing a delay. The name is checked
+ * against a plain-routine-name pattern and compared with `position()`, so no character of it is a
+ * pattern and nothing but `[a-z0-9_]` ever reaches the SQL text.
+ */
+export function lockWaitersSql(routine: string): string {
+  if (!ROUTINE_PATTERN.test(routine)) {
+    throw new Error('lockWaitersSql: the routine is not a plain routine name');
+  }
+  return (
+    'SELECT count(*)::int AS waiting FROM pg_stat_activity ' +
+    "WHERE datname = current_database() AND wait_event_type = 'Lock' " +
+    `AND position('${routine}' IN query) > 0`
+  );
+}
+
+/** How many backends are waiting for a lock inside a statement that names `routine` (see `lockWaitersSql`). */
+export async function countLockWaiters(routine: string): Promise<number> {
+  const rows = await queryLocal(lockWaitersSql(routine));
+  const row = z.array(z.object({ waiting: z.number().int().nonnegative() })).parse(rows)[0];
+  if (row === undefined) throw new Error('countLockWaiters: the database counted nothing');
+  return row.waiting;
+}

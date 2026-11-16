@@ -3,7 +3,46 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LOGIN_GLOBAL_BUDGET } from '@/modules/identity/presentation/rate-limit-budgets';
 import { rateLimitBucket } from '@/shared/http/rate-limit/group';
-import { dbContainerName, globalBudgetResetSql, parseProjectId, parseRowsOutput } from './db';
+import {
+  dbContainerName,
+  globalBudgetResetSql,
+  lockWaitersSql,
+  parseProjectId,
+  parseRowsOutput,
+} from './db';
+
+describe('lockWaitersSql (what tells a test that its requests are parked behind a lock)', () => {
+  it('counts the backends waiting for a lock in a statement that names the routine', () => {
+    const sql = lockWaitersSql('approve_current_stage');
+
+    expect(sql).toContain("wait_event_type = 'Lock'");
+    expect(sql).toContain("position('approve_current_stage' IN query) > 0");
+    expect(sql).toContain('datname = current_database()');
+    expect(sql).not.toContain('LIKE');
+  });
+
+  it.each([
+    ['an empty name', ''],
+    ['a quote', "update_process'"],
+    [
+      'a statement after the name',
+      "x'; SELECT pg_terminate_backend(pid) FROM pg_stat_activity; --",
+    ],
+    ['a LIKE wildcard', 'update%'],
+    ['an uppercase name', 'Update_process'],
+    ['a schema-qualified name', 'public.update_process'],
+    ['a name that starts with a digit', '1update'],
+    ['a name that is too long', 'a'.repeat(64)],
+  ])('refuses %s: nothing but a plain routine name reaches the SQL', (_label, routine) => {
+    expect(() => lockWaitersSql(routine)).toThrow(/not a plain routine name/);
+  });
+
+  it('accepts the routines of the process functions', () => {
+    for (const routine of ['approve_current_stage', 'update_process', 'create_process']) {
+      expect(lockWaitersSql(routine)).toContain(`'${routine}'`);
+    }
+  });
+});
 
 describe('parseRowsOutput (what psql prints inside the db container)', () => {
   it('reads one JSON array of rows, however it is wrapped over lines', () => {

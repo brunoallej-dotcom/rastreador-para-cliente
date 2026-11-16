@@ -85,6 +85,16 @@ INSERT INTO public.process_stages (id, process_id, position, name, status, start
 INSERT INTO public.stage_approvals (process_stage_id, process_id, approved_by) VALUES
   ('00000000-0000-4000-8000-0000000002e2', '00000000-0000-4000-8000-0000000001e2', '00000000-0000-4000-8000-0000000000c1');
 
+-- Os processos desta fixture: as contagens de tabela inteira olham só para eles, para não depender de linhas que
+-- outro teste deixou no banco.
+CREATE TEMP TABLE fixture_processes (id uuid PRIMARY KEY);
+INSERT INTO fixture_processes (id) VALUES
+  ('00000000-0000-4000-8000-0000000001a1'), ('00000000-0000-4000-8000-0000000001a2'),
+  ('00000000-0000-4000-8000-0000000001b1'), ('00000000-0000-4000-8000-0000000001d1'),
+  ('00000000-0000-4000-8000-0000000001f1'), ('00000000-0000-4000-8000-0000000001e1'),
+  ('00000000-0000-4000-8000-0000000001e2');
+GRANT SELECT ON fixture_processes TO authenticated;
+
 -- Captura o erro de um comando, com o que ele leva (código, mensagem, DETAIL, HINT): as funções de escrita só
 -- podem levantar o código fixo, sem texto que vaze linha. Roda como quem chama (a sessão autenticada).
 CREATE FUNCTION pg_temp.try(p_sql text)
@@ -318,17 +328,17 @@ SELECT tests.clear_authentication();
 
 -- Nada do que foi negado mudou alguma coisa -------------------------------------------------------------------
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.stage_approvals $$,
+  $$ SELECT count(*)::int FROM public.stage_approvals WHERE process_id IN (SELECT id FROM fixture_processes) $$,
   $$ VALUES (2) $$,
   'AC-08: nenhuma chamada negada gravou aprovação (só as 2 das fixtures)'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action IN ('stage.approved', 'process.completed') $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action IN ('stage.approved', 'process.completed') AND process_id IN (SELECT id FROM fixture_processes) $$,
   $$ VALUES (0) $$,
   'AC-08: nenhuma chamada negada gravou auditoria'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.process_stages WHERE status = 'in_progress' $$,
+  $$ SELECT count(*)::int FROM public.process_stages WHERE status = 'in_progress' AND process_id IN (SELECT id FROM fixture_processes) $$,
   $$ VALUES (6) $$,
   'AC-08: nenhuma chamada negada mexeu em fase (as 6 em andamento das fixtures seguem como estavam)'
 );
@@ -524,7 +534,7 @@ SELECT results_eq(
   'I4: a fase parada do processo cancelado continua em andamento'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action IN ('stage.approved', 'process.completed') $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action IN ('stage.approved', 'process.completed') AND process_id IN (SELECT id FROM fixture_processes) $$,
   $$ VALUES (4) $$,
   'E-03: só os 3 stage.approved de P3 e o process.completed da última estão na auditoria: nada foi gravado por recusa'
 );
@@ -739,7 +749,7 @@ SELECT is_empty(
 SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.stage_approvals $$,
+  $$ SELECT count(*)::int FROM public.stage_approvals WHERE process_id IN (SELECT id FROM fixture_processes) $$,
   $$ VALUES (8) $$,
   'o CEO aal2 atestado lê as aprovações (2 de fixture, 3 de P3, 1 de P1, 1 de PX e 1 de PF)'
 );
