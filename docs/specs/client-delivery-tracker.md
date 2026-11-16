@@ -388,12 +388,19 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   que o código gasta explicitamente (o login). Nunca vale em política de rota. Os limites por IP e
   por conta não protegem a cota do Auth contra um atacante distribuído; o teto global responde
   429 antes que o Auth responda 503 a todos.
-- **Sessão que chama o Auth:** antes de `getClaims()`, o servidor decodifica o cookie sem confiar
-  nele; se resolvê-lo chamaria o Auth (token vencido, ou que não se verifica localmente), o IP
-  gasta o orçamento da tabela. Acima dele: 401, sem apagar os cookies e sem chamar o Auth.
+- **Sessão que chama o Auth:** antes de `getClaims()`, o servidor lê o cookie do mesmo jeito que o
+  cliente do Auth (sem confiar nele). A invariante: toda chamada ao Auth feita ao resolver um
+  principal é cobrada do orçamento do IP, e um IP sem orçamento não chega ao Auth. O servidor só
+  não cobra quando prova que não haverá chamada (nenhum cookie de sessão, ou token não vencido e
+  assimétrico de um `kid` recentemente verificado); todo o resto, inclusive cookie ilegível, gasta
+  uma unidade. Acima do orçamento: 401, sem apagar os cookies e sem chamar o Auth. Um cookie que
+  faria o cliente lançar uma exceção que não é erro de autenticação (algoritmo não suportado, token
+  malformado) é recusado com 401 antes. As chamadas realmente feitas ao Auth são contadas no `fetch`
+  do cliente e a diferença para o que foi cobrado é cobrada depois (`auth.session_budget_mispredicted`).
+  Mesmo um token local é recusado se a memória do limitador já sabe que o IP está sem orçamento.
 - Cada instância guarda em memória as negações que viu e responde 429 sem consultar o banco até o fim
   da janela (só deixa o limite mais estrito). `rate_limit_hit` apaga, em cerca de 1% das chamadas,
-  até 500 janelas vencidas há mais de 1 dia; a limpeza diária por `pg_cron` entra na Onda 11.
+  até 500 janelas vencidas há mais de 48 h; a limpeza diária por `pg_cron` entra na Onda 11.
 
 ### 3.10 Observabilidade e auditoria
 

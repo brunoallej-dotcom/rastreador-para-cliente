@@ -59,5 +59,17 @@ export function createInMemoryRateLimiter(options: InMemoryRateLimiterOptions = 
       const retryAfterSeconds = Math.max(1, Math.ceil((window.resetAtMs - nowMs) / MS_PER_SECOND));
       return Promise.resolve({ allowed: false, retryAfterSeconds });
     },
+
+    peekDenial(key: RateLimitKey, rule: RateLimitRule) {
+      const nowMs = clock.now().getTime();
+      const window = windows.get(`${key.bucket}|${key.subject}`);
+      // denied = the counter is past its limit and its window is still open; nothing is counted
+      if (window === undefined || window.resetAtMs <= nowMs || window.count <= rule.limit) {
+        return undefined;
+      }
+      return {
+        retryAfterSeconds: Math.max(1, Math.ceil((window.resetAtMs - nowMs) / MS_PER_SECOND)),
+      };
+    },
   };
 }

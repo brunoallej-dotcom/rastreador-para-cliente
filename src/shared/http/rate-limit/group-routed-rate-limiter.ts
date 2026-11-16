@@ -19,9 +19,14 @@ export type GroupRoutedRateLimiterOptions = {
  * database outage must not be able to turn a liveness probe into an undocumented 503.
  */
 export function createGroupRoutedRateLimiter(options: GroupRoutedRateLimiterOptions): RateLimiter {
+  const limiterFor = (key: RateLimitKey): RateLimiter =>
+    options.routes[key.group] ?? options.fallback;
   return {
     consume(key: RateLimitKey, rule: RateLimitRule): Promise<RateLimitDecision> {
-      return (options.routes[key.group] ?? options.fallback).consume(key, rule);
+      return limiterFor(key).consume(key, rule);
+    },
+    peekDenial(key: RateLimitKey, rule: RateLimitRule) {
+      return limiterFor(key).peekDenial?.(key, rule);
     },
   };
 }

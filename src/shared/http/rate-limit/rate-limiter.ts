@@ -93,4 +93,15 @@ export type RateLimitDecision =
  */
 export interface RateLimiter {
   consume(key: RateLimitKey, rule: RateLimitRule): Promise<RateLimitDecision>;
+
+  /**
+   * Is this counter ALREADY known to be denied, from what the limiter holds in memory? It never
+   * counts a request, never calls a store and never throws, so it is free; `undefined` means "not
+   * known to be denied", not "allowed". A limiter without such memory leaves it out. Callers use it
+   * to refuse work early for a key that is over budget, as a second line behind `consume`.
+   */
+  peekDenial?(
+    key: RateLimitKey,
+    rule: RateLimitRule,
+  ): { readonly retryAfterSeconds: number } | undefined;
 }

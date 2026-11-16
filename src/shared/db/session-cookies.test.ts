@@ -57,13 +57,56 @@ describe('snapshot and restore of the session cookies', () => {
     expect(jar.get('unrelated')).toBe('x');
   });
 
-  it('removes session cookies that were not in the snapshot', () => {
+  it('keeps a session that a refresh REWROTE: the rotated cookies stay, the consumed refresh token is not put back', () => {
+    const jar = createFakeCookieStore([
+      { name: '__Host-rt-session.0', value: 'old-0' },
+      { name: '__Host-rt-session.1', value: 'old-1' },
+    ]);
+    const snapshot = snapshotSessionCookies(jar);
+    // what @supabase/ssr does after a refresh: new value, and one chunk fewer
+    jar.set('__Host-rt-session.0', 'new-0');
+    jar.delete('__Host-rt-session.1');
+    jar.writes.length = 0;
+
+    restoreSessionCookies(jar, snapshot);
+
+    expect(jar.get('__Host-rt-session.0')).toBe('new-0');
+    expect(jar.get('__Host-rt-session.1')).toBeUndefined();
+    expect(jar.writes).toEqual([]);
+  });
+
+  it('is all or nothing: a session cookie that is still there stops any restore, so old and new chunks are never mixed', () => {
+    const jar = createFakeCookieStore([
+      { name: '__Host-rt-session.0', value: 'old-0' },
+      { name: '__Host-rt-session.1', value: 'old-1' },
+    ]);
+    const snapshot = snapshotSessionCookies(jar);
+    jar.delete('__Host-rt-session.0');
+    jar.delete('__Host-rt-session.1');
+    jar.set('__Host-rt-session', 'new-whole'); // rewritten with another layout
+    jar.writes.length = 0;
+
+    restoreSessionCookies(jar, snapshot);
+
+    expect(jar.getAll().map(({ name }) => name)).toEqual(['__Host-rt-session']);
+    expect(jar.writes).toEqual([]);
+  });
+
+  it('restores nothing when the snapshot is empty', () => {
+    const jar = createFakeCookieStore([{ name: 'unrelated', value: 'x' }]);
+    restoreSessionCookies(jar, []);
+    expect(jar.writes).toEqual([]);
+  });
+
+  it('an unrelated cookie in the jar does not count as a session', () => {
     const jar = createFakeCookieStore([{ name: '__Host-rt-session', value: 'a' }]);
     const snapshot = snapshotSessionCookies(jar);
-    jar.set('__Host-rt-session.0', 'late');
+    jar.delete('__Host-rt-session');
+    jar.set('unrelated', 'x');
+
     restoreSessionCookies(jar, snapshot);
+
     expect(jar.get('__Host-rt-session')).toBe('a');
-    expect(jar.get('__Host-rt-session.0')).toBeUndefined();
   });
 });
 

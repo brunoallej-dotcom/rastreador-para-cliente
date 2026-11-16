@@ -584,7 +584,7 @@ describe('GET /api/v1/auth/session', () => {
     expect((await getSession(jar)).status).toBe(200);
   });
 
-  it('F-01: on an address whose budget a forger used up, a browser whose token is verified locally is not affected', async () => {
+  it('F-01: on an address whose budget a forger used up, even a token that verifies locally is refused (401, cookie kept), and works from a clean address', async () => {
     const client = await createClient();
     const user = await createClientUser({ clientId: client.id });
     const ip = newClientIp();
@@ -596,12 +596,28 @@ describe('GET /api/v1/auth/session', () => {
     for (let n = 0; n < 62; n += 1) {
       await invoke(sessionRoute, { path: '/auth/session', cookies: forged.clone(), ip });
     }
+    const spy = spyOnSupabaseFetch();
 
-    // the address is over its session-upstream budget, and this request does not spend any
-    const response = await invoke(sessionRoute, { path: '/auth/session', cookies: legitimate, ip });
+    let response: Response;
+    try {
+      response = await invoke(sessionRoute, {
+        path: '/auth/session',
+        cookies: legitimate.clone(),
+        ip,
+      });
+    } finally {
+      spy.restore();
+    }
 
-    expect(response.status).toBe(200);
-    expectToMatchContract('getSession', 200, await bodyOf(response), response);
+    // The trade-off of the second line of defense: an address the limiter already knows to be over
+    // budget is refused even for a token that would not have cost a call. Nothing reaches Auth,
+    // and the cookie is not touched.
+    expect(response.status).toBe(401);
+    expectToMatchContract('getSession', 401, await bodyOf(response), response);
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(spy.calls.filter((call) => call.includes('/auth/v1/'))).toEqual([]);
+    // from an address with budget left the very same cookie is fine
+    expect((await getSession(legitimate)).status).toBe(200);
   });
 
   it('F-01: over budget a browser that needs a token refresh gets a 401 and KEEPS its cookie, then refreshes from a clean address', async () => {
@@ -627,6 +643,220 @@ describe('GET /api/v1/auth/session', () => {
     expect(legitimate.names()).toEqual(before.names());
     // and from an address with budget left the very same cookie is refreshed
     expect((await getSession(before)).status).toBe(200);
+  });
+
+  describe('F-01: whatever the cookie looks like, an address over budget never reaches Auth', () => {
+    const REQUESTS = 63; // the budget is 60: three more than it can pay for
+    const AUTH_BUDGET = 60;
+    const FUTURE_S = () => Math.floor(Date.now() / 1000) + 3600;
+    const SIGNATURE = 'A'.repeat(43);
+    const b64 = (value: unknown) =>
+      Buffer.from(typeof value === 'string' ? value : JSON.stringify(value), 'utf8').toString(
+        'base64url',
+      );
+    const fakeJwt = (header: Record<string, unknown>, payload: Record<string, unknown> = {}) =>
+      `${b64(header)}.${b64({ sub: 'x', exp: FUTURE_S(), ...payload })}.${SIGNATURE}`;
+    const stored = (session: Record<string, unknown>) => `base64-${b64(session)}`;
+    const sessionOf = (accessToken: unknown, expiresAt: unknown) => ({
+      access_token: accessToken,
+      refresh_token: 'y',
+      expires_at: expiresAt,
+    });
+    const one = (value: string): Record<string, string> => ({ [SESSION_COOKIE]: value });
+    const authCallsOf = (calls: string[]) => calls.filter((call) => call.includes('/auth/v1/'));
+
+    /** A token whose header carries the kid of the real signing key, with a signature nobody made. */
+    let realHeader: Promise<Record<string, unknown>> | undefined;
+    const realKidHeader = (): Promise<Record<string, unknown>> =>
+      (realHeader ??= loadRealKidHeader());
+    async function loadRealKidHeader(): Promise<Record<string, unknown>> {
+      const client = await createClient();
+      const jar = await signIn(await createClientUser({ clientId: client.id }));
+      // verifying one real token teaches the server this signing key: from now on it is local
+      expect((await getSession(jar)).status).toBe(200);
+      const [header = ''] = readSessionCookie(jar).access_token.split('.');
+      return JSON.parse(Buffer.from(header, 'base64url').toString('utf8')) as Record<
+        string,
+        unknown
+      >;
+    }
+
+    const corpus: [string, (real: Record<string, unknown>) => Record<string, string>][] = [
+      ['expires_at in the past', () => one(stored(sessionOf('x', 1)))],
+      ['expires_at as the string "1"', () => one(stored(sessionOf('x', '1')))],
+      ['expires_at -1', () => one(stored(sessionOf('x', -1)))],
+      [
+        'expires_at null with an HS256 token',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'HS256' }), null))),
+      ],
+      [
+        'expires_at 0 with an HS256 token',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'HS256' }), 0))),
+      ],
+      [
+        'expires_at 1e999 (Infinity) with an HS256 token',
+        () =>
+          one(
+            `base64-${b64(
+              `{"access_token":"${fakeJwt({ alg: 'HS256' })}","refresh_token":"y","expires_at":1e999}`,
+            )}`,
+          ),
+      ],
+      [
+        'an unexpired HS256 token',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'HS256' }), FUTURE_S()))),
+      ],
+      [
+        'an ES256 token with no kid',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'ES256' }), FUTURE_S()))),
+      ],
+      [
+        'an ES256 token with a kid nobody has',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'ES256', kid: 'nobody-has-this' }), FUTURE_S()))),
+      ],
+      [
+        'an RS256 token with a kid nobody has',
+        () => one(stored(sessionOf(fakeJwt({ alg: 'RS256', kid: 'nobody-has-this' }), FUTURE_S()))),
+      ],
+      [
+        'the real kid with a signature nobody made',
+        (real) => one(stored(sessionOf(fakeJwt(real), FUTURE_S()))),
+      ],
+      [
+        'the real kid asking for RS256 (a key that cannot verify it)',
+        (real) => one(stored(sessionOf(fakeJwt({ ...real, alg: 'RS256' }), FUTURE_S()))),
+      ],
+      [
+        'an ES384 token with the real kid',
+        (real) => one(stored(sessionOf(fakeJwt({ ...real, alg: 'ES384' }), FUTURE_S()))),
+      ],
+      [
+        'an alg that is a number',
+        () => one(stored(sessionOf(fakeJwt({ alg: 5, kid: 'k' }), FUTURE_S()))),
+      ],
+      ['an access token that is not a string', () => one(stored(sessionOf(5, FUTURE_S())))],
+      [
+        'a header that is not JSON',
+        () =>
+          one(
+            stored(
+              sessionOf(`${b64('nope')}.${b64({ exp: FUTURE_S() })}.${SIGNATURE}`, FUTURE_S()),
+            ),
+          ),
+      ],
+      [
+        'a raw JSON value, without the base64- prefix',
+        () => one(JSON.stringify(sessionOf('x', 1))),
+      ],
+      ['base64- followed by garbage', () => one('base64-@@@')],
+      ['plain garbage', () => one('garbage')],
+      [
+        'an empty whole cookie and a valid expired session in a chunk',
+        () => ({ [SESSION_COOKIE]: '', [`${SESSION_COOKIE}.0`]: stored(sessionOf('x', 1)) }),
+      ],
+      [
+        'a chunk with a hole in the sequence',
+        () => {
+          const value = stored(sessionOf('x', 1));
+          return {
+            [`${SESSION_COOKIE}.0`]: value.slice(0, 10),
+            [`${SESSION_COOKIE}.2`]: value.slice(10),
+          };
+        },
+      ],
+      ['a chunk named .abc', () => ({ [`${SESSION_COOKIE}.abc`]: stored(sessionOf('x', 1)) })],
+    ];
+
+    it.each(corpus)('%s', async (_label, build) => {
+      const real = await realKidHeader();
+      const cookies = build(real);
+      const ip = newClientIp();
+      const spy = spyOnSupabaseFetch();
+
+      const statuses: number[] = [];
+      let authCallsBeforeLast = 0;
+      try {
+        for (let n = 0; n < REQUESTS; n += 1) {
+          if (n === REQUESTS - 3) authCallsBeforeLast = authCallsOf(spy.calls).length;
+          const response = await invoke(sessionRoute, {
+            path: '/auth/session',
+            cookies: createCookieStore(cookies),
+            ip,
+          });
+          statuses.push(response.status);
+          expectToMatchContract('getSession', 401, await bodyOf(response), response);
+        }
+      } finally {
+        spy.restore();
+      }
+
+      const authCalls = authCallsOf(spy.calls);
+      // the invariant: no more than the budget, whatever the shape of the cookie ...
+      expect(authCalls.length).toBeLessThanOrEqual(AUTH_BUDGET);
+      // ... and once the address is over budget nothing else reaches Auth
+      expect(authCalls.length - authCallsBeforeLast).toBe(0);
+      // every request is the documented 401: no variant is a 5xx
+      expect(statuses.every((status) => status === 401)).toBe(true);
+    });
+  });
+
+  it('F-01: a forged ES384 token is 401, not a 500, and costs no call to Auth', async () => {
+    const client = await createClient();
+    const jar = await signIn(await createClientUser({ clientId: client.id }));
+    const session = readSessionCookie(jar);
+    expect((await getSession(jar)).status).toBe(200);
+    const [header = '', payload = ''] = session.access_token.split('.');
+    const realHeader = JSON.parse(Buffer.from(header, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    const forgedHeader = Buffer.from(
+      JSON.stringify({ ...realHeader, alg: 'ES384' }),
+      'utf8',
+    ).toString('base64url');
+    writeSessionCookie(jar, {
+      ...session,
+      access_token: `${forgedHeader}.${payload}.${'A'.repeat(43)}`,
+    });
+    const spy = spyOnSupabaseFetch();
+
+    let response: Response;
+    try {
+      response = await getSession(jar);
+    } finally {
+      spy.restore();
+    }
+
+    expect(response.status).toBe(401);
+    expectToMatchContract('getSession', 401, await bodyOf(response), response);
+    expect(spy.calls.filter((call) => call.includes('/auth/v1/'))).toEqual([]);
+  });
+
+  it('F-01: a forged RS256 token with the real kid is 401 on a process that has not seen the key yet (WebCrypto rejects the import)', async () => {
+    // A fresh module registry is a process that has verified nothing yet: the kid is unknown, so the
+    // request is charged and goes to the key fetch, where importing an EC key as RS256 throws a
+    // DOMException that the library does not wrap. That is a verdict about the token, not a 500.
+    vi.resetModules();
+    const { GET: freshSessionRoute } = await import('@/app/api/v1/auth/session/route');
+    const jwksUrl = `${process.env.SUPABASE_URL ?? ''}/auth/v1/.well-known/jwks.json`;
+    const jwks = (await (await fetch(jwksUrl)).json()) as { keys: { kid: string }[] };
+    const kid = jwks.keys[0]?.kid;
+    const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+    const token = `${part({ alg: 'RS256', kid, typ: 'JWT' })}.${part({
+      sub: 'x',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    })}.${'A'.repeat(43)}`;
+    const jar = createCookieStore();
+    writeSessionCookie(jar, {
+      access_token: token,
+      refresh_token: 'y',
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+
+    const response = await invoke(freshSessionRoute, { path: '/auth/session', cookies: jar });
+
+    expect(response.status).toBe(401);
+    expectToMatchContract('getSession', 401, await bodyOf(response), response);
   });
 
   it('SEC-07: garbage in the session cookie is 401, not a crash', async () => {

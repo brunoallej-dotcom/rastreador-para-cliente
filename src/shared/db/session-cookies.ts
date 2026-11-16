@@ -34,20 +34,24 @@ export function snapshotSessionCookies(jar: SessionCookieStore): SessionCookie[]
 }
 
 /**
- * Puts a snapshot back: every cookie of the snapshot is written again, and any session cookie that
- * is not in the snapshot is deleted. Used when a call that clears the session did not complete, so
- * the browser keeps a session it can still use to try again.
+ * Puts a session back that a failed call had dropped from the jar, so the browser keeps a session it
+ * can still use to try again.
+ *
+ * It restores ONLY a session that was REMOVED: when no session cookie is left in the jar, the whole
+ * snapshot is written again. A session cookie that is still there, whatever its value, is left as it
+ * is: if the Auth client had refreshed the session before the call failed, those are the ROTATED
+ * cookies, and putting the snapshot back would bring back a refresh token the server has already
+ * consumed; once the reuse interval has passed, its reuse is taken for a theft and the whole session
+ * family is revoked (E-10). (The snapshot is also never mixed with rewritten chunks: a refresh can
+ * change how many chunks the cookie has, and half old, half new chunks would be a corrupt session.)
  */
 export function restoreSessionCookies(
   jar: SessionCookieStore,
   snapshot: readonly SessionCookie[],
 ): void {
-  const kept = new Set(snapshot.map(({ name }) => name));
+  if (jar.getAll().some(({ name }) => isSessionCookieName(name))) return;
   for (const { name, value } of snapshot) {
     jar.set(name, value, { maxAge: SESSION_COOKIE_MAX_AGE_SECONDS });
-  }
-  for (const { name } of jar.getAll()) {
-    if (isSessionCookieName(name) && !kept.has(name)) jar.delete(name);
   }
 }
 
@@ -90,35 +94,6 @@ function decodeSessionCookies(
 export function readAccessToken(cookies: readonly SessionCookie[]): string | undefined {
   const token = decodeSessionCookies(cookies)?.['access_token'];
   return typeof token === 'string' && token !== '' ? token : undefined;
-}
-
-/**
- * What the session cookies claim, with the shape the Auth client requires of a session (it throws
- * the cookie away otherwise): access token, refresh token and expiry. UNVERIFIED: anybody can put
- * anything in a cookie, so this is only for deciding what the server would have to do with it
- * (see `needsAuthServer`), never for trusting it.
- */
-export type CookieSession = {
-  readonly accessToken: string;
-  readonly refreshToken: string;
-  /** Seconds since the epoch, as in the cookie. */
-  readonly expiresAt: number;
-};
-
-export function readSession(cookies: readonly SessionCookie[]): CookieSession | undefined {
-  const session = decodeSessionCookies(cookies);
-  const accessToken = session?.['access_token'];
-  const refreshToken = session?.['refresh_token'];
-  const expiresAt = session?.['expires_at'];
-  if (
-    typeof accessToken !== 'string' ||
-    typeof refreshToken !== 'string' ||
-    typeof expiresAt !== 'number' ||
-    !Number.isFinite(expiresAt)
-  ) {
-    return undefined;
-  }
-  return { accessToken, refreshToken, expiresAt };
 }
 
 /** The `session_id` claim of an access token, for LOG lines only (the payload is not verified). */

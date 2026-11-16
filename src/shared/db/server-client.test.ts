@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getRequestSupabase } from './server-client';
+import { fenceRequestClient, getRequestAuthCalls, getRequestSupabase } from './server-client';
 import { createFakeCookieStore } from './testing';
 
 // Obviously fake, lowercase-only values (the secret-detection hook rightly ignores them).
@@ -143,5 +143,110 @@ describe('getRequestSupabase', () => {
     expect(cookies.getAll()).toEqual([]);
     expect(cookies.writes.length).toBeGreaterThan(0);
     for (const write of cookies.writes) expect(write.kind).toBe('delete');
+  });
+});
+
+describe('getRequestAuthCalls: the calls to the Auth server, measured where they are made (F-01)', () => {
+  it('is 0 for a request that has no client yet', () => {
+    expect(getRequestAuthCalls(requestOf())).toBe(0);
+  });
+
+  it('counts the requests to /auth/v1/ and nothing else', async () => {
+    stubFetch((url) => (url.includes('/auth/v1/') ? json(FAKE_SESSION) : json([])));
+    const request = requestOf();
+    const client = getRequestSupabase({
+      request,
+      cookies: createFakeCookieStore(),
+      requestId: 'request-id-1',
+    });
+
+    await client.from('clients').select('id'); // PostgREST: not an Auth call
+    expect(getRequestAuthCalls(request)).toBe(0);
+
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+    expect(getRequestAuthCalls(request)).toBe(1);
+
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+    expect(getRequestAuthCalls(request)).toBe(2);
+  });
+
+  it('keeps one counter per request', async () => {
+    stubFetch(() => json(FAKE_SESSION));
+    const busy = requestOf();
+    const idle = requestOf();
+    const client = getRequestSupabase({
+      request: busy,
+      cookies: createFakeCookieStore(),
+      requestId: 'request-id-1',
+    });
+    getRequestSupabase({
+      request: idle,
+      cookies: createFakeCookieStore(),
+      requestId: 'request-id-2',
+    });
+
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+
+    expect(getRequestAuthCalls(busy)).toBe(1);
+    expect(getRequestAuthCalls(idle)).toBe(0);
+  });
+
+  it('counts a call even when it fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('fetch failed'));
+    const request = requestOf();
+    const client = getRequestSupabase({
+      request,
+      cookies: createFakeCookieStore(),
+      requestId: 'request-id-1',
+    });
+
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' }).catch(() => {
+      // the outcome does not matter here, only that the call was counted
+    });
+
+    expect(getRequestAuthCalls(request)).toBe(1);
+  });
+});
+
+describe('fenceRequestClient: abandoned work cannot touch the jar afterwards', () => {
+  it('drops the cookie writes made after the fence, and keeps the ones made before it', async () => {
+    stubFetch(() => json(FAKE_SESSION));
+    const request = requestOf();
+    const cookies = createFakeCookieStore();
+    const client = getRequestSupabase({ request, cookies, requestId: 'request-id-1' });
+
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+    const before = cookies.getAll();
+    expect(before.length).toBeGreaterThan(0);
+
+    fenceRequestClient(request);
+    cookies.writes.length = 0;
+    await client.auth.signOut({ scope: 'local' });
+    await client.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+
+    expect(cookies.writes).toEqual([]);
+    expect(cookies.getAll()).toEqual(before);
+  });
+
+  it('fences only the request it is given', async () => {
+    stubFetch(() => json(FAKE_SESSION));
+    const fenced = requestOf();
+    const other = requestOf();
+    getRequestSupabase({ request: fenced, cookies: createFakeCookieStore(), requestId: 'a' });
+    const otherCookies = createFakeCookieStore();
+    const otherClient = getRequestSupabase({
+      request: other,
+      cookies: otherCookies,
+      requestId: 'b',
+    });
+
+    fenceRequestClient(fenced);
+    await otherClient.auth.signInWithPassword({ email: 'a@b.test', password: 'x' });
+
+    expect(otherCookies.getAll().length).toBeGreaterThan(0);
+  });
+
+  it('is a no-op for a request that has no client', () => {
+    expect(() => fenceRequestClient(requestOf())).not.toThrow();
   });
 });

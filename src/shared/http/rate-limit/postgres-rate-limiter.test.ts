@@ -306,4 +306,103 @@ describe('createPostgresRateLimiter: remembered denials (F-06)', () => {
     await limiter.consume(keyFor('maria@cliente.test'), loginAccountRule);
     expect(received[0]?.bucket).not.toContain('maria');
   });
+
+  it('eviction is O(1): the oldest entry goes, expired or not, and a repeated denial moves a counter to the newest position', async () => {
+    const time = clock();
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({
+      secret: HMAC_KEY,
+      hit,
+      now: time.now,
+      maxDenials: 2,
+    });
+
+    await limiter.consume(keyFor('one'), loginAccountRule);
+    await limiter.consume(keyFor('two'), loginAccountRule);
+    time.advance(120_000); // both denials ended
+    await limiter.consume(keyFor('one'), loginAccountRule); // asks again, denied again: now the NEWEST
+    expect(received).toHaveLength(3);
+
+    await limiter.consume(keyFor('three'), loginAccountRule); // full: the oldest ('two') goes
+    expect(received).toHaveLength(4);
+
+    await limiter.consume(keyFor('one'), loginAccountRule); // still remembered
+    await limiter.consume(keyFor('three'), loginAccountRule); // still remembered
+    expect(received).toHaveLength(4);
+    await limiter.consume(keyFor('two'), loginAccountRule); // was evicted
+    expect(received).toHaveLength(5);
+  });
+});
+
+describe('createPostgresRateLimiter: peekDenial (F-01)', () => {
+  const DENIED = [{ allowed: false, retry_after_seconds: 120 }];
+  const clock = (startMs = 1_000_000) => {
+    let nowMs = startMs;
+    return { now: () => nowMs, advance: (ms: number) => void (nowMs += ms) };
+  };
+
+  it('is undefined for a counter that was never denied, and never calls the database', async () => {
+    const { hit, received } = fakeHit(ALLOWED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit });
+
+    expect(limiter.peekDenial?.(keyFor('fine'), loginAccountRule)).toBeUndefined();
+
+    await limiter.consume(keyFor('fine'), loginAccountRule);
+    expect(limiter.peekDenial?.(keyFor('fine'), loginAccountRule)).toBeUndefined();
+    expect(received).toHaveLength(1);
+  });
+
+  it('answers from memory with the time that is left, and counts nothing', async () => {
+    const time = clock();
+    const { hit, received } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit, now: time.now });
+    await limiter.consume(keyFor('flooded'), loginAccountRule);
+
+    time.advance(20_000);
+    expect(limiter.peekDenial?.(keyFor('flooded'), loginAccountRule)).toEqual({
+      retryAfterSeconds: 100,
+    });
+    expect(received).toHaveLength(1);
+  });
+
+  it('forgets a denial that has ended, and is per counter (subject, group, window)', async () => {
+    const time = clock();
+    const { hit } = fakeHit(DENIED);
+    const limiter = createPostgresRateLimiter({ secret: HMAC_KEY, hit, now: time.now });
+    const otherWindow: RateLimitRule = { ...loginAccountRule, windowSeconds: 60 };
+    await limiter.consume(keyFor('flooded'), loginAccountRule);
+
+    expect(limiter.peekDenial?.(keyFor('other'), loginAccountRule)).toBeUndefined();
+    expect(limiter.peekDenial?.(keyFor('flooded', otherWindow), otherWindow)).toBeUndefined();
+
+    time.advance(120_000);
+    expect(limiter.peekDenial?.(keyFor('flooded'), loginAccountRule)).toBeUndefined();
+  });
+
+  it('never throws and never reaches the database, even when the database is down', () => {
+    const limiter = createPostgresRateLimiter({
+      secret: HMAC_KEY,
+      hit: () => Promise.reject(new Error('connection refused')),
+    });
+    expect(() => limiter.peekDenial?.(keyFor('a'), loginAccountRule)).not.toThrow();
+  });
+
+  it('the group-routed limiter peeks at the limiter of that group, and falls back to the default one', async () => {
+    const { hit } = fakeHit(DENIED);
+    const postgres = createPostgresRateLimiter({ secret: HMAC_KEY, hit });
+    const memoryOnly: RateLimiter = { consume: () => Promise.resolve({ allowed: true }) };
+    const routed = createGroupRoutedRateLimiter({
+      routes: { login: postgres },
+      fallback: memoryOnly,
+    });
+
+    await routed.consume(keyFor('flooded'), loginAccountRule);
+
+    expect(routed.peekDenial?.(keyFor('flooded'), loginAccountRule)).toEqual({
+      retryAfterSeconds: 120,
+    });
+    const other: RateLimitRule = { ...loginAccountRule, group: 'reads' };
+    // a group routed to a limiter with no memory has nothing to peek at
+    expect(routed.peekDenial?.(keyFor('flooded', other), other)).toBeUndefined();
+  });
 });

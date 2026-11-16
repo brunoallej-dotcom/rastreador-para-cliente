@@ -66,25 +66,29 @@ export function createPostgresRateLimiter(options: PostgresRateLimiterOptions = 
   /** counter id → when the denial ends (ms). A Map iterates in insertion order: oldest first. */
   const denials = new Map<string, number>();
 
-  const remember = (id: string, untilMs: number, nowMs: number) => {
+  /**
+   * O(1) per denial, even under a flood of distinct counters: when the map is full the OLDEST entry
+   * (the first in insertion order) goes, expired or not. Sweeping for expired entries on every
+   * denial would make each one cost up to `maxDenials` steps, turning the flood into CPU load.
+   * Expired entries are also dropped lazily when they are looked up.
+   */
+  const remember = (id: string, untilMs: number) => {
     denials.delete(id);
     if (denials.size >= maxDenials) {
-      for (const [other, until] of denials) {
-        if (until <= nowMs) denials.delete(other);
-      }
-      for (const oldest of denials.keys()) {
-        if (denials.size < maxDenials) break;
-        denials.delete(oldest);
-      }
+      const oldest = denials.keys().next();
+      if (oldest.done !== true) denials.delete(oldest.value);
     }
     denials.set(id, untilMs);
   };
 
+  const denialId = (key: RateLimitKey, rule: RateLimitRule): string =>
+    // The window is part of the database key, so it is part of the memory's key too.
+    `${key.bucket}:${hmacSubject(secret, key.subject)}|${rule.windowSeconds}|${rule.limit}`;
+
   return {
     async consume(key: RateLimitKey, rule: RateLimitRule): Promise<RateLimitDecision> {
       const bucket = `${key.bucket}:${hmacSubject(secret, key.subject)}`;
-      // The window is part of the database key, so it is part of the memory's key too.
-      const id = `${bucket}|${rule.windowSeconds}|${rule.limit}`;
+      const id = denialId(key, rule);
 
       const nowMs = now();
       const blockedUntil = denials.get(id);
@@ -108,8 +112,20 @@ export function createPostgresRateLimiter(options: PostgresRateLimiterOptions = 
       if (row.allowed) return { allowed: true };
 
       const retryAfterSeconds = Math.max(1, row.retry_after_seconds);
-      remember(id, nowMs + retryAfterSeconds * MS_PER_SECOND, nowMs);
+      remember(id, nowMs + retryAfterSeconds * MS_PER_SECOND);
       return { allowed: false, retryAfterSeconds };
+    },
+
+    peekDenial(key: RateLimitKey, rule: RateLimitRule) {
+      const nowMs = now();
+      const id = denialId(key, rule);
+      const blockedUntil = denials.get(id);
+      if (blockedUntil === undefined) return undefined;
+      if (blockedUntil <= nowMs) {
+        denials.delete(id);
+        return undefined;
+      }
+      return { retryAfterSeconds: Math.max(1, Math.ceil((blockedUntil - nowMs) / MS_PER_SECOND)) };
     },
   };
 }
