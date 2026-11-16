@@ -63,6 +63,9 @@ export default defineConfig({
           ...dbProject,
           name: 'api',
           include: ['tests/api/**/*.api.test.ts'],
+          // Files run one at a time (`fileParallelism: false` above), so each can start from an empty
+          // global login budget: see the header of the setup file.
+          setupFiles: [...dbProject.setupFiles, 'tests/setup/reset-login-budget.ts'],
         },
       },
     ],

@@ -18,6 +18,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { z } from 'zod';
+import { LOGIN_GLOBAL_BUDGET } from '@/modules/identity/presentation/rate-limit-budgets';
 
 const execFileAsync = promisify(execFile);
 
@@ -189,4 +190,39 @@ export async function backendChallengeIdsOf(userId: string): Promise<string[]> {
     .array(z.object({ challenge_id: z.string() }))
     .parse(rows)
     .map((row) => row.challenge_id);
+}
+
+/** The name of a counter group (`login`, `totp-verify-daily`): lowercase words joined by hyphens. */
+const BUDGET_GROUP_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
+
+/**
+ * The statement that deletes every counter of ONE global budget (scope `global`, spec §3.9). The bucket
+ * of a counter is `<scope>:<group>:<hmac of the subject>` (`rateLimitBucket` plus the keyed subject), so
+ * the budget's counters are the rows whose bucket starts with `global:<group>:`. The prefix is compared
+ * with `left()` and not with `LIKE`, so no character of it is a pattern; and the group is checked
+ * against a plain-name pattern, so nothing but `[a-z0-9:-]` ever reaches the SQL text.
+ */
+export function globalBudgetResetSql(group: string): string {
+  if (!BUDGET_GROUP_PATTERN.test(group)) {
+    throw new Error('globalBudgetResetSql: the group is not a plain counter group name');
+  }
+  const prefix = `global:${group}:`;
+  return (
+    `DELETE FROM private.rate_limit_counters WHERE left(bucket, ${prefix.length}) = '${prefix}' ` +
+    'RETURNING bucket'
+  );
+}
+
+/**
+ * Empties the global login budget (`LOGIN_GLOBAL_BUDGET`: 300 sign-ins per 5 minutes for the whole
+ * app, F-02) and returns how many counters it dropped. A full `test:api` run signs in for about as many
+ * users as the budget allows, so a run that adds CEOs would hit the cap and answer 429 where a real
+ * deployment would not; `tests/setup/reset-login-budget.ts` calls this before every test FILE. It is
+ * safe only because the `api` project runs its files one at a time (`fileParallelism: false`) and
+ * because the tests of the cap itself fill the budget inside one file. No argument: nothing a caller
+ * passes ever reaches the SQL.
+ */
+export async function resetGlobalLoginBudget(): Promise<number> {
+  const rows = await queryLocal(globalBudgetResetSql(LOGIN_GLOBAL_BUDGET.group));
+  return rows.length;
 }
