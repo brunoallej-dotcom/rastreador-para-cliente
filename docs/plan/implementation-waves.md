@@ -271,13 +271,13 @@ tempo):
   TOTP, um challenge verificado que não foi criado pelo backend. A recusa gera auditoria e alerta.
 - **Depende de / paralela com**: 5, 6 e o PR do contrato `1.0.0-draft.2`, que mexe no mesmo
   verify / —.
-- **Critérios de aceite**: os IDs novos da spec, a partir de E-31:
+- **Critérios de aceite**: os IDs novos da spec, a partir de E-32 (o E-31 é do contrato `draft.2`):
   - `aal2` obtida direto no Auth não executa função de CEO (pgTAP e API);
   - código descoberto fora do backend e reapresentado por ele é recusado com 422;
   - senha temporária com mais de 72 h fica sem principal, e o login é recusado com o erro
     genérico;
   - um reset renova o prazo.
-- **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "E-3[1-9]" executa pelo menos 4 testes, todos verdes, stop after 10 tries`
+- **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "E-3[2-9]" executa pelo menos 4 testes, todos verdes, stop after 10 tries`
 
 ## Onda 7 — Identidade: logins de cliente
 
