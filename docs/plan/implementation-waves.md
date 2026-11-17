@@ -18,8 +18,8 @@
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
-| 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
-| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, auditoria de intenção e reversão no provisionamento (F-81, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 ```
@@ -339,7 +339,8 @@ tempo):
   `tracking/infrastructure/supabase-client-process-queries.ts` (query service, filtro por tenant
   da sessão + RLS), `tracking/presentation/*my-process*`, rotas `me/processes` e
   `me/processes/[processId]`, `tests/api/client-panel.api.test.ts` (fixtures com aprovações
-  inseridas via `service_role`, sem depender da Onda 9). **Sem migration.**
+  inseridas por psql no container via `tests/helpers/db.ts`, sem `service_role` e sem depender da
+  Onda 9), `supabase/tests/018_client_panel_isolation.test.sql`. **Sem migration.**
 - **Depende de / paralela com**: 8 / **9**.
 - **Critérios de aceite**: AC-09 (parte da API), AC-20, AC-21; E-05, E-06, E-07. A validação de
   contrato falha se o DTO tiver campo extra (`additionalProperties: false`).
@@ -347,12 +348,21 @@ tempo):
 
 ## Onda 10.1 — Endurecimento do banco
 
-- **Origem**: revisões das Ondas 7 e 8 (threat model F-81, F-92b, F-93), em 2026-11-16. Não depende
-  da configuração de produção.
+- **Origem**: revisões das Ondas 7, 8, 9 e 10 (threat model F-81, F-83, F-92b, F-93), em
+  2026-11-16. Não depende da configuração de produção.
 - **Escopo**:
   - revogar o DML do `service_role` em `clients`, `processes`, `process_stages` e
     `stage_approvals` (F-81). As fixtures dos testes passam a usar `tests/helpers/db.ts` (psql no
-    container), e só as funções `SECURITY DEFINER` escrevem;
+    container), e só as funções `SECURITY DEFINER` escrevem. Inclui `seedProcesses`
+    (`tests/helpers/clients.ts`), que hoje grava com a secret key processos ativos sem fase;
+  - usuário totalmente ativo no RLS (F-83, T-42): login com a senha temporária pendente
+    (`must_change_password = true`) não lê processos, fases nem clientes pelo PostgREST. O pgTAP
+    018 já marca as asserções a inverter (login `a4`, "F-83 residual (Onda 10.1 inverte)").
+    Avaliar o mesmo predicado em `is_ceo()` (CEO com senha temporária pendente e atestado);
+  - higiene do pgTAP: os arquivos 010, 012, 013 e 016 contam linhas da tabela inteira e falham
+    quando `pnpm db:test` roda depois de `pnpm test:api` sem `db:reset` (a CI reseta antes, por
+    isso não aparece lá). Restringir essas asserções às fixtures de cada arquivo, como já fazem
+    017 e 018;
   - `begin_client_login_admin(client_id, user_id, action)`: confere `is_ceo`, dono e papel e grava
     uma auditoria de intenção antes de cada escrita no Auth (F-92b);
   - `record_account_provisioned` devolve a linha do login, sem releitura, mais o evento
@@ -360,7 +370,12 @@ tempo):
     (F-93).
 - **Depende de / paralela com**: 7, 9, 10 / —.
 - **Critérios de aceite**: pgTAP provando que o `service_role` não escreve nas tabelas de
-  rastreamento; suítes verdes com as fixtures novas; testes de API dos eventos novos.
+  rastreamento; pgTAP provando que login com a senha temporária pendente não lê pelo PostgREST
+  (F-83); `pnpm test:api` seguido de `pnpm db:test`, sem reset, verde; suítes verdes com as
+  fixtures novas; testes de API dos eventos novos.
+- **Opcional, se couber**: extrair os helpers repetidos entre as Ondas 8, 9 e 10 (`safeCause`,
+  `DATA_EXCEPTION_CLASS`, `invalidPosition`, `parseRows`, a paginação keyset em duas consultas)
+  para um módulo compartilhado de `infrastructure/`.
 
 ## Onda 11 — Hardening e go-live
 

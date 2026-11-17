@@ -196,6 +196,15 @@ export function invariantViolations(process: Process): readonly InvariantViolati
 }
 
 /**
+ * What `summaryViolations` reads of a row: a `ProcessSummary` is one, and so is what the client panel
+ * (which has no `version`, no `clientId` and no stage ids) derives from a row of its own.
+ */
+export type SummaryCounters = Pick<
+  ProcessSummary,
+  'status' | 'totalStages' | 'completedStages' | 'completedAt' | 'cancelledAt'
+> & { readonly currentStage: Pick<CurrentStage, 'position'> | null };
+
+/**
  * `invariantViolations` for a row of the list, which has no stages to look at: only what the summary
  * carries of them (how many there are, how many are completed, which one is current). It cannot see
  * everything the snapshot check sees (an out-of-order stage that keeps the counts right), but it
@@ -207,7 +216,7 @@ export function invariantViolations(process: Process): readonly InvariantViolati
  * - I4: `cancelled` stopped where its stages were: if one is current, the ones before it are completed.
  * - the dates: `completedAt` exactly when `completed`, `cancelledAt` exactly when `cancelled`.
  */
-export function summaryViolations(summary: ProcessSummary): readonly InvariantViolation[] {
+export function summaryViolations(summary: SummaryCounters): readonly InvariantViolation[] {
   const found: InvariantViolation[] = [];
   const add = (invariant: Invariant, message: string) => found.push({ invariant, message });
   const { totalStages, completedStages, currentStage } = summary;

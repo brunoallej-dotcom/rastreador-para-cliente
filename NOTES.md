@@ -4,12 +4,12 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 8 concluídas, mais os contratos
-  `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 8 e 10 concluídas, mais os
+  contratos `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 9 ∥ 10, depois 10.1 (endurecimento do banco).
+- **Próximas ondas:** 9 (em revisão), depois 10.1 (endurecimento do banco).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -26,8 +26,8 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
-| 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ⬜ |
-| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, auditoria de intenção e reversão no provisionamento (F-81, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
@@ -39,6 +39,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 | Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
 | Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
 | Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
+| Decidir F-80 (POST de processo repetido: título ativo único com 409, ou `Idempotency-Key`), F-87 (processos de cliente arquivado: congelar com 422 `CLIENT_ARCHIVED`?) e aprovar o bump `draft.4` do contrato, só de documentação (candidatos nos logs das Ondas 7, 8, 9 e 10) | nada hoje; F-87 muda a spec e o `approve_current_stage`/`update_process` |
 | Deixar o repositório privado (decidido em 2026-11-16) **depois** do merge do PR do Semgrep, que substitui o CodeQL (code scanning não existe em repositório privado de conta pessoal no GitHub Free) | exposição do threat model com achados abertos |
 | ~~Branch protection na `main`~~: **decidido em 2026-11-16, sem GitHub Pro por ora.** Risco aceito: o GitHub não barra merge com CI vermelho; o fluxo de ondas só faz merge com todos os checks verdes | — |
 | Corrigir no código-fonte do `@aisac/cli` o falso positivo do `secrets-guard` (identificador terminado em `.key` em comando Bash; ver CLAUDE.md) | conforto dos agentes |
@@ -502,3 +503,53 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   main: `pnpm verify` → 2520 unit + 1323 pgTAP; `db:lint` ok; `db:types` sem diff; `test:api` →
   454/454 duas vezes; `test:api -t "AC-1[234]|E-(1[6789]|2[34])"` → 37; `test:int` → 22/22;
   `test:coverage`, `build` e `format:check` ok; `pnpm sast` sem achados (subagente).
+
+### 2026-11-16 — Onda 10: painel do cliente
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 9, com o usuário
+  ausente e a sessão principal como gerente.
+- **Entregue:** `GET /me/processes` (keyset, cursor `my-processes`) e
+  `GET /me/processes/{processId}`.
+  - Query service `ClientProcessQueries`, separado do repositório do agregado, lendo
+    `processes` e `process_stages` com o JWT do usuário. Nunca lê `stage_approvals`.
+  - O tenant vem só de `principal.clientId`. Processo de outro cliente e UUID inexistente dão o
+    mesmo 404. CEO recebe 403; login com a senha temporária pendente, 403
+    `PASSWORD_CHANGE_REQUIRED`.
+  - Três barreiras: o filtro do app, o RLS e um tripwire que dá 500 se uma linha de outro
+    tenant voltar.
+  - Fail closed: processo sem fase ou que quebre I1–I4 dá 500 (E-82). `progressPercent` é
+    `round(100 × concluídas ÷ total)` (spec §3.5.1).
+  - Sem migration, sem mudança de contrato. pgTAP 018 (54 asserções) e
+    `tests/api/client-panel.api.test.ts` (39 testes).
+- **Revisões** (threat-modeler T-43..T-48 e F-97..F-103, code-reviewer, contract-guardian,
+  rls-auditor estático): nenhum CRÍTICO, ALTO ou MÉDIO bloqueante. Corrigidos na rodada única:
+  - o comentário do tripwire prometia mais do que cobre. A regressão só do RLS é coberta pelo
+    pgTAP, agora com `policies_are` em `processes`, `process_stages` e `stage_approvals` (F-97);
+  - logs nos sinais de defeito (cursor recusado pelo banco, linha alheia malformada, recusa da
+    segunda linha) e trilha de leitura por processo (F-98, F-99);
+  - o pgTAP 018 usa logins totalmente ativos nos controles positivos e marca o resíduo do F-83
+    no login `a4`, para a Onda 10.1 inverter. Também cobre o desempate do keyset sem o filtro
+    do app e a senha temporária vencida (E-34);
+  - fixtures psql atômicas (`DO` e CTE), com guarda de processo ativo e limpeza do processo
+    sem fase no `afterAll` (F-103);
+  - testes de contrato no 429 do detalhe, nas asserções secundárias e no `Cache-Control`;
+  - logout antes da leitura dá 401 nas duas rotas.
+- **Aceitos:** F-100 (limite só no BFF e por login), F-101 (o cursor leva em claro o id e o
+  `created_at` da última linha; o frontend nunca o põe numa URL compartilhável), F-102 (tempo
+  do 404).
+- **Adiado:**
+  - helpers repetidos com a Onda 8 (opcional na Onda 10.1);
+  - `z.uuid()` contra `format: uuid` no projeto inteiro;
+  - lacunas do contrato só de documentação, que vão para o `draft.4`:
+    - o arredondamento de `progressPercent` e o significado de `currentStage`;
+    - a ordem da lista com desempate, a semântica do cursor e os parâmetros desconhecidos → 400;
+    - a ordem das fases e os nulos por status;
+    - o contador `reads` compartilhado com `getSession`;
+    - o `Cache-Control` como header de resposta;
+    - E-81, E-82 e E-83.
+- **Para a Onda 10.1:** o F-83 (que faltava no plano) e a higiene do pgTAP. Os arquivos 010, 012,
+  013 e 016 falham com `pnpm db:test` logo depois de `pnpm test:api` sem reset; a CI reseta antes.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`: `pnpm verify` →
+  2654 unit + 1377 pgTAP; `db:lint` ok; `test:int` → 22/22; `test:api` → 493/493 duas vezes;
+  `test:api -t "AC-(09|2[01])|E-0[567]"` → 34; `build`, `format:check` e `pnpm sast` (0 achados)
+  ok.
