@@ -770,7 +770,10 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   perfil ativo: senão 42501, F-55), e só o `authenticated` a executa (nem o `service_role`). O "Ok" é do CEO da
   **sessão**: `approved_by` é `auth.uid()`, nunca um argumento, e o processo e a fase vêm do path e do corpo só
   como ids a conferir. A fase esperada nula é `INVALID_INPUT`. Devolve a linha de `processes`; o app lê o
-  detalhe de novo (§3.7.2) e, se ele não aparece mais, responde 404. As regras são as da transição pura
+  detalhe de novo (§3.7.2) e, se ele não aparece mais, responde 404. A resposta é o processo
+  **como relido logo depois do COMMIT**, e não a linha que a função devolveu: ela pode já incluir uma mudança
+  concorrente gravada nesse intervalo (um cancelamento que esperava a trava e passou logo depois dela, por exemplo),
+  e nunca mostra um estado anterior a esta aprovação. As regras são as da transição pura
   `approveCurrentStage` do agregado (`tracking/domain/process.ts`: só a fase atual, uma aprovação por fase, a
   última fase conclui o processo, `completed_at` e `version` mudam uma vez), e um teste de API compara, passo
   a passo, o que o banco grava com o que a transição pura prevê.
@@ -832,7 +835,9 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   detalhe (`GET /admin/processes/{processId}`): `stages[].approval` diz que a fase foi concluída e por quem.
   *Pendência do contrato:* a descrição de `approveCurrentStage` já trata o 409 como "outro CEO já aprovou ou houve
   um retry", mas não diz que o retry da última fase é 422 `PROCESS_NOT_ACTIVE`; entra no próximo bump de contrato,
-  junto com a pendência de `createProcess` (§3.7.2).
+  junto com a pendência de `createProcess` (§3.7.2). A descrição da resposta 200 de `approveCurrentStage` ("devolve o
+  processo atualizado") também deve dizer que o corpo é o processo relido logo depois do COMMIT, que pode já incluir
+  uma mudança concorrente e nunca mostra um estado anterior a esta aprovação.
 - **Requisito para o frontend (T-51, F-107).** O `expectedStageId` protege contra aprovar a **mesma** fase duas
   vezes, mas não contra um cliente que reenvia o "Ok" com o `currentStageId` que acabou de receber: isso aprova a
   fase **seguinte**, que o CEO nunca viu. Então o cliente da API (a Onda de frontend) **nunca reenvia uma aprovação

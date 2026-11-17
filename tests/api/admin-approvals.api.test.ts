@@ -975,7 +975,15 @@ describe('concurrent approvals and cancellations (AC-17, F-82)', () => {
     const cancelled = await expectContract<ProcessDetailBody>('updateProcess', cancel);
     expect(approve.status).toBe(200);
     expect(cancel.status).toBe(200);
-    expect(approved).toMatchObject({ status: 'active', version: 2, completedStages: 1 });
+    // The approval's body is the process RE-READ right after its commit, not the function's own row, and the
+    // cancellation parked behind it proceeds at once: it can commit before that re-read. So the body is "this
+    // approval or a later state", never an earlier one: still active at version 2, or already cancelled at
+    // version 3 (the cancellation's). The causal order is proven by the trail order and the final state below.
+    expect(['active', 'cancelled']).toContain(approved.status);
+    expect(approved.version).toBeGreaterThanOrEqual(2);
+    expect(approved.completedStages).toBeGreaterThanOrEqual(1);
+    expect(['active/2', 'cancelled/3']).toContain(`${approved.status}/${approved.version}`);
+    // the cancellation's body is re-read after ITS commit, which nothing follows
     expect(cancelled).toMatchObject({ status: 'cancelled', version: 3, completedStages: 1 });
     const state = await stateOf(process.id);
     expect(state.audit).toEqual(['process.created', 'stage.approved', 'process.cancelled']);
