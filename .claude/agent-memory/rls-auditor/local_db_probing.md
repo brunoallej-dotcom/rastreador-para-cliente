@@ -18,6 +18,8 @@ metadata:
 - Canonical memory lives in the main checkout `.claude/agent-memory/rls-auditor/`. When run from a
   worktree, the worktree copy may be deleted mid-run; read and write the main-checkout copy.
 - Manager-run audits may forbid `db:test`/`db:lint` (shared DB not reset to the branch): then audit
-  statically and say the gates were not run.
+  statically and say the gates were not run. First check
+  `supabase_migrations.schema_migrations` to see whether the branch migration is even applied;
+  if not, only catalog facts of the base (default ACLs, schema USAGE, auth indexes) are probeable.
 
 Related: [[supabase-privilege-pitfalls]].

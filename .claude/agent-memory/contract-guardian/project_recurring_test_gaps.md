@@ -11,3 +11,19 @@ Also recurring: Zod for `LoginRequest` normalizes the e-mail (trim/NFC/lowercase
 
 **Why:** keeps severity consistent between audits.
 **How to apply:** in each wave audit, grep `toBe(<status>)` lines and check for a nearby `expectToMatchContract`; report pair-level coverage first, per-assertion gaps as BAIXO.
+
+Wave 8 (admin-processes.api.test.ts) fixed the Origin/415/413/503 gap: every status goes through an
+`expectContract` wrapper. Still recurring: no admin API test validates the 429 pair (only auth and
+health suites hit RATE_LIMITED); rule equality is proven in `process.handlers.test.ts`. Rate as BAIXO.
+
+Wave 7 (admin-client-users.api.test.ts) follows the same `expectContract` wrapper pattern and is the
+first admin suite to validate a 429 pair (provision + reset, shared counter). The 429 pairs of list and
+update are still only proven by `client-user.handlers.test.ts`. One stray assertion: a 409 in the E-23
+test checks status only, but the pair is validated elsewhere (BAIXO, not worth a finding on its own).
+
+Wave 9 (admin-approvals.api.test.ts, 2026-11-16): same pattern again. The first operation of the pair
+(approveCurrentStage) has its 429 validated; the second (listProcessEvents) does not, rule equality only in
+`approval.handlers.test.ts` (BAIXO, as in Wave 8). Also recurring: no admin suite asserts
+`Cache-Control: no-store` (withRoute sets it, proven in `with-route.test.ts`; expectToMatchContract does
+not check it); the `null` arm of a `oneOf [X, null]` problem extension (e.g. `currentStageId`) is only
+checked in repository unit tests, never against the contract. 500 is never contract-validated in admin suites.
