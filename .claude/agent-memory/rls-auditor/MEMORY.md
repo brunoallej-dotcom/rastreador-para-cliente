@@ -1,3 +1,3 @@
-- [Supabase privilege pitfalls](supabase_privilege_pitfalls.md) — service_role/supabase_admin default ACLs, claim casts, [[:cntrl:]] and btrim gaps, DECLARE-before-guard
+- [Supabase privilege pitfalls](supabase_privilege_pitfalls.md) — default ACLs, claim casts, btrim/ICU/NFKC gaps, auth.* CASCADE, attested helper, pgTAP vacuity + count-scoping heuristics
 - [Local DB probing](local_db_probing.md) — docker exec psql into the local container, rollback probes, role limits
-- [Open audit findings](wave2_audit_findings.md) — open MÉDIO/BAIXO items (Wave 2, Wave 6) to re-check
+- [Open audit findings](wave2_audit_findings.md) — open items per wave (2, 6, 6.1, 7, 8, 10, 10.1): BAIXOs, load-bearing orders, forward items
