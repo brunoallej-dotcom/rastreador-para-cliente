@@ -9,9 +9,9 @@
 --
 -- Também fixa o INVENTÁRIO das policies das três tabelas que o painel toca (F-97: uma policy permissiva nova,
 -- ou uma frouxa, quebra aqui até alguém revisar), prova com logins de senha definitiva (os positivos não
--- dependem de `must_change_password`, que nasce verdadeiro) e registra os dois estados da senha temporária: o
--- login com a senha ainda por trocar LÊ pelo RLS (resíduo F-83, que a Onda 10.1 inverte) e o de senha
--- temporária vencida (72 h, E-34) não lê nada.
+-- dependem de `must_change_password`, que nasce verdadeiro) e os dois estados da senha temporária: o login com a
+-- senha ainda por trocar (F-83, Onda 10.1) e o de senha temporária vencida (72 h, E-34) não leem nada. O
+-- arquivo 020 prova o mesmo para `clients` e `stage_approvals`, e o que o login pendente ainda faz.
 BEGIN;
 SELECT plan(54);
 
@@ -37,7 +37,7 @@ GRANT EXECUTE ON FUNCTION tests.panel_list(uuid) TO anon, authenticated, service
 -- Clientes A, B e D (D não tem processo). a1 e a2 são logins de A (o tenant é do cliente, não do login), a3 é
 -- login desativado de A, a5 tem sessão expirada, b1 é login de B e d1 é login de D: todos com a senha
 -- DEFINITIVA (must_change_password = false), para que cada um teste só a condição que o nome dele diz. a4 ainda
--- tem a senha temporária, dentro das 72 h (o resíduo F-83), e a6 tem a senha temporária de mais de 72 h (E-34).
+-- tem a senha temporária, dentro das 72 h (F-83), e a6 tem a senha temporária de mais de 72 h (E-34).
 -- c1 é CEO com fator verificado (controle positivo, atestado) e c2 é CEO com fator que NUNCA é atestado (só o
 -- claim aal2 aparece).
 INSERT INTO public.clients (id, name) VALUES
@@ -289,25 +289,23 @@ SELECT results_eq(
 );
 SELECT tests.clear_authentication();
 
--- F-83 residual (Onda 10.1 inverte): a senha temporária ainda por trocar, dentro das 72 h --------------------------------
--- O BFF recusa `/me/*` a este login (403 PASSWORD_CHANGE_REQUIRED, E-81), mas o RLS de leitura é pelo tenant da
--- sessão, não pela pendência: quem chama o PostgREST direto com o próprio JWT LÊ os processos do próprio cliente.
--- Estes dois asserts descrevem o estado de hoje, de propósito. A Onda 10.1 decide se a policy passa a exigir
--- `must_change_password = false`; quando passar, só estes dois viram `is_empty`.
+-- F-83 (Onda 10.1): a senha temporária ainda por trocar, dentro das 72 h ---------------------------------------------
+-- O BFF recusa `/me/*` a este login (403 `PASSWORD_CHANGE_REQUIRED`, E-81), e o RLS de leitura agora diz o
+-- mesmo: quem chama o PostgREST direto com o próprio JWT NÃO lê os processos nem as fases do próprio cliente
+-- enquanto `must_change_password = true` (`private.current_client_id()` é nulo para ele). O principal dele
+-- continua existindo, e o 020 prova o que ele ainda faz e que o mesmo login lê depois de trocar a senha.
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000a4');
-SELECT results_eq(
+SELECT is_empty(
   $$ SELECT id FROM tests.panel_list('00000000-0000-4000-8000-00000000000a') $$,
-  $$ VALUES ('00000000-0000-4000-8000-000000000101'::uuid), ('00000000-0000-4000-8000-000000000103'::uuid),
-            ('00000000-0000-4000-8000-000000000104'::uuid) $$,
-  'F-83 residual (Onda 10.1 inverte): o login a4, com a senha temporária por trocar, lê a lista do próprio tenant pelo RLS'
+  'F-83: o login a4, com a senha temporária por trocar, lê lista vazia no painel (era o resíduo da Onda 10)'
 );
-SELECT isnt_empty(
+SELECT is_empty(
   $$ SELECT id FROM public.process_stages WHERE process_id = '00000000-0000-4000-8000-000000000101' $$,
-  'F-83 residual (Onda 10.1 inverte): o login a4 lê também as fases de um processo do próprio tenant'
+  'F-83: o login a4 não lê as fases de um processo do próprio tenant'
 );
 SELECT is_empty(
   $$ SELECT id FROM tests.panel_list('00000000-0000-4000-8000-00000000000b') $$,
-  'AC-09: e o login a4, mesmo lendo o que é do próprio tenant, não lê nada de B'
+  'AC-09: e o login a4 não lê nada de B (nem de A)'
 );
 SELECT tests.clear_authentication();
 

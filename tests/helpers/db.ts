@@ -135,6 +135,20 @@ export async function agePasswordBaseline(userId: string, hours: number): Promis
 }
 
 /**
+ * What the operator's password reset of a CEO (F-41, Wave 11) will do to the database: gives the user the
+ * temporary password again (`must_change_password = true`), which a CEO that already enrolled its second
+ * factor can only get this way. Returns whether the profile was there. A test that needs a CEO in that state
+ * uses it, because the API has no route that produces it (`require_password_change` acts on client logins).
+ */
+export async function markPasswordPendingFixture(userId: string): Promise<boolean> {
+  assertUuid(userId, 'markPasswordPendingFixture');
+  const rows = await queryLocal(
+    `UPDATE public.profiles SET must_change_password = true WHERE id = '${userId}' RETURNING id`,
+  );
+  return rows.length === 1;
+}
+
+/**
  * What the operator's MFA reset (E-25, Wave 11) does to the database: deletes the mark of the user's
  * first activation (`private.mfa_first_activations`), the one thing that reopens the enrollment of a
  * new factor after the first one was activated (F-64). Returns whether there was a mark to delete.

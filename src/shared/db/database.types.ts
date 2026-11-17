@@ -201,6 +201,11 @@ isOneToOne: false
         isOneToOne: true
         isSetofReturn: false
       } },
+"current_client_summary":
+{ Args: Record<PropertyKey, never>; Returns: {
+              "id": string,"name": string
+            }[]
+                           },
 "current_principal":
 { Args: Record<PropertyKey, never>; Returns: {
               "aal": string,"client_id": string,"display_name": string,"has_verified_totp": boolean,"must_change_password": boolean,"role": Database["public"]['Enums']["app_role"],"user_id": string

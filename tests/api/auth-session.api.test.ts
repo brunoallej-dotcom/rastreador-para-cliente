@@ -10,6 +10,7 @@ import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import type { Database } from '@/shared/db/database.types';
 import { timing } from '@/shared/http/response-floor';
 import { expectToMatchContract } from '../helpers/contract';
+import { markPasswordPendingFixture } from '../helpers/db';
 import {
   ceoAal2Client,
   createClient,
@@ -578,7 +579,25 @@ describe('GET /api/v1/auth/session', () => {
     expect(body).toMatchObject({
       aal: 'aal1',
       client: null,
-      // the temporary password is still unchanged, and the factor is verified but not used yet
+      // the password was changed at the first access (before the factor, as production requires): the
+      // factor is verified but not used yet
+      pendingActions: ['VERIFY_MFA'],
+    });
+  });
+
+  it('AC-26: a CEO that already has a verified factor and gets the temporary password again has CHANGE_PASSWORD and VERIFY_MFA pending, in that priority', async () => {
+    const { ceo } = await ceoAal2Client();
+    await markPasswordPendingFixture(ceo.id); // what the operator's password reset will do (F-41, Wave 11)
+    const jar = await signIn(ceo);
+
+    const response = await getSession(jar);
+    const body = await bodyOf(response);
+
+    expect(response.status).toBe(200);
+    expectToMatchContract('getSession', 200, body, response);
+    expect(body).toMatchObject({
+      aal: 'aal1',
+      client: null,
       pendingActions: ['CHANGE_PASSWORD', 'VERIFY_MFA'],
     });
   });

@@ -17,6 +17,12 @@ SELECT tests.create_user(
 );
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo', NULL, 'Carlos CEO');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
+-- `tests.create_user` já entrega o CEO com a senha definitiva (000_helpers); o perfil como o TRIGGER o cria
+-- (com a senha temporária) é o de um CEO inserido direto em auth.users
+SELECT tests.insert_auth_user(
+  '00000000-0000-4000-8000-0000000000c9',
+  '{"role":"ceo","display_name":"Carlos CEO"}'
+);
 
 SELECT results_eq(
   $$ SELECT role::text, client_id, display_name, must_change_password, disabled_at IS NULL
@@ -27,7 +33,7 @@ SELECT results_eq(
 
 SELECT results_eq(
   $$ SELECT role::text, client_id, display_name, must_change_password, disabled_at IS NULL
-       FROM public.profiles WHERE id = '00000000-0000-4000-8000-0000000000c1' $$,
+       FROM public.profiles WHERE id = '00000000-0000-4000-8000-0000000000c9' $$,
   $$ VALUES ('ceo', NULL::uuid, 'Carlos CEO', true, true) $$,
   'AC-31: app_metadata de CEO cria perfil ceo sem client_id e com must_change_password = true'
 );

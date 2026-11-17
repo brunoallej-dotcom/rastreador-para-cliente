@@ -24,6 +24,11 @@ INSERT INTO public.clients (id, name, archived_at) VALUES
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000b1', 'client', '00000000-0000-4000-8000-00000000000b');
+-- os logins de A e de B são clientes plenamente ativos (senha definitiva): com a senha temporária o RLS não lê
+-- processo nem fase (F-83, arquivo 020), e aqui o que se prova é o isolamento entre clientes
+UPDATE public.profiles SET must_change_password = false WHERE id IN (
+  '00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000b1'
+);
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c2', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c3', 'ceo');

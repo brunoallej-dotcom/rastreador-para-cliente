@@ -38,10 +38,28 @@ function fakeSupabase(outcome: Outcome) {
   return { supabase, calls };
 }
 
+/** Records the rpc call and answers a scripted outcome (`current_client_summary()`). */
+function fakeRpcSupabase(outcome: Outcome) {
+  const calls: unknown[][] = [];
+  const query = {
+    maybeSingle: () => {
+      calls.push(['maybeSingle']);
+      return Promise.resolve(outcome);
+    },
+  };
+  const supabase = {
+    rpc: (...args: unknown[]) => {
+      calls.push(['rpc', ...args]);
+      return query;
+    },
+  } as unknown as SupabaseClient<Database>;
+  return { supabase, calls };
+}
+
 describe('getClientSummary', () => {
-  it('SEC-06: reads one client by id, with an explicit column list, and answers id and name', async () => {
-    const { supabase, calls } = fakeSupabase({
-      data: { id: CLIENT_ID, name: 'Cliente A', archived_at: null },
+  it('F-83: reads the client of the login through current_client_summary(), never the table, and answers id and name', async () => {
+    const { supabase, calls } = fakeRpcSupabase({
+      data: { id: CLIENT_ID, name: 'Cliente A' },
       error: null,
       status: 200,
     });
@@ -50,22 +68,26 @@ describe('getClientSummary', () => {
       id: CLIENT_ID,
       name: 'Cliente A',
     });
-    expect(calls).toEqual([
-      ['from', 'clients'],
-      ['select', 'id, name, archived_at'],
-      ['eq', 'id', CLIENT_ID],
-      ['retry', false],
-      ['maybeSingle'],
-    ]);
+    // no argument: no id from outside chooses the row, and no `from('clients')`
+    expect(calls).toEqual([['rpc', 'current_client_summary'], ['maybeSingle']]);
   });
 
-  it('SEC-05: a row RLS hides is null, not an error', async () => {
-    const { supabase } = fakeSupabase({ data: null, error: null, status: 200 });
+  it('SEC-05: no row (a CEO, a dead session, a disabled login) is null, not an error', async () => {
+    const { supabase } = fakeRpcSupabase({ data: null, error: null, status: 200 });
+    await expect(getClientSummary(supabase, CLIENT_ID)).resolves.toBeNull();
+  });
+
+  it('answers null, never another client, when the function names a client that is not the one asked for', async () => {
+    const { supabase } = fakeRpcSupabase({
+      data: { id: '33333333-3333-4333-8333-333333333333', name: 'Cliente B' },
+      error: null,
+      status: 200,
+    });
     await expect(getClientSummary(supabase, CLIENT_ID)).resolves.toBeNull();
   });
 
   it('E-21: Supabase being down is ServiceUnavailableError', async () => {
-    const { supabase } = fakeSupabase({
+    const { supabase } = fakeRpcSupabase({
       data: null,
       error: { message: 'TypeError: fetch failed', code: '' },
       status: 0,
@@ -76,7 +98,7 @@ describe('getClientSummary', () => {
   });
 
   it('denies on any other database error, without echoing it', async () => {
-    const { supabase } = fakeSupabase({
+    const { supabase } = fakeRpcSupabase({
       data: null,
       error: { message: 'internal detail', code: '42501' },
       status: 403,
@@ -90,7 +112,7 @@ describe('getClientSummary', () => {
     ['a row without a name', { id: CLIENT_ID }],
     ['an id that is not a UUID', { id: 'nope', name: 'Cliente A' }],
   ])('fails closed on %s', async (_label, data) => {
-    const { supabase } = fakeSupabase({ data, error: null, status: 200 });
+    const { supabase } = fakeRpcSupabase({ data, error: null, status: 200 });
     await expect(getClientSummary(supabase, CLIENT_ID)).rejects.toThrow('not understood');
   });
 });

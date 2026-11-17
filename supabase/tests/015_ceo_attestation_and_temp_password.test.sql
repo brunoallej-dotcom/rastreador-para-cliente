@@ -1236,9 +1236,11 @@ SELECT is(
 );
 SELECT tests.clear_authentication();
 
--- o CEO com a senha temporária vencida perde o poder, mesmo com a sessão atestada
+-- o CEO com a senha temporária vencida perde o poder, mesmo com a sessão atestada (e, desde a Onda 10.1, um CEO
+-- atestado com a senha temporária AINDA DENTRO do prazo também não é CEO: o 020 prova; aqui é o vencimento)
 SELECT pg_temp.arrange(72);
 SELECT pg_temp.attest(72);
+UPDATE public.profiles SET must_change_password = true WHERE id = pg_temp.uid(72);
 UPDATE private.password_baselines SET recorded_at = now() - interval '73 hours' WHERE user_id = pg_temp.uid(72);
 SELECT tests.authenticate_as(pg_temp.uid(72), 'aal2', false);
 SELECT is(
