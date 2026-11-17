@@ -19,6 +19,7 @@ import {
   agePasswordBaseline,
   backendChallengeIdsOf,
   firstActivationFactorOf,
+  markPasswordPendingFixture,
   resetFirstActivation,
 } from '../helpers/db';
 import { listClientsViaApi } from '../helpers/clients';
@@ -855,8 +856,10 @@ describe('F-41: a temporary password is valid for 72 h', () => {
   });
 
   it('E-34: a CEO with an expired temporary password is refused the same way', async () => {
-    // a fresh CEO that never changed the temporary password (the one of `ceoAal2Client`)
+    // a CEO that has the temporary password (again: `ceoAal2Client` completes the first access, as production
+    // does, and an operator's reset gives the temporary password back, F-41)
     const { ceo } = await ceoAal2Client();
+    await markPasswordPendingFixture(ceo.id);
     await agePasswordBaseline(ceo.id, 80);
 
     const response = await login(ceo.email, ceo.password);
