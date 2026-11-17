@@ -3,7 +3,94 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LOGIN_GLOBAL_BUDGET } from '@/modules/identity/presentation/rate-limit-budgets';
 import { rateLimitBucket } from '@/shared/http/rate-limit/group';
-import { dbContainerName, globalBudgetResetSql, parseProjectId, parseRowsOutput } from './db';
+import {
+  dbContainerName,
+  globalBudgetResetSql,
+  lockWaitersSql,
+  parseProjectId,
+  parseRowsOutput,
+  terminateBackendSql,
+} from './db';
+
+const HELD_PID = 4242;
+
+describe('lockWaitersSql (what tells a test that its requests are parked behind a lock)', () => {
+  it('counts the backends waiting for a lock in a statement that names the routine', () => {
+    const sql = lockWaitersSql('approve_current_stage', HELD_PID);
+
+    expect(sql).toContain("a.wait_event_type = 'Lock'");
+    expect(sql).toContain("position('approve_current_stage' IN a.query) > 0");
+    expect(sql).toContain('a.datname = current_database()');
+    expect(sql).not.toContain('LIKE');
+  });
+
+  it('F-108: counts only what the held session blocks, directly or through other waiters', () => {
+    const sql = lockWaitersSql('update_process', HELD_PID);
+
+    // the direct waiters of the held session...
+    expect(sql).toContain(`${HELD_PID} = ANY (pg_blocking_pids(a.pid))`);
+    // ...and, recursively, whoever waits for one of them (a cancellation behind an approval that is
+    // itself parked behind the held session)
+    expect(sql).toMatch(/^WITH RECURSIVE blocked \(pid\) AS \(/);
+    expect(sql).toContain('JOIN blocked b ON b.pid = ANY (pg_blocking_pids(a.pid))');
+    // and the final count is of the blocked backends only, never of every waiter in the database
+    expect(sql).toContain('JOIN blocked b ON b.pid = a.pid');
+  });
+
+  it.each([
+    ['an empty name', ''],
+    ['a quote', "update_process'"],
+    [
+      'a statement after the name',
+      "x'; SELECT pg_terminate_backend(pid) FROM pg_stat_activity; --",
+    ],
+    ['a LIKE wildcard', 'update%'],
+    ['an uppercase name', 'Update_process'],
+    ['a schema-qualified name', 'public.update_process'],
+    ['a name that starts with a digit', '1update'],
+    ['a name that is too long', 'a'.repeat(64)],
+  ])('refuses %s: nothing but a plain routine name reaches the SQL', (_label, routine) => {
+    expect(() => lockWaitersSql(routine, HELD_PID)).toThrow(/not a plain routine name/);
+  });
+
+  it.each([
+    ['zero', 0],
+    ['a negative pid', -1],
+    ['a fraction', 1.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['a pid past 32 bits', 2 ** 31],
+    ['an unsafe integer', Number.MAX_SAFE_INTEGER + 2],
+  ])('refuses %s as the pid: only a positive integer reaches the SQL', (_label, pid) => {
+    expect(() => lockWaitersSql('update_process', pid)).toThrow(/not a positive integer/);
+  });
+
+  it('accepts the routines of the process functions and the largest pid', () => {
+    for (const routine of ['approve_current_stage', 'update_process', 'create_process']) {
+      expect(lockWaitersSql(routine, 2 ** 31 - 1)).toContain(`'${routine}'`);
+    }
+  });
+});
+
+describe('terminateBackendSql (what ends a held session from the database side)', () => {
+  it('terminates one backend by pid, and only if it is a psql of the postgres user, never this connection', () => {
+    const sql = terminateBackendSql(HELD_PID);
+
+    expect(sql).toContain('pg_terminate_backend(a.pid)');
+    expect(sql).toContain(`a.pid = ${HELD_PID}`);
+    expect(sql).toContain('a.pid <> pg_backend_pid()');
+    // a recycled pid that belongs to PostgREST (`authenticator`) or anything else is left alone
+    expect(sql).toContain("a.usename = 'postgres'");
+    expect(sql).toContain("a.application_name = 'psql'");
+  });
+
+  it.each([0, -7, 3.2, Number.NaN, 2 ** 31, Number.MAX_SAFE_INTEGER + 2])(
+    'refuses the pid %s',
+    (pid) => {
+      expect(() => terminateBackendSql(pid)).toThrow(/not a positive integer/);
+    },
+  );
+});
 
 describe('parseRowsOutput (what psql prints inside the db container)', () => {
   it('reads one JSON array of rows, however it is wrapped over lines', () => {

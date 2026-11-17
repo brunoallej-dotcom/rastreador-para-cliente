@@ -4,12 +4,13 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 8 e 10 concluídas, mais os
-  contratos `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
+- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 10 concluídas, mais os contratos
+  `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 9 (em revisão), depois 10.1 (endurecimento do banco).
+- **Próximas ondas:** 10.1 (endurecimento do banco), depois 11 (hardening e go-live, que depende
+  da configuração de produção do usuário).
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -25,7 +26,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
-| 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
+| 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
@@ -553,3 +554,62 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   2654 unit + 1377 pgTAP; `db:lint` ok; `test:int` → 22/22; `test:api` → 493/493 duas vezes;
   `test:api -t "AC-(09|2[01])|E-0[567]"` → 34; `build`, `format:check` e `pnpm sast` (0 achados)
   ok.
+
+### 2026-11-16 — Onda 9: aprovação ("Ok") e linha do tempo
+
+- Executada por subagente Sonnet (xhigh) em worktree, em paralelo com a Onda 10, e rebaseada sobre
+  a main depois do merge da Onda 10 (único conflito: linhas novas nas tabelas do threat model).
+- **Entregue:** `POST /admin/processes/{processId}/approvals` e
+  `GET /admin/processes/{processId}/events`.
+  - `approve_current_stage` (migration `20261116213000_tracking_approvals.sql`). A função:
+    - trava a linha do processo com `FOR NO KEY UPDATE` antes de qualquer fase (F-82, T-41);
+    - confere `status = 'active'` e só depois trava a fase atual;
+    - grava aprovação e auditoria na mesma transação;
+    - na última fase, conclui o processo.
+  - `STALE_STAGE` vira 409 com o `currentStageId` relido; `PROCESS_NOT_ACTIVE` vira 422.
+  - Retry depois de 503 (E-70): 409 com a fase seguinte, ou 422 depois da última. Nunca aprova
+    duas vezes.
+  - A linha do tempo vem da auditoria, em ordem causal por `id` (cursor `admin-process-events`),
+    sem títulos (SEC-16). Ator sem perfil vira `actor: null` (E-75).
+- **Concorrência provada sem `sleep`:** `tests/helpers/held-transaction.ts` abre uma segunda
+  sessão do banco que segura a trava, e `countLockWaiters` segue `pg_blocking_pids` até todas as
+  requisições estarem paradas atrás dela.
+  - AC-17: quatro "Ok" parados e seis soltos dão um 200 e o resto 409.
+  - Aprovar × cancelar nas duas ordens.
+  - Um teste de comportamento falha se a ordem das travas for invertida (verificado por mutação).
+- **Revisões** (threat-modeler T-49..T-51 e F-104..F-108, code-reviewer, contract-guardian,
+  rls-auditor estático): nenhum CRÍTICO ou ALTO. Corrigidos na rodada única:
+  - a função passou a conferir o que escreve (`ROW_COUNT = 1`, próxima fase `pending`, nenhuma
+    fase aberta ao concluir). Também ganhou teto de 1 min no ajuste do instante, com
+    `INVARIANT_VIOLATION` → 500 (F-104, F-105);
+  - índice `audit_events (process_id, id)` para a linha do tempo (F-106);
+  - pgTAP 017 com asserções restritas às próprias fixtures e guarda de catálogo da ordem de
+    travas mais robusta (comentários `/* */`, maiúsculas, inicializadores);
+  - a sessão retida não vaza mais: `lock_timeout`, `statement_timeout` e
+    `pg_terminate_backend` em toda falha (F-108);
+  - testes de contrato no 429 da linha do tempo, no `currentStageId: null`, no `Cache-Control`
+    e no teste de corrida;
+  - a resposta do "Ok" é relida depois do COMMIT e pode já trazer um cancelamento concorrente
+    (spec §3.7.3). O teste novo de ordem de travas falhou 1 vez em 3 nos gates da sessão
+    principal por isso, e foi corrigido.
+- **Requisito do frontend (F-107):** nunca reenviar o "Ok" automaticamente; depois de 409 ou
+  503, mostrar a fase atual, e o novo "Ok" é sempre um clique novo.
+- **Decisão do usuário ainda aberta (F-87):** aprovar processo de cliente arquivado continua
+  permitido. O pgTAP registra o comportamento atual, e a spec §3.7.3 descreve a mudança pequena,
+  se o congelamento for aprovado.
+- **Candidatos ao `draft.4`:**
+  - a semântica do retry;
+  - `currentStageId: null`;
+  - `expectedStageId` alheio → 409;
+  - `actor: null` também sem perfil;
+  - o formato de `ProcessEventDetails`, com `previousTitle`/`newTitle` marcados como nunca
+    preenchidos;
+  - os contadores de rate limit compartilhados;
+  - a ordem por `id`;
+  - a resposta do "Ok" relida depois do COMMIT;
+  - o F-107.
+- Verificado pela sessão principal, sob o lock, a partir de `pnpm db:reset`, já rebaseada sobre a
+  Onda 10: `pnpm verify` → 2786 unit + 1500 pgTAP; `db:lint` ok; `db:types` sem diff;
+  `test:int` → 22/22; `test:api` → 543/543 duas vezes;
+  `test:api -t "AC-(1[678]|28)|E-0[1-4]"` → 25, três vezes seguidas; `build`, `format:check` e
+  `pnpm sast` (0 achados) ok.

@@ -1,6 +1,6 @@
 // In-memory fake of `ProcessRepository`, for the unit tests of the process use cases. It runs the
-// real transitions of the aggregate (`startProcess`, `applyProcessPatch`), keeps the real order (newest
-// first, id breaking ties) and the real keyset paging. Imported by tests only.
+// real transitions of the aggregate (`startProcess`, `approveCurrentStage`, `applyProcessPatch`), keeps
+// the real order (newest first, id breaking ties) and the real keyset paging. Imported by tests only.
 import {
   err,
   NotFoundError,
@@ -12,8 +12,10 @@ import {
 import { ClientArchivedError } from '../domain/errors';
 import {
   applyProcessPatch,
+  approveCurrentStage as applyApproval,
   startProcess,
   summarize,
+  type Approver,
   type Process,
   type ProcessClient,
   type ProcessListQuery,
@@ -27,13 +29,13 @@ import type { StageTemplate } from '../domain/stage';
 export type FakeClient = ProcessClient & { readonly archived?: boolean };
 
 export type FakeProcessRepository = ProcessRepository & {
-  /** One entry per call, e.g. `create:<clientId>`, `find:<id>`, `update:<id>`, `list:<clientId>`. */
+  /** One entry per call, e.g. `create:<clientId>`, `find:<id>`, `update:<id>`, `approve:<id>`, `list:<clientId>`. */
   readonly calls: string[];
   /** The processes the fake holds right now. */
   readonly stored: () => readonly Process[];
   /** Makes every later call throw `ServiceUnavailableError` (E-21). */
   failWithOutage(): void;
-  /** Makes `create` and `update` answer `err(error)`, as the database would refuse them. */
+  /** Makes `create`, `update` and `approve` answer `err(error)`, as the database would refuse them. */
   refuseWrites(error: DomainError): void;
 };
 
@@ -43,6 +45,14 @@ export const FAKE_TEMPLATE: StageTemplate = {
     { position: 2, name: 'Briefing', description: 'Levantamento inicial' },
     { position: 3, name: 'Entrega final', description: null },
   ],
+};
+
+/** The CEO whose session the fake approves with (the database takes the approver from the session). */
+export const FAKE_APPROVER: Approver = {
+  userId: '11111111-1111-4111-8111-111111111111',
+  displayName: 'CEO',
+  role: 'ceo',
+  aal: 'aal2',
 };
 
 const FAKE_ID_PREFIX = '00000000-0000-4000-8000-';
@@ -65,12 +75,15 @@ export function createFakeProcessRepository(
     readonly processes?: readonly Process[];
     readonly template?: StageTemplate;
     readonly now?: Date;
+    /** Who the fake's session is when it approves. Default: `FAKE_APPROVER`. */
+    readonly approver?: Approver;
   } = {},
 ): FakeProcessRepository {
   const clients = new Map((options.clients ?? []).map((client) => [client.id, client]));
   const rows = new Map((options.processes ?? []).map((process) => [process.id, process]));
   const template = options.template ?? FAKE_TEMPLATE;
   const now = options.now ?? new Date('2026-06-01T12:00:00.000Z');
+  const approver = options.approver ?? FAKE_APPROVER;
   const calls: string[] = [];
   let outage = false;
   let refusal: DomainError | null = null;
@@ -126,6 +139,19 @@ export function createFakeProcessRepository(
         return Promise.resolve(err(new NotFoundError('no such process')));
       }
       const next = applyProcessPatch(current, patch, now);
+      if (next.ok) rows.set(processId, next.value);
+      return Promise.resolve(next);
+    },
+
+    approve(processId, expectedStageId): Promise<Result<Process, DomainError>> {
+      calls.push(`approve:${processId}`);
+      guard();
+      if (refusal !== null) return Promise.resolve(err(refusal));
+      const current = rows.get(processId);
+      if (current === undefined) {
+        return Promise.resolve(err(new NotFoundError('no such process')));
+      }
+      const next = applyApproval(current, { expectedStageId, approver, at: now });
       if (next.ok) rows.set(processId, next.value);
       return Promise.resolve(next);
     },
