@@ -79,8 +79,13 @@ SELECT ok(
   (SELECT bool_and(count = 60) AND count(*) = 50 FROM private.rate_limit_counters WHERE bucket LIKE 'probe:%'),
   'a limpeza não altera a contagem das chamadas: cada um dos 50 buckets contou exatamente 60 hits'
 );
-SELECT is((SELECT count(*)::int FROM private.rate_limit_counters), 57,
-  'sobraram só as 4 recentes, as 3 vivas e as 50 de teste: nenhuma outra linha foi apagada');
+-- só as linhas deste arquivo (os prefixos abaixo são dele): o banco pode ter os contadores de outros testes
+SELECT is(
+  (SELECT count(*)::int FROM private.rate_limit_counters
+    WHERE bucket LIKE 'old:%' OR bucket LIKE 'recent:%' OR bucket LIKE 'live:%' OR bucket LIKE 'probe:%'),
+  57,
+  'sobraram só as 4 recentes, as 3 vivas e as 50 de teste: nenhuma outra linha foi apagada'
+);
 
 -- Mesmas permissões, mesma disciplina de SECURITY DEFINER -----------------------------------------------------
 SELECT is(
