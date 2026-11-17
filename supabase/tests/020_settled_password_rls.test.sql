@@ -330,10 +330,12 @@ SELECT tests.clear_authentication();
 
 -- Cliente arquivado: o login dele (senha definitiva) lê a própria linha, como a policy antiga fazia; arquivar só impede
 -- processos e logins novos (E-83, Q-13). É uma decisão documentada aqui, não um efeito colateral.
-INSERT INTO public.clients (id, name, archived_at)
-VALUES ('00000000-0000-4000-8000-00000000000c', 'Cliente Arquivado', now());
+-- (o login nasce com o cliente ativo, porque o gatilho do perfil recusa um cliente arquivado; arquivar vem depois,
+-- como no produto: arquivar não toca nos logins que já existem, F-58)
+INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000c', 'Cliente Arquivado');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000d1', 'client', '00000000-0000-4000-8000-00000000000c');
 UPDATE public.profiles SET must_change_password = false WHERE id = '00000000-0000-4000-8000-0000000000d1';
+UPDATE public.clients SET archived_at = now() WHERE id = '00000000-0000-4000-8000-00000000000c';
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000d1');
 SELECT results_eq(
   $$ SELECT id, name FROM public.current_client_summary() $$,
