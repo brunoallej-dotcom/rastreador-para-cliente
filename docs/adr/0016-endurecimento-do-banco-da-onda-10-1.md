@@ -36,14 +36,17 @@ F-93):
 - **A intenção de cada escrita no Auth sobre um login que existe é gravada antes, em transação própria, e sem ela o
   Auth não é tocado.** `begin_client_login_admin(client_id, user_id, action)` confere `is_ceo()`, o dono e o papel
   e aceita só `ban`, `unban` e `set_password`. A compensação do provisionamento segue a mesma regra com
-  `record_account_provision_reverted`: grava antes de apagar e não apaga se não gravou. `record_account_provisioned`
+  `record_account_provision_reverted`: grava antes de apagar e não apaga se não gravou. A função só aceita um login
+  que ninguém usou, criado há menos de 15 minutos (a compensação roda na mesma requisição) e que ainda não tem
+  `account.provisioned`; um registro que valeu mas cuja resposta se perdeu é recusado, e a conta fica como órfã com o
+  registro mantido (F-117). `record_account_provisioned`
   devolve a linha do login, e o reset de uma conta órfã registra o `account.provisioned` que faltava.
 - **Os arquivos pgTAP contam só as próprias linhas** (as fixtures, e as da própria transação por `now()`), para
   `pnpm db:test` passar depois de `pnpm test:api` sem `db:reset`.
 
 ## Consequências
 
-- **Positivas:** a secret key não escreve nem lê dado de negócio; o banco diz o que o BFF já dizia (senha pendente
+- **Positivas:** a secret key deixou de ler e de escrever as tabelas de rastreamento diretamente (PostgREST ou SQL); o banco diz o que o BFF já dizia (senha pendente
   não lê, não é CEO); uma escrita no Auth deixa rastro mesmo quando o passo do banco falha depois; a compensação do
   provisionamento tem começo, meio e fim na trilha.
 - **Negativas:** (a) um CEO que volta a ter a senha temporária (reset de operador) perde o acesso de CEO até trocar
@@ -51,7 +54,9 @@ F-93):
   (b) quando a intenção não grava, o ban da desativação não é posto (o banco já bloqueia o login, o log diz
   `not_audited`) e a conta de um provisionamento que falhou fica como órfã em vez de ser apagada sem rastro;
   (c) cada fixture de teste que escreve essas tabelas custa uma ida ao contêiner; (d) a intenção é o que o app ia
-  fazer, não prova de que o Auth o fez.
+  fazer, não prova de que o Auth o fez; (e) a secret key ainda troca a senha de um login ativo pelo Auth Admin API e
+  então lê o tenant dele pelo RLS, sem linha em `audit_events` (T-53, Onda 11): o que esta onda tirou dela foi o acesso
+  direto às tabelas, não o poder sobre as contas.
 - **Alternativas recusadas:** manter o `SELECT` do `service_role` "por conveniência dos testes" (a chave com
   `BYPASSRLS` lê todos os clientes sem ninguém precisar); deixar `clients` legível ao login pendente (a regra
   ficaria com uma exceção que o próximo helper copiaria); só documentar que o atestado do CEO pendente é

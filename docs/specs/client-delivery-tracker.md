@@ -592,7 +592,7 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
 | `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`). **Devolve a linha do login**, com as colunas de `list_client_users` (F-93) |
 | `begin_client_login_admin(p_client_id, p_user_id, p_action)` | idem; o login precisa ser `client` **do cliente informado** | Grava a **intenção** de uma escrita no Auth: `ban`, `unban` ou `set_password` (lista fechada; outra ação: `INVALID_INPUT`). Eventos `account.ban_intent`, `account.unban_intent`, `account.password_set_intent` (§3.7.4, F-92 b) |
-| `record_account_provision_reverted(p_user_id, p_reason)` | idem; alvo `client` que ninguém usou | A compensação do provisionamento: evento `account.provision_reverted`, antes de apagar a conta. `p_reason`: `record_failed` ou `answer_lost`. Uma vez por login (§3.7.4, F-93) |
+| `record_account_provision_reverted(p_user_id, p_reason)` | idem; alvo `client` que ninguém usou, criado há menos de 15 minutos e sem `account.provisioned` | A compensação do provisionamento: evento `account.provision_reverted`, antes de apagar a conta. `p_reason`: `record_failed` ou `answer_lost`. Uma vez por login (§3.7.4, F-93) |
 | `current_client_summary()` | authenticated (o próprio login, também com a senha temporária pendente) | `id` e `name` do cliente do próprio perfil, sem argumento (o `SessionClient` do login e do `GET /auth/session`, F-83) |
 | `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
 | `set_account_display_name(p_user_id, p_display_name)` | idem; alvo precisa ser `client` | Renomeia o login (`PATCH …/users/{userId}` com `displayName`). `account.updated` |
@@ -926,8 +926,12 @@ são **internos** da trilha (`audit_events` só é lida por CEO atestado, e nenh
 - **A compensação deixa rastro (F-93).** `record_account_provision_reverted(p_user_id, p_reason)` grava
   `account.provision_reverted`, com `{"reason": "record_failed" | "answer_lost"}`, **antes** de o app apagar no Auth a
   conta que acabou de criar (depois da exclusão o perfil não existe mais). Só vale para um login que ninguém usou
-  (senha temporária pendente e nenhum acesso); uma segunda chamada para o mesmo login não grava outro evento (a
-  compensação tenta duas vezes). **Falha fechada:** se o registro falha, a conta **não** é apagada e a resposta é o 503 de
+  (senha temporária pendente e nenhum acesso), criado há menos de 15 minutos (a compensação roda na mesma
+  requisição) e que **ainda não tem `account.provisioned`** (INVALID_INPUT: um login registrado não é um provisionamento
+  a desfazer, F-117); uma segunda chamada para o mesmo login não grava outro evento (a compensação tenta duas vezes).
+  **Consequência, escolhida por falhar fechada:** se o registro valeu mas a resposta se perdeu (ou não foi entendida),
+  a reversão é recusada e a conta **não** é apagada: fica como órfã, com o `account.provisioned` mantido, e o reset a
+  entrega (sem registro tardio, porque o registro existe). **Falha fechada:** se o registro falha, a conta **não** é apagada e a resposta é o 503 de
   `provision_orphaned` (E-93); a trilha de uma conta que ficou e foi entregue por reset lê: `provision_reverted`,
   `provisioned` (tardio) e `password_reset`.
 - **O registro devolve o login (F-93).** `record_account_provisioned` devolve a linha do login, com as colunas e a ordem de
@@ -935,7 +939,13 @@ são **internos** da trilha (`audit_events` só é lida por CEO atestado, e nenh
   tipo de retorno exigiu apagar a função e criá-la de novo (mesmo nome, mesma entrada, mesmos privilégios).
 - **Registro tardio no reset (F-93).** `require_password_change` grava `account.provisioned` com `{"late": true}`,
   antes de `account.password_reset` e na mesma transação, quando o login nunca teve o seu: é a recuperação da conta
-  órfã de E-53 e de E-50 (que só é entregue pelo reset). Um login já registrado não ganha outro.
+  órfã de E-53 e de E-50 (que só é entregue pelo reset). Um login já registrado não ganha outro. **Leitura da
+  trilha (F-118):** `late: true` quer dizer "adotado na recuperação por este ator", não "criado por ele": o ator do
+  evento é o CEO que resetou, e o criador original (o CEO da requisição que criou a conta) pode ser outro, ou nenhum
+  evento o nomeia. Um login com `account.provision_reverted` seguido de um `account.provisioned` tardio é uma órfã
+  recuperada: a reversão foi registrada, a exclusão falhou, e o reset a entregou. **Onda 11:** uma consulta de
+  detecção para logins sem evento de origem (`account.provisioned` ou `account.provision_reverted`), que só um
+  reset ainda não corrigiu.
 - **Eventos de conta**, o catálogo completo (o pgTAP 021 recusa qualquer outro): `account.provisioned`,
   `account.provision_reverted`, `account.disabled`, `account.enabled`, `account.updated`, `account.password_reset`,
   `account.password_changed`, `account.ban_intent`, `account.unban_intent` e `account.password_set_intent`.
@@ -1239,7 +1249,9 @@ de `service_role` de §3.7 (`rate_limit_hit`, a queima de código TOTP e as trê
 algum** em `clients`, `processes`, `process_stages` e `stage_approvals` (F-81, Onda 10.1: nem `SELECT`, nem `TRIGGER`,
 `REFERENCES` ou `MAINTAIN`), porque com `BYPASSRLS` uma linha feita à mão quebrava I1 a I5 sem auditoria e uma leitura
 via todos os clientes; nada na aplicação usa a chave nelas (a fachada do admin client não expõe `.from()`, e
-`scripts/create-ceo.ts` escreve só o Auth). O privilégio padrão do dono das migrations em `public` também não concede
+`scripts/create-ceo.ts` escreve só o Auth). **O limite disso (T-53):** a chave deixou de ler e escrever as tabelas
+diretamente (PostgREST ou SQL); pelo Auth Admin API ela ainda troca a senha de um login ativo e então lê o tenant dele
+pelo RLS, sem linha em `audit_events` (Onda 11). O privilégio padrão do dono das migrations em `public` também não concede
 nada a ela, então uma tabela ou sequência nova não nasce acessível à secret key: cada migration concede o que precisa.
 Quem escreve é só a função `SECURITY DEFINER`, como o dono. As fixtures dos testes escrevem e leem essas tabelas pelo
 `psql` do contêiner do banco (`tests/helpers/db.ts`, com entradas validadas), nunca pela chave.
@@ -1351,9 +1363,9 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-80 | `GET /me/processes` com `clientId`, `status` ou outro parâmetro que o contrato não tem; `limit` fora de 1 a 100 ou que não é inteiro; cursor adulterado, truncado, de outro endpoint ou com um instante que o banco não lê | 400 `VALIDATION_ERROR` em `query.<campo>`: a validação recusa antes do banco, e a classe 22 do banco (um instante que a validação deixou passar) é a retaguarda, também 400. Um cursor bem formado que veio de outro cliente é aceito e anda só dentro das linhas de quem o envia (§3.5.1) |
 | E-81 | Cliente com `CHANGE_PASSWORD` pendente em `/me/*` | 403 `PASSWORD_CHANGE_REQUIRED` na lista e no detalhe; liberado depois de `POST /auth/password` |
 | E-90 | Cliente com a senha temporária pendente chama o PostgREST direto com o próprio JWT (`processes`, `process_stages`, `clients`, `stage_approvals`) | Lista vazia em todas, inclusive a do próprio cliente (F-83); o `GET /auth/session` dele segue mostrando o cliente (`current_client_summary()`); depois de `POST /auth/password` o mesmo JWT lê o próprio tenant |
-| E-91 | CEO atestado que volta a ter a senha temporária (reset de operador, F-41) | `is_ceo()` é falso: não lê nem escreve nada de negócio até trocar a senha; a troca e o `GET /auth/session` funcionam (F-83) |
+| E-91 | CEO atestado que volta a ter a senha temporária | `is_ceo()` é falso: não lê nem escreve nada de negócio até trocar a senha (F-83). **A troca funciona só a partir de uma sessão atestada que sobreviveu ao reset** (o `must_change_password` voltou a `true` sem a sessão cair, por exemplo um UPDATE de operador no perfil). Um reset de operador que **troca a senha** no Auth derruba as sessões, e a sessão nova cai no beco sem saída de F-110 (e de F-115) |
 | E-92 | Reset, reativação ou ban sem a **intenção** gravada (`begin_client_login_admin` falha) | O Auth não é tocado. Reset e reativação: o erro da gravação (403, 404 ou 503), a senha antiga e o ban ficam como estavam. Desativação: 200 com o login bloqueado no banco, `ban_failed` com motivo `not_audited` em `error` (F-92 b) |
-| E-93 | Provisionar: o `account.provision_reverted` não grava antes de apagar a conta | A conta **não** é apagada (falha fechada): 503, `provision_orphaned` em `error` com o porquê da falha do registro; o login fica na lista e o reset o entrega (E-53, F-93) |
+| E-93 | Provisionar: o `account.provision_reverted` não grava antes de apagar a conta (ou a reversão é recusada) | A conta **não** é apagada (falha fechada): 503, `provision_orphaned` em `error` com o porquê da falha do registro; o login fica na lista e o reset o entrega (E-53, F-93). **No ramo em que o banco já não vê um CEO** (o registro e a reversão voltam 403), o resultado é determinístico: sempre uma órfã e um 503, nunca o 403 nem a exclusão sem rastro (F-114). Um registro que valeu mas cuja resposta se perdeu também termina assim, com o `account.provisioned` mantido (F-117) |
 | E-94 | Provisionar: a lista falha depois do registro | Não importa: o 201 vem do retorno de `record_account_provisioned`, sem releitura (F-93) |
 | E-95 | A secret key lê ou escreve `clients`, `processes`, `process_stages` ou `stage_approvals` pelo PostgREST | 403 `42501`, em toda operação (F-81) |
 | E-82 | Processo sem fase, ou que quebra I1 a I4, na lista ou no detalhe do cliente | 500 `INTERNAL_ERROR`, sem mostrar nada dele nem do título; o log leva só o id do processo e as invariantes (F-81). Os outros clientes não são afetados |
@@ -1373,7 +1385,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
 | E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes`, que cria sem chave natural, **pode duplicar**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 201 com um **segundo** processo e a auditoria tem dois `process.created` (§3.7.2), então o CEO confere a lista do cliente antes de repetir; no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
-| E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: grava `account.provision_reverted`, apaga o usuário criado, responde 503 e loga em `error` (se o `provision_reverted` não grava, não apaga: E-93) |
+| E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: grava `account.provision_reverted`, apaga o usuário criado, responde 503 e loga em `error` (se o `provision_reverted` não grava, ou se o registro chegou a valer, não apaga: E-93) |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
 | E-50 | Provisionar: o Auth criou a conta mas a resposta se perdeu (timeout depois do commit) | Antes de responder, o caso de uso relê a lista do cliente e acha o login novo pelo e-mail: se há exatamente um candidato e ele foi criado no começo da tentativa ou depois, apaga a conta e responde 503, sem nada pela metade e nunca 422 (mesmo que o cliente tenha ficado cheio por causa dela); repetir dá 201. Com mais de um candidato, ou com um criado antes da tentativa (outro CEO provisionou o mesmo endereço um instante antes), **não apaga nada**: 503 e `identity.client_user.provision_answer_lost` em `error` com os ids e `deleted: false`. Se a exclusão também falha: 503, o mesmo evento com o id e o porquê da falha; o login fica na lista, repetir dá 409 `EMAIL_ALREADY_REGISTERED` e um reset da senha o entrega |
 | E-51 | Resetar: o Auth já guardou a senha nova e o passo do banco (`require_password_change`) falha por **qualquer** motivo (queda mesmo com a segunda tentativa, 403 de atestado vencido, 404, entrada recusada) | 503 e `identity.client_user.reset_incomplete` em `error`, com só o tipo, o SQLSTATE e o status. A senha antiga e as sessões já não valem; faltam `CHANGE_PASSWORD`, a linha de base nova e a auditoria. A senha nova não é mostrada; repetir o reset conclui. Se a segunda tentativa de uma queda funciona, o reset conclui na mesma chamada (e, se a primeira tinha gravado com a resposta perdida, a auditoria ganha um segundo `account.password_reset`) |
