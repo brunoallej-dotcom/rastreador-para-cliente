@@ -17,7 +17,7 @@
 | 6.1 | Identidade: elevação de CEO atestada pelo backend (F-50) e validade da senha temporária (F-41) | 5, 6 | — | ✅ |
 | 7 | Identidade: logins de cliente (provisionar, listar, desativar, resetar senha) | 4, 6.1 | 8 | ✅ |
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
-| 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ⬜ |
+| 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
@@ -326,8 +326,9 @@ tempo):
   `tracking/infrastructure/supabase-process-event-queries.ts`,
   `tracking/presentation/{approve*,*events*}`, rotas
   `admin/processes/[processId]/approvals` e `admin/processes/[processId]/events`, migration com
-  `approve_current_stage`, `supabase/tests/tracking_approvals.test.sql`,
-  `tests/api/admin-approvals.api.test.ts`.
+  `approve_current_stage`, `supabase/tests/017_tracking_approvals.test.sql`,
+  `tests/api/admin-approvals.api.test.ts`, `tests/helpers/held-transaction.ts` (segunda sessão do
+  banco que segura a trava, para provar a concorrência sem `sleep`).
 - **Depende de / paralela com**: 8 / **10**.
 - **Critérios de aceite**: AC-16, AC-17, AC-18, AC-28; E-01, E-02, E-03, E-04.
 - **Goal command**: `/goal pnpm verify && pnpm db:test && pnpm test:api terminam com exit 0 e pnpm test:api -t "AC-(1[678]|28)|E-0[1-4]" executa pelo menos 8 testes, todos verdes, em 3 execuções seguidas (sem flakiness no teste de concorrência), stop after 12 tries`
