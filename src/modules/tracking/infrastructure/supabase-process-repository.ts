@@ -35,14 +35,13 @@ import {
   type StageTemplate,
 } from '../domain/stage';
 import { getClientStatus } from './supabase-client-directory';
+import { DATA_EXCEPTION_CLASS, invalidPosition, safeCause } from './database-errors';
 import { timestampSchema } from './timestamp-schema';
 
 /** Postgres: `insufficient_privilege`, what the database functions raise for a denied caller. */
 const INSUFFICIENT_PRIVILEGE = '42501';
 /** Postgres: `raise_exception`, with the application code as the message (spec §3.7). */
 const RAISE_EXCEPTION = 'P0001';
-/** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
-const DATA_EXCEPTION_CLASS = '22';
 const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
 const CLIENT_ARCHIVED_MESSAGE = 'CLIENT_ARCHIVED';
@@ -213,30 +212,11 @@ function parseSummaryRows(data: unknown): ProcessSummaryRow[] {
   return parsed.data;
 }
 
-/**
- * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message or
- * the details of the database error. Those can carry the row ("Failing row contains (..., <title>)")
- * and the logger writes the `cause` chain of every 5xx error, so a title would end up in the logs
- * (SEC-16 keeps titles out of the trail; the logs follow the same rule).
- */
-const safeCause = (error: { code?: string }, status: number) => ({
-  code: error.code ?? '',
-  status,
-});
-
 const invalidInput = (code: string | undefined) =>
   new ValidationError(
     'the database refused the input',
     [{ path: 'body', message: 'Invalid input' }],
     { cause: { code: code ?? '' } },
-  );
-
-/** The refusal of a list position (the cursor) that the database could not read as a timestamp. */
-const invalidPosition = (code: string) =>
-  new ValidationError(
-    'the database refused the list position',
-    [{ path: 'query.cursor', message: 'Invalid cursor' }],
-    { cause: { code } },
   );
 
 export type ProcessRepositoryOptions = {
