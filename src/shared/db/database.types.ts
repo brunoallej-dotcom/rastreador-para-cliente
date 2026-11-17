@@ -166,6 +166,9 @@ isOneToOne: false
 "attest_mfa_session":
 { Args: { "p_challenge_id": string,"p_factor_id": string,"p_session_id": string,"p_user_id": string }; Returns: string
                            },
+"begin_client_login_admin":
+{ Args: { "p_action": string,"p_client_id": string,"p_user_id": string }; Returns: undefined
+                           },
 "consume_totp_code":
 { Args: { "p_code_digest": string,"p_factor_id": string,"p_user_id": string }; Returns: boolean
                            },
@@ -229,8 +232,13 @@ isOneToOne: false
               "allowed": boolean,"retry_after_seconds": number
             }[]
                            },
+"record_account_provision_reverted":
+{ Args: { "p_reason": string,"p_user_id": string }; Returns: undefined
+                           },
 "record_account_provisioned":
-{ Args: { "p_user_id": string }; Returns: undefined
+{ Args: { "p_user_id": string }; Returns: {
+              "created_at": string,"disabled_at": string,"display_name": string,"email": string,"last_sign_in_at": string,"must_change_password": boolean,"user_id": string
+            }[]
                            },
 "record_backend_mfa_challenge":
 { Args: { "p_challenge_id": string,"p_factor_id": string,"p_user_id": string }; Returns: undefined

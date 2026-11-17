@@ -1,6 +1,16 @@
 import type { DomainError, NotFoundError, Result } from '@/shared/kernel';
 import type { ClientStatus, ClientUser } from './client-user';
-import type { EmailAlreadyRegisteredError } from './client-user-errors';
+import type { EmailAlreadyRegisteredError, ProvisionTakeBackReason } from './client-user-errors';
+
+/**
+ * What the application writes to the Auth server in the name of an existing client login, as a closed
+ * list (F-92 b): the audit of the intent (`begin_client_login_admin`) is written before each of them.
+ * `ban` is the second lock of a disable and the ban put back after a re-enable that failed, `unban` is
+ * the first step of a re-enable and `set_password` is the temporary password of a reset. Creating and
+ * deleting an account are not on it: the creation has no id to audit yet, and the deletion is the
+ * compensation of a provisioning, which has its own event (`recordProvisionReverted`).
+ */
+export type AuthWriteAction = 'ban' | 'unban' | 'set_password';
 
 /**
  * The logins of clients as the database knows them, read and written AS THE CEO who is calling (the
@@ -18,10 +28,33 @@ export interface ClientUserRepository {
   list(clientId: string): Promise<Result<readonly ClientUser[], DomainError>>;
 
   /**
-   * `account.provisioned` for a login just created in the Auth server. `err(NotFoundError)` when the
-   * account is not a client login, `err(ForbiddenError)` when the database no longer sees a CEO.
+   * `account.provisioned` for a login just created in the Auth server, and the login as the list shows it
+   * (one call, no read-back that could fail after the record, F-93). `err(NotFoundError)` when the account
+   * is not a client login, `err(ForbiddenError)` when the database no longer sees a CEO.
    */
-  recordProvisioned(userId: string): Promise<Result<void, DomainError>>;
+  recordProvisioned(userId: string): Promise<Result<ClientUser, DomainError>>;
+
+  /**
+   * `account.provision_reverted`, written BEFORE the account that this request created is deleted from the
+   * Auth server (F-93): without it a deleted account left an `account.provisioned` with no end. Only for a
+   * login nobody has used; a second call for the same login records nothing more.
+   */
+  recordProvisionReverted(
+    userId: string,
+    reason: ProvisionTakeBackReason,
+  ): Promise<Result<void, DomainError>>;
+
+  /**
+   * The audit of the INTENT to write to the Auth server (`begin_client_login_admin`, F-92 b): it checks
+   * that the caller is a CEO and that `userId` is a client login of `clientId`, and records the intent in
+   * its own transaction. Every Auth write of an existing login comes after it, and a failure here means
+   * the Auth server is not touched. `err(NotFoundError)` when the login is not one of that client.
+   */
+  beginAuthWrite(
+    clientId: string,
+    userId: string,
+    action: AuthWriteAction,
+  ): Promise<Result<void, DomainError>>;
 
   /** Disables (and revokes every session of) or re-enables a login. Audits only a change of state. */
   setDisabled(userId: string, disabled: boolean): Promise<Result<void, DomainError>>;
@@ -82,10 +115,11 @@ export interface AccountAdminGateway {
 /**
  * Why the second lock of a disable (the ban in the Auth server) could not be set (E-24, F-94):
  * `unavailable` (the Auth server is slow or down: transient, repeating the disable retries it),
- * `not_found` (the Auth server has no such user: the profile and the account disagree) or
- * `unexpected` (an answer nobody planned for: a rejected key, a changed server).
+ * `not_found` (the Auth server has no such user: the profile and the account disagree),
+ * `unexpected` (an answer nobody planned for: a rejected key, a changed server) or `not_audited` (the
+ * audit of the intent could not be written, so the Auth server was not called at all, F-92 b).
  */
-export type BanFailureReason = 'unavailable' | 'not_found' | 'unexpected';
+export type BanFailureReason = 'unavailable' | 'not_found' | 'unexpected' | 'not_audited';
 
 /**
  * Something a use case wants on record that is neither its result nor its error: the handler turns it

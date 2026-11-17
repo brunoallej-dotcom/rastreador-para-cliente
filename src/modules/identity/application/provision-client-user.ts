@@ -152,8 +152,36 @@ function isOwnLogin(
 type Removal =
   { readonly removed: true } | { readonly removed: false; readonly failure: SafeCause };
 
+/** The compensation tries the record of the reversal and the deletion this many times each. */
+const REVERSAL_ATTEMPTS = 2;
+
+/**
+ * Puts the reversal on the audit trail (`account.provision_reverted`, F-93) BEFORE the account goes: the
+ * trail of a provisioning that was taken back says so, and `account.provisioned` does not stay without an
+ * end. Tries again after an outage; a refusal of the database (a CEO it no longer sees, a login that is
+ * not the unused one) is final. `null` when it is recorded, otherwise why not (a code and a status).
+ */
+async function recordReversal(
+  users: ClientUserRepository,
+  userId: string,
+  reason: ProvisionTakeBackReason,
+): Promise<SafeCause | null> {
+  let failure: SafeCause = { kind: 'UNKNOWN' };
+  for (let attempt = 1; attempt <= REVERSAL_ATTEMPTS; attempt += 1) {
+    try {
+      const recorded = await users.recordProvisionReverted(userId, reason);
+      if (recorded.ok) return null;
+      return safeCauseOf(recorded.error);
+    } catch (error) {
+      failure = safeCauseOf(error);
+      if (!(error instanceof ServiceUnavailableError)) break;
+    }
+  }
+  return failure;
+}
+
 /** Deletes the account, trying again once. When it cannot, says why (a code and a status only). */
-async function removeAccount(accounts: AccountAdminGateway, userId: string): Promise<Removal> {
+async function deleteAccount(accounts: AccountAdminGateway, userId: string): Promise<Removal> {
   let failure: SafeCause = { kind: 'UNKNOWN' };
   for (let attempt = 1; attempt <= DELETE_ATTEMPTS; attempt += 1) {
     try {
@@ -167,6 +195,23 @@ async function removeAccount(accounts: AccountAdminGateway, userId: string): Pro
 }
 
 /**
+ * Takes the account this request created back: the reversal is recorded FIRST, and only then is the
+ * account deleted. Fail closed (F-92 b, F-93): when the reversal cannot be recorded the account is NOT
+ * deleted, so nothing is destroyed without a trace, and `failure` says why the account was not removed (the
+ * failure of the record, or of the deletion itself). The account stays as an orphan the CEO finds in the
+ * list and recovers by resetting its password (E-53).
+ */
+async function removeAccount(
+  deps: ProvisionClientUserDeps,
+  userId: string,
+  reason: ProvisionTakeBackReason,
+): Promise<Removal> {
+  const notRecorded = await recordReversal(deps.users, userId, reason);
+  if (notRecorded !== null) return { removed: false, failure: notRecorded };
+  return deleteAccount(deps.accounts, userId);
+}
+
+/**
  * Takes an account this request created back, and ends the request with the 503 that says how it went:
  * deleted (`ClientUserProvisionRolledBackError`) or not (`ClientUserProvisionOrphanedError`, with the id
  * and why the deletion failed, for the log). Always throws.
@@ -177,31 +222,12 @@ async function takeBack(
   reason: ProvisionTakeBackReason,
   cause: unknown,
 ): Promise<never> {
-  const removal = await removeAccount(deps.accounts, userId);
+  const removal = await removeAccount(deps, userId, reason);
   const safe = safeCauseOf(cause);
   if (removal.removed) {
     throw new ClientUserProvisionRolledBackError(userId, reason, { cause: safe });
   }
   throw new ClientUserProvisionOrphanedError(userId, reason, removal.failure, { cause: safe });
-}
-
-/** The step that must succeed before the password is handed over: the audit record and the read-back. */
-async function recordAndRead(
-  deps: ProvisionClientUserDeps,
-  clientId: string,
-  userId: string,
-): Promise<Result<ClientUser, DomainError>> {
-  const recorded = await deps.users.recordProvisioned(userId);
-  if (!recorded.ok) return recorded;
-
-  // The 201 shows the login as the list will show it (the profile's own timestamps).
-  const listed = await deps.users.list(clientId);
-  if (!listed.ok) return listed;
-  const user = listed.value.find((candidate) => candidate.id === userId);
-  if (user === undefined) {
-    return err(new NotFoundError('the new login is not in the list', { detail: 'Not found.' }));
-  }
-  return ok(user);
 }
 
 /**
@@ -255,10 +281,13 @@ async function explainFailedCreation(
  *    clean 404, 422, 409 and 422).
  * 2. The account is created. `email_exists` is 409 `EMAIL_ALREADY_REGISTERED` (E-17). After a failure that
  *    looks like an outage the use case finds out what happened before it answers (`explainFailedCreation`).
- * 3. `record_account_provisioned` and a read-back. This is the one step that can fail AFTER the account
- *    exists. If it does (E-23), the account is deleted again (the compensation) and the answer is 503:
- *    nothing is left and nobody saw the password. If the deletion fails too, `ClientUserProvisionOrphanedError`
- *    says so and carries the id for the log: the CEO finds the login in the list and resets or disables it.
+ * 3. `record_account_provisioned`, which answers with the login (no read-back). This is the one step that
+ *    can fail AFTER the account exists. If it does (E-23), the account is deleted again (the compensation)
+ *    and the answer is 503: nothing is left and nobody saw the password. The compensation records
+ *    `account.provision_reverted` BEFORE it deletes (F-93), and does not delete when that record fails
+ *    (fail closed). If the record or the deletion fails, `ClientUserProvisionOrphanedError` says so and
+ *    carries the id for the log: the CEO finds the login in the list and resets or disables it, and the
+ *    reset registers the `account.provisioned` that is missing.
  */
 export async function provisionClientUser(
   deps: ProvisionClientUserDeps,
@@ -299,18 +328,20 @@ export async function provisionClientUser(
   if (!created.ok) return created;
   const userId = created.value.id;
 
+  // The record answers with the login as the list shows it (one call, F-93): there is no read-back that
+  // could fail after the record and force the compensation.
   let outcome: Result<ClientUser, DomainError>;
   try {
-    outcome = await recordAndRead(deps, input.clientId, userId);
+    outcome = await deps.users.recordProvisioned(userId);
   } catch (cause) {
-    // E-23: the account exists, the record or the read-back did not work
+    // E-23: the account exists, the record did not work
     return takeBack(deps, userId, 'record_failed', cause);
   }
 
   if (!outcome.ok) {
     // a database that no longer sees a CEO is that answer; anything else here is not the CEO's doing
     if (outcome.error instanceof ForbiddenError) {
-      const removal = await removeAccount(deps.accounts, userId);
+      const removal = await removeAccount(deps, userId, 'record_failed');
       if (!removal.removed) {
         throw new ClientUserProvisionOrphanedError(userId, 'record_failed', removal.failure, {
           cause: safeCauseOf(outcome.error),

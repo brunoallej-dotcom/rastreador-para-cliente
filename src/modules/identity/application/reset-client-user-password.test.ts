@@ -150,10 +150,129 @@ describe('resetClientUserPassword', () => {
 
     expect(result.ok).toBe(true);
     expect(world.records.get(USER_A1)).toMatchObject({ mustChangePassword: true, sessions: 0 });
+    // one intent for the one Auth write, and two events from the two runs of the database step
     expect(world.records.get(USER_A1)?.audit).toEqual([
+      'account.password_set_intent',
       'account.password_reset',
       'account.password_reset',
     ]);
+  });
+
+  describe('F-92 b: the intent of the Auth write is on the trail BEFORE the password is stored', () => {
+    it('the order is the intent, the Auth write, then the database step', async () => {
+      const world = worldWithTwoClients();
+
+      await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      expect(
+        world.calls.filter((call) =>
+          ['beginAuthWrite', 'setPassword', 'requirePasswordChange'].includes(call),
+        ),
+      ).toEqual(['beginAuthWrite', 'setPassword', 'requirePasswordChange']);
+      expect(world.intents).toEqual([{ userId: USER_A1, action: 'set_password' }]);
+      expect(world.records.get(USER_A1)?.audit).toEqual([
+        'account.password_set_intent',
+        'account.password_reset',
+      ]);
+    });
+
+    it('the intent names the client of the path and the login', async () => {
+      const world = worldWithTwoClients();
+      const seen: unknown[][] = [];
+      const users = {
+        ...world.users,
+        beginAuthWrite: (...args: Parameters<typeof world.users.beginAuthWrite>) => {
+          seen.push(args);
+          return world.users.beginAuthWrite(...args);
+        },
+      };
+
+      await resetClientUserPassword({ ...deps(world), users }, ceoPrincipal, INPUT);
+
+      expect(seen).toEqual([[CLIENT_A, USER_A1, 'set_password']]);
+    });
+
+    it('an intent that cannot be recorded (a refusal): the Auth server is not touched, the old password still works, and the answer is the error of the record', async () => {
+      const world = worldWithTwoClients();
+      const before = world.records.get(USER_A1)?.password;
+      world.refuseNext('beginAuthWrite', new ForbiddenError('denied'));
+
+      const result = await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      expect(!result.ok && result.error).toBeInstanceOf(ForbiddenError);
+      expect(world.calls).not.toContain('setPassword');
+      expect(world.calls).not.toContain('requirePasswordChange');
+      expect(world.records.get(USER_A1)).toMatchObject({ password: before, sessions: 1 });
+    });
+
+    it('an outage of the record: a 503, the Auth server is not touched and nothing is returned', async () => {
+      const world = worldWithTwoClients();
+      const before = world.records.get(USER_A1)?.password;
+      world.failNext('beginAuthWrite');
+
+      await expect(
+        resetClientUserPassword(deps(world), ceoPrincipal, INPUT),
+      ).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(world.calls).not.toContain('setPassword');
+      expect(world.records.get(USER_A1)?.password).toBe(before);
+    });
+
+    it('a login the database no longer knows as one of this client (404 at the intent) is not reset', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext('beginAuthWrite', new NotFoundError('gone'));
+
+      const result = await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      expect(!result.ok && result.error).toBeInstanceOf(NotFoundError);
+      expect(world.calls).not.toContain('setPassword');
+    });
+
+    it('the repeat after a refused intent starts over and completes', async () => {
+      const world = worldWithTwoClients();
+      world.refuseNext('beginAuthWrite', new ForbiddenError('denied'));
+      await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      const repeated = await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      expect(repeated.ok).toBe(true);
+      expect(world.intents).toEqual([{ userId: USER_A1, action: 'set_password' }]);
+    });
+  });
+
+  describe('F-93: the reset that delivers an orphan registers the provisioning that is missing', () => {
+    it('a login that never had account.provisioned gets it, late, before account.password_reset', async () => {
+      const world = worldWithTwoClients();
+      const orphan = world.seed({
+        id: '00000000-0000-4000-8000-0000000000a9',
+        clientId: CLIENT_A,
+        email: 'orfa@cliente.test',
+        mustChangePassword: true,
+        provisioned: false,
+      });
+
+      const result = await resetClientUserPassword(deps(world), ceoPrincipal, {
+        clientId: CLIENT_A,
+        userId: orphan.id,
+      });
+
+      expect(result.ok).toBe(true);
+      expect(orphan.provisioned).toBe(true);
+      expect(orphan.audit).toEqual([
+        'account.password_set_intent',
+        'account.provisioned',
+        'account.password_reset',
+      ]);
+    });
+
+    it('a login that already has account.provisioned does not get a second one, however many times it is reset', async () => {
+      const world = worldWithTwoClients();
+
+      await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+      await resetClientUserPassword(deps(world), ceoPrincipal, INPUT);
+
+      expect(world.trail.filter((entry) => entry.event === 'account.provisioned')).toEqual([]);
+    });
   });
 
   describe('F-93: anything after setPassword is an incomplete reset, never the answer the database gave', () => {

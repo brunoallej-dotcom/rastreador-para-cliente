@@ -50,17 +50,21 @@ const nothingToChange = () =>
  *    nothing else was touched;
  * 2. re-enabling, and only of a login that was disabled when the request began (enabling an enabled login
  *    is a no-op that touches nothing, so nothing can go wrong half way and no ban can be put back on an
- *    active login, M2): the Auth server is told first (unban), then the database. If the unban fails the login
+ *    active login, M2): the intent is recorded (F-92 b), the Auth server is told (unban), then the
+ *    database. If the intent cannot be recorded the Auth server is not called and the answer is the error
+ *    of the record. If the unban fails the login
  *    is still disabled in the database and still blocked. If the database step fails AFTER the unban,
  *    the ban is put back (best effort, reported), so the login stays blocked in both places instead of
  *    "unbanned here, disabled there". Never the reverse order, where the database would say "enabled"
  *    while the Auth server still refuses the sign-in;
  * 3. disabling: the database first (the block that counts: it deletes every session and `current_principal()`
- *    returns nothing), then the ban in the Auth server as a second lock. A ban that fails does not undo
- *    the disable and is not an error for the CEO (E-24): the notice `ban_failed` carries why, and the
- *    handler logs it at `error`. Repeating the PATCH `{ disabled: true }` tries the ban again, which is
- *    why a disable of a login that is already disabled still calls the Auth server. The database
- *    function audits only a change of state, so repeating a disable or an enable writes no second event.
+ *    returns nothing), then the intent of the ban (F-92 b), then the ban in the Auth server as a second
+ *    lock. A ban that fails does not undo the disable and is not an error for the CEO (E-24): the notice
+ *    `ban_failed` carries why (`not_audited` when the intent could not be recorded and the Auth server was
+ *    not called), and the handler logs it at `error`. Repeating the PATCH `{ disabled: true }` tries the
+ *    ban again, which is why a disable of a login that is already disabled still calls the Auth server (and
+ *    records another intent). The database function audits only a change of state, so repeating a disable
+ *    or an enable writes no second `account.disabled` or `account.enabled`.
  *
  * Two CEOs disabling and enabling the same login at the same time can interleave the two systems. The
  * worst outcome is "enabled in the database, banned in Auth": the sign-in is refused (fail closed). A bare
@@ -91,13 +95,13 @@ export async function updateClientUser(
     // step is skipped, the unban included: if its database step then failed, putting the ban back would
     // lock out a login that is active (M2).
     if (target.value.disabled) {
-      const enabled = await enable(deps, input.userId);
+      const enabled = await enable(deps, input.clientId, input.userId);
       if (!enabled.ok) return enabled;
     }
   } else if (input.disabled === true) {
     const disabled = await deps.users.setDisabled(input.userId, true);
     if (!disabled.ok) return disabled;
-    const failure = await tryBan(deps.accounts, input.userId);
+    const failure = await tryBan(deps, input.clientId, input.userId);
     if (failure !== null) deps.report?.({ kind: 'ban_failed', reason: failure });
   }
 
@@ -105,11 +109,19 @@ export async function updateClientUser(
   return findClientLogin(deps.users, input.clientId, input.userId);
 }
 
-/** The Auth server first, then the database; a database step that fails puts the ban back. */
+/**
+ * The intent of the unban is recorded first (F-92 b: when it cannot be, the Auth server is not touched and
+ * the answer is the error of the record, the login still disabled and banned); then the Auth server, then
+ * the database; a database step that fails puts the ban back.
+ */
 async function enable(
   deps: UpdateClientUserDeps,
+  clientId: string,
   userId: string,
 ): Promise<Result<void, DomainError>> {
+  const begun = await deps.users.beginAuthWrite(clientId, userId, 'unban');
+  if (!begun.ok) return begun;
+
   const unbanned = await deps.accounts.setBanned(userId, false);
   if (!unbanned.ok) return err(clientLoginNotFound());
 
@@ -117,17 +129,21 @@ async function enable(
   try {
     enabled = await deps.users.setDisabled(userId, false);
   } catch (error) {
-    await rebanAfterFailedEnable(deps, userId);
+    await rebanAfterFailedEnable(deps, clientId, userId);
     throw error;
   }
-  if (!enabled.ok) await rebanAfterFailedEnable(deps, userId);
+  if (!enabled.ok) await rebanAfterFailedEnable(deps, clientId, userId);
   return enabled;
 }
 
-async function rebanAfterFailedEnable(deps: UpdateClientUserDeps, userId: string): Promise<void> {
+async function rebanAfterFailedEnable(
+  deps: UpdateClientUserDeps,
+  clientId: string,
+  userId: string,
+): Promise<void> {
   let failure: BanFailureReason | null;
   try {
-    failure = await tryBan(deps.accounts, userId);
+    failure = await tryBan(deps, clientId, userId);
   } catch {
     // never let the second failure hide the first one, which the caller is about to report
     failure = 'unexpected';
@@ -140,17 +156,27 @@ async function rebanAfterFailedEnable(deps: UpdateClientUserDeps, userId: string
 }
 
 /**
- * The second lock of a disable. `null` when it is set; otherwise why not, as data (E-24, F-94):
- * `unavailable` (transient), `not_found` or `unexpected`. Only these three are swallowed: an error nobody
- * classified (a bug) is thrown, because it is not something a CEO can retry into working. The disable
- * itself is already in the database either way.
+ * The second lock of a disable, and the ban put back after a re-enable that failed. `null` when it is set;
+ * otherwise why not, as data (E-24, F-94): `unavailable` (transient), `not_found`, `unexpected`, or
+ * `not_audited` (the intent could not be recorded, so the Auth server was NOT called: fail closed on the
+ * audit, F-92 b; the database blocks the login all the same). Only these four are swallowed: an error
+ * nobody classified (a bug) is thrown, because it is not something a CEO can retry into working. The
+ * disable itself is already in the database either way.
  */
 async function tryBan(
-  accounts: AccountAdminGateway,
+  deps: UpdateClientUserDeps,
+  clientId: string,
   userId: string,
 ): Promise<BanFailureReason | null> {
   try {
-    const banned = await accounts.setBanned(userId, true);
+    const begun = await deps.users.beginAuthWrite(clientId, userId, 'ban');
+    if (!begun.ok) return 'not_audited';
+  } catch (error) {
+    if (error instanceof ServiceUnavailableError) return 'not_audited';
+    throw error;
+  }
+  try {
+    const banned = await deps.accounts.setBanned(userId, true);
     return banned.ok ? null : 'not_found';
   } catch (error) {
     if (error instanceof UnexpectedAuthAnswerError) return 'unexpected';

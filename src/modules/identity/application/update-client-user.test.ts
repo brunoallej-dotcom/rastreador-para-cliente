@@ -26,6 +26,10 @@ const deps = (world: ReturnType<typeof worldWithTwoClients>, notices: ClientUser
   report: (notice: ClientUserNotice) => void notices.push(notice),
 });
 
+/** What the database functions audited about a login, without the intents of the Auth writes. */
+const stateEvents = (world: ReturnType<typeof worldWithTwoClients>, userId: string) =>
+  (world.records.get(userId)?.audit ?? []).filter((event) => !event.endsWith('_intent'));
+
 describe('updateClientUser', () => {
   it('AC-13: disabling blocks the login in the database (sessions gone) and bans it in the Auth server', async () => {
     const world = worldWithTwoClients();
@@ -189,7 +193,12 @@ describe('updateClientUser', () => {
     expect(notices).toEqual([]);
     expect(world.records.get(USER_A1)?.banned).toBe(true);
     // the login was already disabled in the database: no second event, and the ban was still tried
-    expect(world.records.get(USER_A1)?.audit).toEqual(['account.disabled']);
+    // (each try wrote its own intent, F-92 b)
+    expect(stateEvents(world, USER_A1)).toEqual(['account.disabled']);
+    expect(world.intents).toEqual([
+      { userId: USER_A1, action: 'ban' },
+      { userId: USER_A1, action: 'ban' },
+    ]);
   });
 
   it('E-56: the database step of a re-enable fails after the unban: the ban is put back, the login stays blocked in both places, and it is reported', async () => {
@@ -378,7 +387,7 @@ describe('updateClientUser', () => {
     await run(false);
     await run(false);
 
-    expect(world.records.get(USER_A1)?.audit).toEqual(['account.disabled', 'account.enabled']);
+    expect(stateEvents(world, USER_A1)).toEqual(['account.disabled', 'account.enabled']);
   });
 
   it('AC-13: renames a login, and a rename and a disable in one request both apply', async () => {
@@ -493,5 +502,207 @@ describe('updateClientUser', () => {
     });
 
     expect(world.calls).not.toContain('setBanned');
+  });
+
+  describe('F-92 b: the intent of every Auth write is on the trail BEFORE the write', () => {
+    const update = (
+      world: ReturnType<typeof worldWithTwoClients>,
+      disabled: boolean,
+      notices: ClientUserNotice[] = [],
+    ) =>
+      updateClientUser(deps(world, notices), ceoPrincipal, {
+        clientId: CLIENT_A,
+        userId: USER_A1,
+        disabled,
+      });
+
+    it('disabling: database, then the intent of the ban, then the ban', async () => {
+      const world = worldWithTwoClients();
+
+      await update(world, true);
+
+      expect(
+        world.calls.filter((call) => ['setDisabled', 'beginAuthWrite', 'setBanned'].includes(call)),
+      ).toEqual(['setDisabled', 'beginAuthWrite', 'setBanned']);
+      expect(world.intents).toEqual([{ userId: USER_A1, action: 'ban' }]);
+      expect(world.records.get(USER_A1)?.audit).toEqual(['account.disabled', 'account.ban_intent']);
+    });
+
+    it('re-enabling: the intent of the unban, then the unban, then the database', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.calls.length = 0;
+
+      await update(world, false);
+
+      expect(
+        world.calls.filter((call) => ['setDisabled', 'beginAuthWrite', 'setBanned'].includes(call)),
+      ).toEqual(['beginAuthWrite', 'setBanned', 'setDisabled']);
+      expect(world.intents.at(-1)).toEqual({ userId: USER_A1, action: 'unban' });
+      expect(world.records.get(USER_A1)?.audit).toEqual([
+        'account.disabled',
+        'account.ban_intent',
+        'account.unban_intent',
+        'account.enabled',
+      ]);
+    });
+
+    it('the intent names the client of the path and the login, never anything the body carried', async () => {
+      const world = worldWithTwoClients();
+      const seen: unknown[][] = [];
+      const users = {
+        ...world.users,
+        beginAuthWrite: (...args: Parameters<typeof world.users.beginAuthWrite>) => {
+          seen.push(args);
+          return world.users.beginAuthWrite(...args);
+        },
+      };
+
+      await updateClientUser({ ...deps(world), users }, ceoPrincipal, {
+        clientId: CLIENT_A,
+        userId: USER_A1,
+        disabled: true,
+      });
+
+      expect(seen).toEqual([[CLIENT_A, USER_A1, 'ban']]);
+    });
+
+    it('an intent that cannot be recorded for an unban: the Auth server is not touched, the login stays disabled and banned, and the answer is the error of the record', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.refuseNext('beginAuthWrite', new ForbiddenError('denied'));
+
+      const result = await update(world, false);
+
+      expect(!result.ok && result.error).toBeInstanceOf(ForbiddenError);
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: true });
+      expect(world.calls.filter((call) => call === 'setBanned')).toHaveLength(1);
+      expect(world.calls.filter((call) => call === 'setDisabled')).toHaveLength(1);
+    });
+
+    it('an outage of the record of the unban intent is a 503 and the Auth server is not touched either', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.failNext('beginAuthWrite');
+
+      await expect(update(world, false)).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: true });
+      expect(world.calls.filter((call) => call === 'setBanned')).toHaveLength(1);
+    });
+
+    it.each([
+      [
+        'an outage',
+        (world: ReturnType<typeof worldWithTwoClients>) => world.failNext('beginAuthWrite'),
+      ],
+      [
+        'a refusal',
+        (world: ReturnType<typeof worldWithTwoClients>) =>
+          world.refuseNext('beginAuthWrite', new ForbiddenError('denied')),
+      ],
+    ])(
+      'an intent of the ban that cannot be recorded (%s): the login is disabled in the database, the Auth server is NOT called, and the ban is reported as not_audited, in a 200',
+      async (_label, breakIt) => {
+        const world = worldWithTwoClients();
+        const notices: ClientUserNotice[] = [];
+        breakIt(world);
+
+        const result = await update(world, true, notices);
+
+        expect(result.ok && result.value.disabled).toBe(true);
+        expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: false });
+        expect(world.calls).not.toContain('setBanned');
+        expect(notices).toEqual([{ kind: 'ban_failed', reason: 'not_audited' }]);
+      },
+    );
+
+    it('repeating the disable after a not_audited ban records the intent and sets the ban', async () => {
+      const world = worldWithTwoClients();
+      world.failNext('beginAuthWrite');
+      await update(world, true);
+
+      const notices: ClientUserNotice[] = [];
+      await update(world, true, notices);
+
+      expect(notices).toEqual([]);
+      expect(world.records.get(USER_A1)?.banned).toBe(true);
+      expect(world.intents).toEqual([{ userId: USER_A1, action: 'ban' }]);
+    });
+
+    it('a bug in the record of the intent (not an outage, not a refusal) is thrown after the database disabled the login, like a bug in the ban', async () => {
+      const world = worldWithTwoClients();
+      world.failNext('beginAuthWrite', 1, new TypeError('a bug'));
+
+      await expect(update(world, true)).rejects.toBeInstanceOf(TypeError);
+
+      expect(world.records.get(USER_A1)?.disabled).toBe(true);
+      expect(world.calls).not.toContain('setBanned');
+    });
+
+    it('E-56: the ban put back after a failed re-enable records its own intent first', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.failNext('setDisabled', 1);
+      const notices: ClientUserNotice[] = [];
+
+      await expect(update(world, false, notices)).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(notices).toEqual([{ kind: 'reban_after_failed_enable', rebanned: true }]);
+      expect(world.intents.map((intent) => intent.action)).toEqual(['ban', 'unban', 'ban']);
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: true });
+    });
+
+    it('E-56: when the intent of the ban put back cannot be recorded, the ban is not put back and it is reported as not_audited (the database still blocks the login)', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.failNext('setDisabled', 1);
+      const notices: ClientUserNotice[] = [];
+      // the unban's own intent works; the next intent (the ban put back) does not
+      let calls = 0;
+      const users = {
+        ...world.users,
+        beginAuthWrite: (...args: Parameters<typeof world.users.beginAuthWrite>) => {
+          calls += 1;
+          if (calls === 2) return Promise.reject(new ServiceUnavailableError('down'));
+          return world.users.beginAuthWrite(...args);
+        },
+      };
+
+      await expect(
+        updateClientUser({ ...deps(world, notices), users }, ceoPrincipal, {
+          clientId: CLIENT_A,
+          userId: USER_A1,
+          disabled: false,
+        }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(notices).toEqual([
+        { kind: 'reban_after_failed_enable', rebanned: false, reason: 'not_audited' },
+      ]);
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: false });
+    });
+
+    it('a rename alone writes no intent and does not touch the Auth server', async () => {
+      const world = worldWithTwoClients();
+
+      await updateClientUser(deps(world), ceoPrincipal, {
+        clientId: CLIENT_A,
+        userId: USER_A1,
+        displayName: 'Outro Nome',
+      });
+
+      expect(world.intents).toEqual([]);
+      expect(world.calls).not.toContain('beginAuthWrite');
+      expect(world.calls).not.toContain('setBanned');
+    });
+
+    it('enabling a login that is already enabled records no intent: nothing is written to the Auth server', async () => {
+      const world = worldWithTwoClients();
+
+      await update(world, false);
+
+      expect(world.intents).toEqual([]);
+    });
   });
 });

@@ -32,8 +32,9 @@ const REQUIRE_CHANGE_ATTEMPTS = 2;
  * login a NEW temporary password (20 characters, CSPRNG) and hands it back once. A user that is not a
  * login of THAT client is 404 (E-19).
  *
- * The order is the one of spec §3.4 and it is not negotiable: the password is stored in the Auth server
- * FIRST, and only then does `require_password_change` run, which records the baseline of the NEW hash
+ * The order is the one of spec §3.4 and it is not negotiable: the intent of the Auth write is recorded
+ * (`begin_client_login_admin`, F-92 b: fail closed, nothing is stored when it is not), the password is
+ * stored in the Auth server, and only then does `require_password_change` run, which records the baseline of the NEW hash
  * (restarting the 72 h, F-70), sets `CHANGE_PASSWORD` and deletes every session of the user (AC-14). The
  * other order would leave the old password working until the Auth call, and the baseline would prove a
  * "change" the user never made.
@@ -59,6 +60,11 @@ export async function resetClientUserPassword(
 
   const target = await findClientLogin(deps.users, input.clientId, input.userId);
   if (!target.ok) return target;
+
+  // The intent is on the audit trail BEFORE the Auth server is touched (F-92 b). When it cannot be
+  // recorded, the answer is the error of the record (403, 404, 503) and the old password still works.
+  const begun = await deps.users.beginAuthWrite(input.clientId, input.userId, 'set_password');
+  if (!begun.ok) return begun;
 
   const temporaryPassword = (deps.generatePassword ?? generateTemporaryPassword)();
   const stored = await deps.accounts.setPassword(input.userId, temporaryPassword);
