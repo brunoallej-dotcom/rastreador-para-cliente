@@ -1,6 +1,6 @@
 # ADR 0006 — Privilégios mínimos do `service_role` no banco
 
-- **Status:** accepted
+- **Status:** accepted; o item do DML de fixtures foi revogado pelo [ADR 0016](0016-endurecimento-do-banco-da-onda-10-1.md)
 - **Data:** 2026-11-16
 
 ## Contexto

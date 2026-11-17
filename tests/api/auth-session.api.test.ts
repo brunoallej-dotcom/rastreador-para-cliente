@@ -10,6 +10,7 @@ import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import type { Database } from '@/shared/db/database.types';
 import { timing } from '@/shared/http/response-floor';
 import { expectToMatchContract } from '../helpers/contract';
+import { markPasswordPendingFixture } from '../helpers/db';
 import {
   ceoAal2Client,
   createClient,
@@ -32,6 +33,8 @@ import {
   writeSessionCookie,
   type CookieStore,
 } from '../helpers/http';
+import { verifyTotpViaApi } from '../helpers/mfa';
+import { changePassword } from '../helpers/password';
 
 const SESSION_COOKIE = '__Host-rt-session';
 /** ADR 0009 and spec SEC-07: a session lives at most 12 hours. */
@@ -578,9 +581,52 @@ describe('GET /api/v1/auth/session', () => {
     expect(body).toMatchObject({
       aal: 'aal1',
       client: null,
-      // the temporary password is still unchanged, and the factor is verified but not used yet
+      // the password was changed at the first access (before the factor, as production requires): the
+      // factor is verified but not used yet
+      pendingActions: ['VERIFY_MFA'],
+    });
+  });
+
+  it('AC-26: a CEO that already has a verified factor and gets the temporary password again has CHANGE_PASSWORD and VERIFY_MFA pending, in that priority', async () => {
+    const { ceo } = await ceoAal2Client();
+    await markPasswordPendingFixture(ceo.id); // what the operator's password reset will do (F-41, Wave 11)
+    const jar = await signIn(ceo);
+
+    const response = await getSession(jar);
+    const body = await bodyOf(response);
+
+    expect(response.status).toBe(200);
+    expectToMatchContract('getSession', 200, body, response);
+    expect(body).toMatchObject({
+      aal: 'aal1',
+      client: null,
       pendingActions: ['CHANGE_PASSWORD', 'VERIFY_MFA'],
     });
+  });
+
+  it('F-110: a CEO that has the verified factor and the temporary password again is stuck at the BFF: the verify wants CHANGE_PASSWORD done and the password change wants VERIFY_MFA done', async () => {
+    const { ceo } = await ceoAal2Client();
+    await markPasswordPendingFixture(ceo.id);
+    const jar = await signIn(ceo);
+
+    // the authorization comes before the body is looked at, so a code that is not a real one is enough
+    const verify = await verifyTotpViaApi(jar, { code: '000000' });
+    const verifyBody = await bodyOf(verify);
+    const change = await changePassword(jar, {
+      currentPassword: ceo.password,
+      newPassword: `Next-${ceo.id}-0123456789`,
+    });
+    const changeBody = await bodyOf(change);
+
+    expectToMatchContract('verifyTotp', verify.status, verifyBody, verify);
+    expect([verify.status, (verifyBody as { code: string }).code]).toEqual([
+      403,
+      'PASSWORD_CHANGE_REQUIRED',
+    ]);
+    expect([change.status, (changeBody as { code: string }).code]).toEqual([
+      403,
+      'MFA_VERIFICATION_REQUIRED',
+    ]);
   });
 
   it('AC-26: without a cookie it is 401 UNAUTHENTICATED, per the contract', async () => {

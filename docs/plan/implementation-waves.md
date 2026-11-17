@@ -19,7 +19,7 @@
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
-| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 ```
@@ -430,10 +430,32 @@ tempo):
   - BAIXOs do security-scan:
     - OTP de e-mail mais curto no `config.toml` (`max_frequency` e `otp_expiry`);
     - headers `Cross-Origin-Opener-Policy` e `Cross-Origin-Resource-Policy`.
+- **Herdados da Onda 10.1** (threat model, revisão de 2026-11-17):
+  - **T-53 e T-54:** trigger em `auth.users`, com `AFTER UPDATE OF encrypted_password,
+    banned_until` e `AFTER DELETE`, que grava o efeito observado (`account.auth_*`) numa função
+    `SECURITY DEFINER`. Vem com alerta quando não há intenção correspondente
+    (`begin_client_login_admin`) e entra no runbook de rotação da secret key. Hoje quem tem a
+    secret key ainda troca a senha de um login ativo pela Admin API do Auth e lê aquele tenant
+    pelo RLS, sem linha em `audit_events`.
+  - **F-110 e F-115:** um CEO que tem o fator TOTP e recebe de novo uma senha temporária fica
+    sem saída no BFF. Isso também acontece se ele cadastrar um fator nativo do GoTrue direto. O
+    script de reset de senha de CEO precisa resolver esse caso, e `mark_password_changed` e
+    `current_principal` devem contar só fatores provados pelo backend.
+  - **F-113:** pré-autorizar, na intenção de desbanir, o ban de compensação, para que ele rode
+    mesmo com o banco fora do ar.
+  - **F-114:** gravar `account.provision_intent` antes do `createUser`, para que a reversão não
+    dependa de um `is_ceo()` que acabou de falhar. Hoje esse ramo deixa um órfão recuperável e
+    responde 503.
+  - **F-118:** consulta de detecção de logins sem evento de origem.
+  - **F-119 e F-112:**
+    - leituras de operação nas tabelas de rastreamento por funções `SECURITY DEFINER`
+      auditadas, ou por um papel `NOLOGIN` concedido sob demanda;
+    - conferir `pg_default_acl` no projeto hospedado;
+    - decidir o SELECT residual do `service_role` em `profiles`, `audit_events` e
+      `default_stage_template`.
 - Candidatos de implementação:
-  - `pg_cron` que apaga as sessões que `session_is_alive()` já nega;
-  - trigger que detecta troca de senha feita direto no Auth.
-- **Depende de / paralela com**: 7, 9, 10 / —.
+  - `pg_cron` que apaga as sessões que `session_is_alive()` já nega.
+- **Depende de / paralela com**: 7, 9, 10, 10.1 / —.
 - **Critérios de aceite**: AC-30 completo; k6 dentro do RNF-02; ZAP sem alertas High;
   `GET https://<domínio>/api/v1/health` → 200; `security-scan` sem achados críticos ou altos;
   runbooks revisados.

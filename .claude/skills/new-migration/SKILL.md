@@ -31,8 +31,11 @@ Migration: $ARGUMENTS
   nunca `INSERT` direto em `audit_events` (nem a secret key tem esse privilégio).
 - Privilégios: os defaults (Onda 2) já tiram tudo de `anon`, `authenticated` e, em funções, de
   `service_role`; conceda explicitamente só o necessário (`GRANT SELECT … TO authenticated`,
-  `GRANT EXECUTE … TO authenticated`). Tabela nova que não é fixture de teste: também
-  `REVOKE INSERT, UPDATE, DELETE, TRUNCATE … FROM service_role`.
+  `GRANT EXECUTE … TO authenticated`). Tabela nova: `REVOKE ALL … FROM anon, authenticated,
+  service_role` e depois só o `GRANT SELECT … TO authenticated` (a secret key não tem privilégio
+  algum em tabela de negócio, ADR 0016; o padrão do dono das migrations já não concede nada a ela,
+  mas o `REVOKE` explícito não custa e o pgTAP 019 confere). Toda relação de `public` é do `postgres`:
+  o privilégio padrão revogado é o dele.
 - Texto visível (nomes, títulos): mesma regra dos CHECKs existentes, copie a classe exatamente de
   `supabase/migrations/20261115223625_identity_core.sql` (controle + formatação Unicode, E-30),
   sempre com escapes `\uXXXX`/`\UXXXXXXXX`, nunca caracteres invisíveis literais.

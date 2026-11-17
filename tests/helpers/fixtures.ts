@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { createClient as createSupabaseClient, type SupabaseClient } from '@supabase/supabase-js';
 import * as OTPAuth from 'otpauth';
 import type { Database } from '@/shared/db/database.types';
+import { insertClientFixture } from './db';
 
 type Env = 'SUPABASE_URL' | 'SUPABASE_PUBLISHABLE_KEY' | 'SUPABASE_SECRET_KEY';
 
@@ -73,15 +74,13 @@ export async function authUserExists(email: string): Promise<boolean> {
 
 export type FixtureClient = { readonly id: string; readonly name: string };
 
-/** A tenant. The secret key keeps DML on `public.clients` for fixtures (spec §4.2). */
+/**
+ * A tenant, inserted as the operator (psql in the database container, `tests/helpers/db.ts`): the secret
+ * key has no privilege on `public.clients` any more (F-81, spec §4.2).
+ */
 export async function createClient(name = `Cliente ${shortId()}`): Promise<FixtureClient> {
-  const { data, error } = await adminClient()
-    .from('clients')
-    .insert({ name })
-    .select('id, name')
-    .single();
-  if (error) throw new Error(`createClient failed: ${error.message}`);
-  return { id: data.id, name: data.name };
+  const { id } = await insertClientFixture(name);
+  return { id, name };
 }
 
 export type FixtureUser = {
@@ -229,6 +228,37 @@ export async function directAal2Session(
   };
 }
 
+/** A fresh password of 40 characters for the definitive password of a first access. */
+const newPassword = () => `Pw2-${randomUUID()}`;
+
+/**
+ * Clears the `CHANGE_PASSWORD` pending of a CEO the way production's database function requires:
+ * the password is changed in Auth (here through the Auth Admin API, with the secret key), the user
+ * signs in with the new one, and `mark_password_changed()` runs AS THAT USER. It proves the change
+ * against the baseline hash (spec §3.7, ADR 0007), and an `aal1` session is enough as long as the
+ * CEO has no verified factor.
+ *
+ * It exists because `POST /auth/password` is Wave 4's endpoint. Returns the user with the new
+ * password, which is the one to log in with from now on. It also comes first in the fixtures that
+ * enroll a factor: a CEO with the temporary password still pending is not a CEO to the database (F-83).
+ */
+export async function completeFirstAccess(ceo: FixtureUser): Promise<FixtureUser> {
+  const password = newPassword();
+  const updated = await adminClient().auth.admin.updateUserById(ceo.id, { password });
+  if (updated.error) throw new Error(`updateUserById failed: ${updated.error.message}`);
+
+  const asUser = publishableClient();
+  const signedIn = await asUser.auth.signInWithPassword({ email: ceo.email, password });
+  if (signedIn.error)
+    throw new Error(`sign-in with the new password failed: ${signedIn.error.message}`);
+
+  const marked = await asUser.rpc('mark_password_changed');
+  if (marked.error) throw new Error(`mark_password_changed failed: ${marked.error.message}`);
+
+  await asUser.auth.signOut({ scope: 'local' });
+  return { ...ceo, password };
+}
+
 /**
  * Signs a fresh CEO in with supabase-js, enrolls TOTP, computes the code from the secret Supabase
  * returns, then challenges and verifies to reach `aal2`, and ATTESTS the session the way the backend
@@ -237,12 +267,13 @@ export async function directAal2Session(
  * functions (`set_account_disabled`...) as a fixture: not even the secret key can update `profiles`
  * (by design), so a disabled account has to be made the way production makes it.
  *
- * The CEO keeps the temporary password (`CHANGE_PASSWORD` pending), which the backend routes do not
- * allow past the verification: that is why this fixture does not call them. The API-level helper that
- * goes through the routes is `loginAsCeoWithMfa` in `mfa.ts`.
+ * The CEO completes its first access first (`completeFirstAccess`), as in production, where the backend
+ * routes refuse the enrollment while `CHANGE_PASSWORD` is pending: since Wave 10.1 a CEO with the
+ * temporary password is not a CEO to the database even with an attested session (F-83). The API-level
+ * helper that goes through the routes is `loginAsCeoWithMfa` in `mfa.ts`.
  */
 export async function ceoAal2Client(init: UserInit = {}): Promise<CeoAal2> {
-  const ceo = await createCeo(init);
+  const ceo = await completeFirstAccess(await createCeo(init));
   const supabase = publishableClient();
 
   const signIn = await supabase.auth.signInWithPassword({

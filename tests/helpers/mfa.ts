@@ -11,12 +11,11 @@
 //
 // Test code only: it uses the secret key (to set a password) and nothing here may be imported by
 // `src/`.
-import { randomUUID } from 'node:crypto';
 import * as OTPAuth from 'otpauth';
 import { POST as loginRoute } from '@/app/api/v1/auth/login/route';
 import { POST as enrollRoute } from '@/app/api/v1/auth/mfa/totp/enroll/route';
 import { POST as verifyRoute } from '@/app/api/v1/auth/mfa/totp/verify/route';
-import { adminClient, createCeo, publishableClient, type FixtureUser } from './fixtures';
+import { adminClient, completeFirstAccess, createCeo, type FixtureUser } from './fixtures';
 import { bodyOf, createCookieStore, invoke, type CookieStore } from './http';
 
 const TOTP_PERIOD_SECONDS = 30;
@@ -94,35 +93,9 @@ export function wrongTotpCode(secret: string, index = 0): string {
   throw new Error('unreachable: at most five of a million codes are forbidden');
 }
 
-/** A fresh password of 40 characters: past the 12-character minimum, within 72 bytes. */
-const newPassword = () => `Pw2-${randomUUID()}`;
-
-/**
- * Clears the `CHANGE_PASSWORD` pending of a CEO the way production's database function requires:
- * the password is changed in Auth (here through the Auth Admin API, with the secret key), the user
- * signs in with the new one, and `mark_password_changed()` runs AS THAT USER. It proves the change
- * against the baseline hash (spec §3.7, ADR 0007), and an `aal1` session is enough as long as the
- * CEO has no verified factor.
- *
- * It exists because `POST /auth/password` is Wave 4's endpoint. Returns the user with the new
- * password, which is the one to log in with from now on.
- */
-export async function completeFirstAccess(ceo: FixtureUser): Promise<FixtureUser> {
-  const password = newPassword();
-  const updated = await adminClient().auth.admin.updateUserById(ceo.id, { password });
-  if (updated.error) throw new Error(`updateUserById failed: ${updated.error.message}`);
-
-  const asUser = publishableClient();
-  const signedIn = await asUser.auth.signInWithPassword({ email: ceo.email, password });
-  if (signedIn.error)
-    throw new Error(`sign-in with the new password failed: ${signedIn.error.message}`);
-
-  const marked = await asUser.rpc('mark_password_changed');
-  if (marked.error) throw new Error(`mark_password_changed failed: ${marked.error.message}`);
-
-  await asUser.auth.signOut({ scope: 'local' });
-  return { ...ceo, password };
-}
+// `completeFirstAccess` lives in `fixtures.ts` (`ceoAal2Client` needs it too, and this file imports that one):
+// the same function, still importable from here.
+export { completeFirstAccess };
 
 /** `POST /auth/login` through the real route. Fails the helper (not the assertion) unless 200. */
 export async function loginViaApi(

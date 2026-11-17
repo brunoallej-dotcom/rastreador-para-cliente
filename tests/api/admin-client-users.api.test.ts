@@ -36,9 +36,11 @@ import { expectToMatchContract } from '../helpers/contract';
 import { agePasswordBaseline } from '../helpers/db';
 import {
   adminClient,
+  ceoAal2Client,
   createClient,
   createClientUser,
   createCeo,
+  publishableClient,
   type FixtureUser,
 } from '../helpers/fixtures';
 import {
@@ -542,7 +544,15 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
 
     expect([first.status, again.status, enable.status]).toEqual([200, 200, 200]);
     const trail = await managementTrail(login.id);
-    expect(trail.map((row) => row.action)).toEqual(['account.disabled', 'account.enabled']);
+    // the database events are written once each; every write to the Auth server records its intent first
+    // (F-92 b): the ban of each disable, and the unban of the enable
+    expect(trail.map((row) => row.action)).toEqual([
+      'account.disabled',
+      'account.ban_intent',
+      'account.ban_intent',
+      'account.unban_intent',
+      'account.enabled',
+    ]);
     expect(trail[0]).toMatchObject({
       actor_id: ceo.ceo.id,
       actor_role: 'ceo',
@@ -618,9 +628,12 @@ describe('PATCH /admin/clients/{clientId}/users/{userId} (updateClientUser)', ()
     });
     expect(repeated.status).toBe(200);
     expect(await isBannedInAuth(login.id)).toBe(true);
-    // the repeat changed no state in the database: still one event
+    // the repeat changed no state in the database: still one `account.disabled`; each try of the ban wrote
+    // its own intent (F-92 b)
     expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
       'account.disabled',
+      'account.ban_intent',
+      'account.ban_intent',
     ]);
   });
 
@@ -894,13 +907,24 @@ describe('POST /admin/clients/{clientId}/users/{userId}/password-reset (resetCli
     await expectContract('resetClientUserPassword', response);
 
     const trail = await managementTrail(login.id);
-    expect(trail.map((row) => row.action)).toEqual(['account.password_reset']);
-    expect(trail[0]).toMatchObject({
-      actor_id: ceo.ceo.id,
-      actor_role: 'ceo',
-      client_id: tenant.id,
-      request_id: response.headers.get('x-request-id'),
-    });
+    // the login was made by a fixture, so it never had `account.provisioned`: the reset registers it, late
+    // (F-93), after the intent of the Auth write (F-92 b) and before its own event
+    expect(trail.map((row) => row.action)).toEqual([
+      'account.password_set_intent',
+      'account.provisioned',
+      'account.password_reset',
+    ]);
+    for (const row of trail) {
+      expect(row).toMatchObject({
+        actor_id: ceo.ceo.id,
+        actor_role: 'ceo',
+        client_id: tenant.id,
+        request_id: response.headers.get('x-request-id'),
+      });
+    }
+    expect(trail[0]?.metadata).toEqual({ action: 'set_password' });
+    expect(trail[1]?.metadata).toEqual({ late: true });
+    expect(JSON.stringify(trail)).not.toContain(login.email);
   });
 
   it('AC-14: the user changes the temporary password of a reset with POST /auth/password: the baseline is the new hash (ADR 0007)', async () => {
@@ -1041,6 +1065,18 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       targetUserId: expect.stringMatching(/^[0-9a-f-]{36}$/) as string,
     });
     expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
+    // F-93: the account is gone, but its trail says it was taken back (`account.provision_reverted`, recorded
+    // BEFORE the deletion), with the CEO, the request id, the reason and no e-mail
+    const trail = await auditOfAccount(String(rolledBack?.['targetUserId']));
+    expect(trail.map((row) => row.action)).toEqual(['account.provision_reverted']);
+    expect(trail[0]).toMatchObject({
+      actor_id: ceo.ceo.id,
+      actor_role: 'ceo',
+      client_id: tenant.id,
+      request_id: response.headers.get('x-request-id'),
+      metadata: { reason: 'record_failed' },
+    });
+    expect(JSON.stringify(trail)).not.toContain(email);
     // and the CEO can simply try again
     const retry = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
       email,
@@ -1095,6 +1131,11 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
     });
     const conflict = await expectContract<Problem>('provisionClientUser', again);
     expect([again.status, conflict.code]).toEqual([409, 'EMAIL_ALREADY_REGISTERED']);
+    // F-93: the reversal was recorded before the deletion that failed, and the account never got
+    // `account.provisioned` (the record failed)
+    expect((await auditOfAccount(orphan?.id ?? '')).map((row) => row.action)).toEqual([
+      'account.provision_reverted',
+    ]);
     // the documented recovery: reset the password, which hands over a usable one
     const reset = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, orphan?.id ?? '');
     const { temporaryPassword } = await expectContract<{ temporaryPassword: string }>(
@@ -1102,6 +1143,17 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
       reset,
     );
     expect(await statusOfSignIn(email, temporaryPassword)).toBe(200);
+    // F-93: and the reset that delivers the account registers the provisioning that was missing, late,
+    // between the intent of the Auth write and the event of the reset
+    const recovered = await auditOfAccount(orphan?.id ?? '');
+    expect(recovered.map((row) => row.action)).toEqual([
+      'account.provision_reverted',
+      'account.password_set_intent',
+      'account.provisioned',
+      'account.password_reset',
+    ]);
+    expect(recovered[2]?.metadata).toEqual({ late: true });
+    expect(recovered[2]?.request_id).toBe(reset.headers.get('x-request-id'));
   });
 
   /** The creation reaches Auth and WORKS; what the app never gets is the answer. */
@@ -1278,7 +1330,10 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
     expect(await canSignIn(login.email, login.password)).toBe(false);
     expect(await sessionStatus(cookies)).toBe(401);
     expect((await profileOf(login.id))?.must_change_password).toBe(false);
-    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([]);
+    // only the intent of the Auth write is on the trail: it was recorded before the password was stored
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.password_set_intent',
+    ]);
 
     const repeated = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
     const { temporaryPassword } = await expectContract<{ temporaryPassword: string }>(
@@ -1289,6 +1344,9 @@ describe('the leftovers of a failure in the middle (E-23, E-50, E-51)', () => {
     const session = await invoke(sessionRoute, { path: '/auth/session', cookies: jar });
     expect(await bodyOf(session)).toMatchObject({ pendingActions: ['CHANGE_PASSWORD'] });
     expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.password_set_intent',
+      'account.password_set_intent',
+      'account.provisioned',
       'account.password_reset',
     ]);
   });
@@ -1766,5 +1824,355 @@ describe('SEC-09: provisioning and resetting share one counter of 20 per hour pe
       displayName: 'Livre',
     });
     expect(update.status).toBe(200);
+  });
+});
+
+describe('F-92 b and F-93: the audit of what is written to the Auth server and of the compensation (Wave 10.1)', () => {
+  let ceo: CeoWithMfa;
+
+  beforeAll(async () => {
+    ceo = await ceoFixture('auth write audit');
+  });
+
+  /** Makes the requests whose URL holds `part` fail the way a dead network does. */
+  const failing = (part: string) =>
+    spyOnSupabaseFetch((url) => (url.includes(part) ? new TypeError('fetch failed') : undefined));
+
+  const authAdminCalls = (calls: readonly string[]) =>
+    calls.filter((call) => call.includes('/auth/v1/admin/users/'));
+
+  it('F-92 b: a reset records its intent BEFORE the password reaches the Auth server, with the CEO and the request id, and no secret', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    const spy = spyOnSupabaseFetch();
+    let response: Response;
+    try {
+      response = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
+    } finally {
+      spy.restore();
+    }
+    const body = await expectContract<{ temporaryPassword: string }>(
+      'resetClientUserPassword',
+      response,
+    );
+
+    const intent = spy.calls.findIndex((call) =>
+      call.includes('/rest/v1/rpc/begin_client_login_admin'),
+    );
+    const write = spy.calls.findIndex((call) => call.includes('/auth/v1/admin/users/'));
+    const mark = spy.calls.findIndex((call) =>
+      call.includes('/rest/v1/rpc/require_password_change'),
+    );
+    expect(intent).toBeGreaterThanOrEqual(0);
+    expect(intent).toBeLessThan(write);
+    expect(write).toBeLessThan(mark);
+    const [first] = await managementTrail(login.id);
+    expect(first).toMatchObject({
+      action: 'account.password_set_intent',
+      actor_id: ceo.ceo.id,
+      client_id: tenant.id,
+      request_id: response.headers.get('x-request-id'),
+      metadata: { action: 'set_password' },
+    });
+    expect(JSON.stringify(await auditOfAccount(login.id))).not.toContain(body.temporaryPassword);
+  });
+
+  it('F-92 b: a reset whose intent cannot be recorded does not touch the Auth server: 503, the old password still works, nothing on the trail', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    logged.lines.length = 0;
+    const spy = failing('/rest/v1/rpc/begin_client_login_admin');
+    let response: Response;
+    try {
+      response = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, login.id);
+    } finally {
+      spy.restore();
+    }
+
+    const body = await expectUnavailable('resetClientUserPassword', response);
+
+    expect(JSON.stringify(body)).not.toContain('temporaryPassword');
+    expect(authAdminCalls(spy.calls)).toEqual([]);
+    expect(await canSignIn(login.email, login.password)).toBe(true);
+    expect((await profileOf(login.id))?.must_change_password).toBe(false);
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([]);
+    expect(events('identity.client_user.reset_incomplete')).toHaveLength(0);
+  });
+
+  it('F-92 b: disabling records the intent of the ban after the database blocked the login and before the Auth server is told', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    const spy = spyOnSupabaseFetch();
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true });
+    } finally {
+      spy.restore();
+    }
+    await expectContract('updateClientUser', response);
+
+    const disabled = spy.calls.findIndex((call) =>
+      call.includes('/rest/v1/rpc/set_account_disabled'),
+    );
+    const intent = spy.calls.findIndex((call) =>
+      call.includes('/rest/v1/rpc/begin_client_login_admin'),
+    );
+    const ban = spy.calls.findIndex((call) => call.includes('/auth/v1/admin/users/'));
+    expect(disabled).toBeLessThan(intent);
+    expect(intent).toBeLessThan(ban);
+    expect(await isBannedInAuth(login.id)).toBe(true);
+    expect((await managementTrail(login.id)).map((row) => [row.action, row.metadata])).toEqual([
+      ['account.disabled', {}],
+      ['account.ban_intent', { action: 'ban' }],
+    ]);
+  });
+
+  it('F-92 b: a disable whose ban intent cannot be recorded is still 200 (the database blocks the login) and the Auth server is NOT called: logged as ban_failed / not_audited', async () => {
+    const { tenant, login, cookies } = await tenantWithSignedInLogin();
+    logged.lines.length = 0;
+    const spy = failing('/rest/v1/rpc/begin_client_login_admin');
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true });
+    } finally {
+      spy.restore();
+    }
+    const body = await expectContract<ClientUserBody>('updateClientUser', response);
+
+    expect([response.status, body.disabled]).toEqual([200, true]);
+    expect(await sessionStatus(cookies)).toBe(401);
+    expect(authAdminCalls(spy.calls)).toEqual([]);
+    expect(await isBannedInAuth(login.id)).toBe(false);
+    expect(events('identity.client_user.ban_failed')[0]).toMatchObject({
+      level: 'error',
+      targetUserId: login.id,
+      reason: 'not_audited',
+    });
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.disabled',
+    ]);
+
+    // repeating the disable records the intent and sets the ban
+    const repeated = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+      disabled: true,
+    });
+    await expectContract('updateClientUser', repeated);
+    expect(repeated.status).toBe(200);
+    expect(await isBannedInAuth(login.id)).toBe(true);
+  });
+
+  it('F-92 b: an unban whose intent cannot be recorded is 503, the Auth server is not touched, and the login stays disabled and banned', async () => {
+    const { tenant, login } = await tenantWithSignedInLogin();
+    await expectContract(
+      'updateClientUser',
+      await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true }),
+    );
+    const spy = failing('/rest/v1/rpc/begin_client_login_admin');
+    let response: Response;
+    try {
+      response = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
+        disabled: false,
+      });
+    } finally {
+      spy.restore();
+    }
+
+    await expectUnavailable('updateClientUser', response);
+
+    expect(authAdminCalls(spy.calls)).toEqual([]);
+    expect(await isBannedInAuth(login.id)).toBe(true);
+    expect((await profileOf(login.id))?.disabled_at).not.toBeNull();
+    expect((await managementTrail(login.id)).map((row) => row.action)).toEqual([
+      'account.disabled',
+      'account.ban_intent',
+    ]);
+  });
+
+  it('F-92 b: the function straight through PostgREST: the right login is recorded, and another client, a CEO, an unknown action, a client login and anon are refused', async () => {
+    const { supabase, ceo: ceoUser } = await ceoAal2Client();
+    const mine = await tenantWithSignedInLogin();
+    const other = await tenantWithSignedInLogin();
+    const call = (clientId: string, userId: string, action: string) =>
+      supabase.rpc('begin_client_login_admin', {
+        p_client_id: clientId,
+        p_user_id: userId,
+        p_action: action,
+      });
+
+    const recorded = await call(mine.tenant.id, mine.login.id, 'unban');
+    expect(recorded.error).toBeNull();
+    const [row] = await managementTrail(mine.login.id);
+    expect(row).toMatchObject({
+      action: 'account.unban_intent',
+      actor_id: ceoUser.id,
+      client_id: mine.tenant.id,
+      metadata: { action: 'unban' },
+    });
+
+    // a login of ANOTHER client, a CEO, an unknown id: the same NOT_FOUND
+    for (const refused of [
+      await call(mine.tenant.id, other.login.id, 'ban'),
+      await call(other.tenant.id, mine.login.id, 'ban'),
+      await call(mine.tenant.id, ceoUser.id, 'ban'),
+      await call(mine.tenant.id, UNKNOWN_USER_ID, 'ban'),
+    ]) {
+      expect(refused.error).toMatchObject({ code: 'P0001', message: 'NOT_FOUND' });
+    }
+    // an action outside the list
+    for (const action of ['delete', 'create', '', 'BAN', 'ban ']) {
+      expect((await call(mine.tenant.id, mine.login.id, action)).error).toMatchObject({
+        code: 'P0001',
+        message: 'INVALID_INPUT',
+      });
+    }
+    // nothing but the one recorded intent reached the trail of either login
+    expect((await managementTrail(mine.login.id)).map((trail) => trail.action)).toEqual([
+      'account.unban_intent',
+    ]);
+    expect((await managementTrail(other.login.id)).map((trail) => trail.action)).toEqual([]);
+
+    // a client login, signed in, is not a CEO; and anon does not even execute it
+    const asClient = publishableClient();
+    const signIn = await asClient.auth.signInWithPassword({
+      email: mine.login.email,
+      password: mine.login.password,
+    });
+    expect(signIn.error).toBeNull();
+    const byClient = await asClient.rpc('begin_client_login_admin', {
+      p_client_id: mine.tenant.id,
+      p_user_id: mine.login.id,
+      p_action: 'ban',
+    });
+    expect(byClient.error).toMatchObject({ code: '42501' });
+    const anon = await publishableClient().rpc('begin_client_login_admin', {
+      p_client_id: mine.tenant.id,
+      p_user_id: mine.login.id,
+      p_action: 'ban',
+    });
+    expect(anon.error).toMatchObject({ code: '42501' });
+    expect((await managementTrail(mine.login.id)).map((trail) => trail.action)).toEqual([
+      'account.unban_intent',
+    ]);
+  });
+
+  it('F-93: the 201 of a provisioning comes from the record itself: the list is read once (before the creation), never after', async () => {
+    const tenant = await createClient();
+    let lists = 0;
+    // a second read of the list would fail: it must not even be made
+    const spy = spyOnSupabaseFetch((url) => {
+      if (!url.includes('/rest/v1/rpc/list_client_users')) return undefined;
+      lists += 1;
+      return lists > 1 ? new TypeError('fetch failed') : undefined;
+    });
+    let response: Response;
+    try {
+      response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+        email: uniqueLoginEmail('semrelida'),
+        displayName: 'Sem releitura',
+      });
+    } finally {
+      spy.restore();
+    }
+
+    const body = await expectContract<ProvisionedBody>('provisionClientUser', response);
+
+    expect([response.status, lists]).toEqual([201, 1]);
+    // the login in the answer is the one the list shows
+    const listed = await expectContract<ClientUserListBody>(
+      'listClientUsers',
+      await listClientUsersViaApi(ceo.cookies, tenant.id),
+    );
+    expect(listed.items).toEqual([body.user]);
+  });
+
+  it('F-117: a record whose ANSWER is lost but that did commit is on the trail: the reversal is refused, the account is NOT deleted (503, provision_orphaned) and the reset delivers it with no late event', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('registrada');
+    logged.lines.length = 0;
+
+    const lost = await whileWatching(
+      (method, path) =>
+        method === 'POST' && path === '/rest/v1/rpc/record_account_provisioned'
+          ? LOSE_ANSWER
+          : undefined,
+      async (traffic) => {
+        const response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+          email,
+          displayName: 'Registro sem resposta',
+        });
+        return { response, deletes: traffic.calls.filter((call) => call.startsWith('DELETE ')) };
+      },
+    );
+
+    await expectUnavailable('provisionClientUser', lost.response);
+    // the account stayed: nothing was deleted, and the reversal was refused by the database
+    expect(lost.deletes).toEqual([]);
+    expect(await loginsWithEmail(email)).toBe(1);
+    const [orphaned] = events('identity.client_user.provision_orphaned');
+    expect(orphaned).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      deleteFailure: { kind: 'VALIDATION_ERROR' },
+    });
+    const [orphan] = (
+      await expectContract<ClientUserListBody>(
+        'listClientUsers',
+        await listClientUsersViaApi(ceo.cookies, tenant.id),
+      )
+    ).items;
+    expect(orphaned?.['targetUserId']).toBe(orphan?.id);
+    // the record is kept and nothing says the provisioning was reverted
+    expect((await auditOfAccount(orphan?.id ?? '')).map((row) => row.action)).toEqual([
+      'account.provisioned',
+    ]);
+
+    // the CEO delivers the account by resetting it: the record exists, so no late registration
+    const reset = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, orphan?.id ?? '');
+    await expectContract('resetClientUserPassword', reset);
+    expect((await auditOfAccount(orphan?.id ?? '')).map((row) => row.action)).toEqual([
+      'account.provisioned',
+      'account.password_set_intent',
+      'account.password_reset',
+    ]);
+  });
+
+  it('F-93: the compensation is fail closed: when the reversal cannot be recorded the account is NOT deleted, 503, and the log says why (provision_orphaned)', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('semrastro');
+    logged.lines.length = 0;
+    const spy = spyOnSupabaseFetch((url) =>
+      url.includes('/rest/v1/rpc/record_account_provisioned') ||
+      url.includes('/rest/v1/rpc/record_account_provision_reverted')
+        ? new TypeError('fetch failed')
+        : undefined,
+    );
+    let response: Response;
+    try {
+      response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+        email,
+        displayName: 'Sem rastro',
+      });
+    } finally {
+      spy.restore();
+    }
+
+    await expectUnavailable('provisionClientUser', response);
+
+    // no deletion was even tried, and the account is where the CEO can recover it
+    expect(spy.calls.filter((call) => call.startsWith('DELETE '))).toEqual([]);
+    expect(await loginsWithEmail(email)).toBe(1);
+    const [orphaned] = events('identity.client_user.provision_orphaned');
+    expect(orphaned).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      deleteFailure: { kind: 'SERVICE_UNAVAILABLE' },
+    });
+    const [orphan] = (
+      await expectContract<ClientUserListBody>(
+        'listClientUsers',
+        await listClientUsersViaApi(ceo.cookies, tenant.id),
+      )
+    ).items;
+    expect(orphan).toMatchObject({ email, mustChangePassword: true });
+    // nothing at all on its trail: not provisioned, not reverted
+    expect(await auditOfAccount(orphan?.id ?? '')).toEqual([]);
+    expect(logged.lines.join('\n').toLowerCase()).not.toContain(email);
   });
 });

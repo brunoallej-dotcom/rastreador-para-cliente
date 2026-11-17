@@ -24,6 +24,11 @@ INSERT INTO public.clients (id, name, archived_at) VALUES
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000b1', 'client', '00000000-0000-4000-8000-00000000000b');
+-- os logins de A e de B são clientes plenamente ativos (senha definitiva): com a senha temporária o RLS não lê
+-- processo nem fase (F-83, arquivo 020), e aqui o que se prova é o isolamento entre clientes
+UPDATE public.profiles SET must_change_password = false WHERE id IN (
+  '00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000b1'
+);
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c2', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c3', 'ceo');
@@ -382,13 +387,15 @@ SELECT throws_ok(
 );
 SELECT tests.clear_authentication();
 
+-- Só o que ESTE arquivo escreveu: os processos dos clientes dele e a auditoria da transação dele (`now()` é o
+-- instante dele); o banco pode guardar os processos e a auditoria de outros testes.
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.processes $$,
+  $$ SELECT count(*)::int FROM public.processes WHERE client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c') $$,
   $$ VALUES (3) $$,
   'AC-08: nenhuma chamada negada criou processo (os 2 de fixture e o do controle positivo)'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action LIKE 'process.%' $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action LIKE 'process.%' AND occurred_at = now() $$,
   $$ VALUES (2) $$,
   'AC-08: nenhuma chamada negada gravou auditoria (só o controle positivo: criou e renomeou)'
 );
@@ -726,8 +733,10 @@ SELECT results_eq(
   'SEC-16: uma linha de auditoria por processo criado (e nenhuma por fase)'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action = 'process.created' $$,
-  $$ SELECT count(*)::int FROM public.processes WHERE id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2') $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action = 'process.created' AND occurred_at = now() $$,
+  $$ SELECT count(*)::int FROM public.processes
+      WHERE id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2')
+        AND client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c') $$,
   'SEC-16: cada processo criado pelas funções tem o seu process.created, e os recusados não deixaram nenhum'
 );
 SELECT is_empty(
@@ -1005,7 +1014,7 @@ SELECT tests.clear_authentication();
 
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT results_eq(
-  $$ SELECT count(DISTINCT client_id)::int FROM public.processes $$,
+  $$ SELECT count(DISTINCT client_id)::int FROM public.processes WHERE client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c') $$,
   $$ VALUES (2) $$,
   'AC-09: o CEO aal2 atestado lê os processos de todos os clientes'
 );
@@ -1115,13 +1124,15 @@ SELECT results_eq(
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.processes p
       WHERE NOT EXISTS (SELECT 1 FROM public.process_stages s WHERE s.process_id = p.id)
-        AND p.id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2') $$,
+        AND p.id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2')
+        AND p.client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c') $$,
   $$ VALUES (0) $$,
   'I1: nenhum processo criado pelas funções ficou sem fase'
 );
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.processes p
       WHERE p.id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2')
+        AND p.client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c')
         AND (SELECT count(*) FILTER (WHERE s.status = 'in_progress') FROM public.process_stages s WHERE s.process_id = p.id) <> 1
         AND p.status = 'active' $$,
   $$ VALUES (0) $$,
@@ -1130,6 +1141,7 @@ SELECT results_eq(
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.processes p
       WHERE p.id NOT IN ('00000000-0000-4000-8000-0000000001c1', '00000000-0000-4000-8000-0000000001c2')
+        AND p.client_id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000c')
         AND (SELECT max(s.position) <> count(*) OR min(s.position) <> 1 FROM public.process_stages s WHERE s.process_id = p.id) $$,
   $$ VALUES (0) $$,
   'I1: toda lista de fases criada pelas funções tem posições contíguas de 1 a n'

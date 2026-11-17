@@ -4,7 +4,11 @@
 --
 --   tests.create_user(id, role, client_id DEFAULT NULL, display_name DEFAULT NULL)
 --       cria o usuário em auth.users com raw_app_meta_data (o trigger cria o perfil) e uma
---       sessão em auth.sessions cujo id é o próprio id do usuário; devolve o id.
+--       sessão em auth.sessions cujo id é o próprio id do usuário; devolve o id. Um CEO já nasce com
+--       a senha DEFINITIVA (must_change_password = false), como depois do primeiro acesso: com a
+--       pendência, `is_ceo()` o recusa (F-83, Onda 10.1) e o fluxo real nunca atesta quem a tem. Um
+--       cliente nasce com a senha temporária pendente, como o trigger o cria; um teste que precisa de
+--       outro estado faz o UPDATE em public.profiles.
 --   tests.insert_auth_user(id, app_meta jsonb, user_meta jsonb DEFAULT '{}')
 --       só o INSERT em auth.users, para testar o trigger com metadados arbitrários.
 --   tests.verify_totp(user_id)      cria um fator TOTP verificado (has_verified_totp = true).
@@ -73,6 +77,9 @@ BEGIN
   );
   INSERT INTO auth.sessions (id, user_id, created_at, updated_at, aal)
   VALUES (p_id, p_id, now(), now(), 'aal1');
+  IF p_role = 'ceo' THEN
+    UPDATE public.profiles SET must_change_password = false WHERE id = p_id;
+  END IF;
   RETURN p_id;
 END;
 $$;

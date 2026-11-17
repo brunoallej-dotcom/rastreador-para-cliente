@@ -119,6 +119,8 @@ SELECT results_eq(
 );
 SELECT tests.clear_authentication();
 
+-- o CEO do primeiro acesso: com a senha temporária pendente (o helper entrega o CEO com a definitiva)
+UPDATE public.profiles SET must_change_password = true WHERE id = '00000000-0000-4000-8000-0000000000c1';
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal1');
 SELECT results_eq(
   $$ SELECT user_id, role::text, client_id, display_name, aal, has_verified_totp, must_change_password
@@ -127,6 +129,7 @@ SELECT results_eq(
   'current_principal: CEO sem fator TOTP devolve has_verified_totp = false e client_id nulo'
 );
 SELECT tests.clear_authentication();
+UPDATE public.profiles SET must_change_password = false WHERE id = '00000000-0000-4000-8000-0000000000c1';
 
 INSERT INTO auth.mfa_factors (id, user_id, friendly_name, factor_type, status, created_at, updated_at, secret)
 VALUES (gen_random_uuid(), '00000000-0000-4000-8000-0000000000c2', 'totp-pendente', 'totp', 'unverified', now(), now(), 'TESTSECRET');
@@ -382,7 +385,9 @@ SELECT results_eq(
   'mark_password_changed: evento de CEO tem actor_role ceo e client_id nulo'
 );
 
--- CEO com TOTP verificado precisa de aal2, mesmo com a senha trocada (c1 tem fator verificado).
+-- CEO com TOTP verificado precisa de aal2, mesmo com a senha trocada (c1 tem fator verificado). Como c1 volta a
+-- ter a senha temporária (o reset de um operador), a pendência existe de novo: o helper entrega o CEO com a definitiva.
+UPDATE public.profiles SET must_change_password = true WHERE id = '00000000-0000-4000-8000-0000000000c1';
 UPDATE auth.users SET encrypted_password = 'changed-1' WHERE id = '00000000-0000-4000-8000-0000000000c1';
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal1');
 SELECT throws_ok(

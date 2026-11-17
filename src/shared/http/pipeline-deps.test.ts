@@ -30,61 +30,70 @@ async function productionLimiter() {
   return getPipelineDeps().rateLimiter;
 }
 
-describe('production wiring of the rate limiter (pipeline-deps)', () => {
-  beforeEach(() => {
-    vi.stubEnv('APP_ORIGIN', 'http://localhost:3000');
-    vi.stubEnv('SUPABASE_URL', 'http://127.0.0.1:54321');
-    vi.stubEnv('SUPABASE_PUBLISHABLE_KEY', 'fake-publishable-key-for-unit-tests');
-    vi.stubEnv('SUPABASE_SECRET_KEY', 'fake-secret-key-for-unit-tests');
-    vi.stubEnv('RATE_LIMIT_KEY_SECRET', 'unit-test-only-rate-limit-key-not-a-real-value');
-    database.rateLimitHit.mockReset();
-    database.rateLimitHit.mockResolvedValue(ALLOWED);
-  });
+// The first test pays the cold import of the whole pipeline graph (env, Supabase clients, rate
+// limiter). With coverage instrumentation on a memory-tight machine that once took longer than the
+// 5 s default (2026-11-17), so the suite gets room for the import, not for the assertions.
+const COLD_IMPORT_TIMEOUT_MS = 30_000;
 
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('E-22: the `health` group never touches the database: it is counted in memory', async () => {
-    const limiter = await productionLimiter();
-
-    await expect(limiter.consume(keyFor('health'), ruleFor('health'))).resolves.toEqual({
-      allowed: true,
+describe(
+  'production wiring of the rate limiter (pipeline-deps)',
+  { timeout: COLD_IMPORT_TIMEOUT_MS },
+  () => {
+    beforeEach(() => {
+      vi.stubEnv('APP_ORIGIN', 'http://localhost:3000');
+      vi.stubEnv('SUPABASE_URL', 'http://127.0.0.1:54321');
+      vi.stubEnv('SUPABASE_PUBLISHABLE_KEY', 'fake-publishable-key-for-unit-tests');
+      vi.stubEnv('SUPABASE_SECRET_KEY', 'fake-secret-key-for-unit-tests');
+      vi.stubEnv('RATE_LIMIT_KEY_SECRET', 'unit-test-only-rate-limit-key-not-a-real-value');
+      database.rateLimitHit.mockReset();
+      database.rateLimitHit.mockResolvedValue(ALLOWED);
     });
 
-    expect(database.rateLimitHit).not.toHaveBeenCalled();
-  });
-
-  it('a database outage cannot turn the liveness probe into an undocumented 503', async () => {
-    database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
-    const limiter = await productionLimiter();
-
-    await expect(limiter.consume(keyFor('health'), ruleFor('health'))).resolves.toEqual({
-      allowed: true,
+    afterEach(() => {
+      vi.unstubAllEnvs();
     });
-  });
 
-  it('SEC-09: every other group goes to Postgres, keyed by an HMAC of the subject', async () => {
-    const limiter = await productionLimiter();
+    it('E-22: the `health` group never touches the database: it is counted in memory', async () => {
+      const limiter = await productionLimiter();
 
-    for (const group of ['login', 'writes', 'reads'] as const) {
-      await limiter.consume(keyFor(group), ruleFor(group));
-    }
+      await expect(limiter.consume(keyFor('health'), ruleFor('health'))).resolves.toEqual({
+        allowed: true,
+      });
 
-    expect(database.rateLimitHit).toHaveBeenCalledTimes(3);
-    const buckets = database.rateLimitHit.mock.calls.map(
-      ([input]) => (input as { bucket: string }).bucket,
-    );
-    expect(buckets[0]).toMatch(/^ip:login:[0-9a-f]{64}$/);
-    expect(buckets[1]).toMatch(/^ip:writes:[0-9a-f]{64}$/);
-    expect(buckets[2]).toMatch(/^ip:reads:[0-9a-f]{64}$/);
-    expect(buckets.join()).not.toContain('203.0.113.9');
-  });
+      expect(database.rateLimitHit).not.toHaveBeenCalled();
+    });
 
-  it('E-22: a database outage fails the other groups closed (the pipeline answers 503)', async () => {
-    database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
-    const limiter = await productionLimiter();
+    it('a database outage cannot turn the liveness probe into an undocumented 503', async () => {
+      database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
+      const limiter = await productionLimiter();
 
-    await expect(limiter.consume(keyFor('login'), ruleFor('login'))).rejects.toThrow();
-  });
-});
+      await expect(limiter.consume(keyFor('health'), ruleFor('health'))).resolves.toEqual({
+        allowed: true,
+      });
+    });
+
+    it('SEC-09: every other group goes to Postgres, keyed by an HMAC of the subject', async () => {
+      const limiter = await productionLimiter();
+
+      for (const group of ['login', 'writes', 'reads'] as const) {
+        await limiter.consume(keyFor(group), ruleFor(group));
+      }
+
+      expect(database.rateLimitHit).toHaveBeenCalledTimes(3);
+      const buckets = database.rateLimitHit.mock.calls.map(
+        ([input]) => (input as { bucket: string }).bucket,
+      );
+      expect(buckets[0]).toMatch(/^ip:login:[0-9a-f]{64}$/);
+      expect(buckets[1]).toMatch(/^ip:writes:[0-9a-f]{64}$/);
+      expect(buckets[2]).toMatch(/^ip:reads:[0-9a-f]{64}$/);
+      expect(buckets.join()).not.toContain('203.0.113.9');
+    });
+
+    it('E-22: a database outage fails the other groups closed (the pipeline answers 503)', async () => {
+      database.rateLimitHit.mockRejectedValue(new TypeError('fetch failed'));
+      const limiter = await productionLimiter();
+
+      await expect(limiter.consume(keyFor('login'), ruleFor('login'))).rejects.toThrow();
+    });
+  },
+);

@@ -122,15 +122,156 @@ describe('list', () => {
   });
 });
 
+describe('recordProvisioned', () => {
+  it('F-93: calls record_account_provisioned with the user id only and returns the login as the list shows it', async () => {
+    const { rpc, repository } = fakeSupabase(answer([row()]));
+
+    const result = await repository.recordProvisioned(USER_ID);
+
+    expect(rpc).toHaveBeenCalledWith('record_account_provisioned', { p_user_id: USER_ID });
+    expect(result.ok && result.value).toEqual({
+      id: USER_ID,
+      email: 'pessoa@cliente.test',
+      displayName: 'Maria',
+      disabled: false,
+      mustChangePassword: true,
+      lastSignInAt: null,
+      createdAt: new Date('2026-11-16T11:30:24.984Z'),
+    });
+  });
+
+  it.each([
+    ['no row', []],
+    ['two rows', [row(), row()]],
+    ['a row the schema does not understand', [row({ email: 42 })]],
+    ['no answer at all (the old function)', null],
+  ])('SEC-13: %s fails closed (500, not a guess)', async (_label, data) => {
+    const { repository } = fakeSupabase(answer(data));
+
+    await expect(repository.recordProvisioned(USER_ID)).rejects.toThrow(/not understood/);
+  });
+
+  it('a target that is not a client login is NotFound, a denied caller is Forbidden', async () => {
+    const notFound = await fakeSupabase(failure('P0001', 'NOT_FOUND')).repository.recordProvisioned(
+      USER_ID,
+    );
+    const denied = await fakeSupabase(failure('42501', 'FORBIDDEN')).repository.recordProvisioned(
+      USER_ID,
+    );
+
+    expect(!notFound.ok && notFound.error).toBeInstanceOf(NotFoundError);
+    expect(!denied.ok && denied.error).toBeInstanceOf(ForbiddenError);
+  });
+
+  it('INVALID_INPUT (the second record of a login) is a 400, a transport failure a 503', async () => {
+    const second = await fakeSupabase(
+      failure('P0001', 'INVALID_INPUT'),
+    ).repository.recordProvisioned(USER_ID);
+
+    expect(!second.ok && second.error).toBeInstanceOf(ValidationError);
+    await expect(
+      fakeSupabase(failure('', 'TypeError: fetch failed', 0)).repository.recordProvisioned(USER_ID),
+    ).rejects.toBeInstanceOf(ServiceUnavailableError);
+  });
+});
+
+describe('beginAuthWrite', () => {
+  it.each(['ban', 'unban', 'set_password'] as const)(
+    'F-92 b: calls begin_client_login_admin with the client, the login and the action %s',
+    async (action) => {
+      const { rpc, repository } = fakeSupabase(answer(null, 204));
+
+      const result = await repository.beginAuthWrite(CLIENT_ID, USER_ID, action);
+
+      expect(result.ok).toBe(true);
+      expect(rpc).toHaveBeenCalledWith('begin_client_login_admin', {
+        p_client_id: CLIENT_ID,
+        p_user_id: USER_ID,
+        p_action: action,
+      });
+    },
+  );
+
+  it('SEC-04: a denied caller is Forbidden and the bypass is logged', async () => {
+    const { repository, warn } = fakeSupabase(failure('42501', 'FORBIDDEN'));
+
+    const result = await repository.beginAuthWrite(CLIENT_ID, USER_ID, 'ban');
+
+    expect(!result.ok && result.error).toBeInstanceOf(ForbiddenError);
+    expect(warn).toHaveBeenCalledWith(
+      { event: 'authz.database_denied', operation: 'begin_client_login_admin' },
+      'authz.database_denied',
+    );
+  });
+
+  it('E-19: a login that is not one of this client is NotFound', async () => {
+    const { repository } = fakeSupabase(failure('P0001', 'NOT_FOUND'));
+
+    const result = await repository.beginAuthWrite(CLIENT_ID, USER_ID, 'set_password');
+
+    expect(!result.ok && result.error).toBeInstanceOf(NotFoundError);
+  });
+
+  it('F-86: INVALID_INPUT here is a defect of the app, never the CEO input: a 500 whose cause is only the code and the status', async () => {
+    const { repository } = fakeSupabase(failure('P0001', 'INVALID_INPUT', 400));
+
+    const error = (await repository
+      .beginAuthWrite(CLIENT_ID, USER_ID, 'ban')
+      .catch((caught: unknown) => caught)) as Error;
+
+    expect(error).not.toBeInstanceOf(ServiceUnavailableError);
+    expect(error).not.toBeInstanceOf(ValidationError);
+    expect(error.cause).toEqual({ code: 'P0001', status: 400 });
+  });
+
+  it.each([
+    ['a CHECK violation', '23514'],
+    ['a value that is too long', '22001'],
+  ])(
+    '%s is a defect of the app too: a 500, never a 400 or a 422 about the CEO',
+    async (_label, code) => {
+      const { repository } = fakeSupabase(failure(code, 'row with pessoa@cliente.test', 400));
+
+      const error = (await repository
+        .beginAuthWrite(CLIENT_ID, USER_ID, 'set_password')
+        .catch((caught: unknown) => caught)) as Error;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(ServiceUnavailableError);
+      expect(error).not.toBeInstanceOf(ValidationError);
+      expect(error.cause).toEqual({ code, status: 400 });
+    },
+  );
+
+  it('a deadlock is a 503 that is safe to repeat, a transport failure too', async () => {
+    for (const outcome of [
+      failure('40P01', 'deadlock detected', 500),
+      failure('', 'TypeError: fetch failed', 0),
+    ]) {
+      const { repository } = fakeSupabase(outcome);
+      await expect(repository.beginAuthWrite(CLIENT_ID, USER_ID, 'ban')).rejects.toBeInstanceOf(
+        ServiceUnavailableError,
+      );
+    }
+  });
+});
+
 describe.each([
-  ['recordProvisioned', 'record_account_provisioned', { p_user_id: USER_ID }],
   ['setDisabled', 'set_account_disabled', { p_user_id: USER_ID, p_disabled: true }],
   ['setDisplayName', 'set_account_display_name', { p_user_id: USER_ID, p_display_name: 'Nome' }],
   ['requirePasswordChange', 'require_password_change', { p_user_id: USER_ID }],
+  [
+    'recordProvisionReverted',
+    'record_account_provision_reverted',
+    { p_user_id: USER_ID, p_reason: 'record_failed' },
+  ],
 ] as const)('%s', (method, fn, args) => {
   const call = (repository: ReturnType<typeof fakeSupabase>['repository']) => {
     if (method === 'setDisabled') return repository.setDisabled(USER_ID, true);
     if (method === 'setDisplayName') return repository.setDisplayName(USER_ID, 'Nome');
+    if (method === 'recordProvisionReverted') {
+      return repository.recordProvisionReverted(USER_ID, 'record_failed');
+    }
     return repository[method](USER_ID);
   };
 

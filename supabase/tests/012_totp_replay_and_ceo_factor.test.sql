@@ -145,12 +145,12 @@ SELECT is(
 RESET ROLE;
 
 SELECT is(
-  (SELECT count(*)::integer FROM private.totp_code_uses),
+  (SELECT count(*)::integer FROM private.totp_code_uses u WHERE u.factor_id IN (SELECT f.factor_id FROM factor_of f)),
   2,
   'F-21: a tabela guarda um digest por código aceito (as recusas não gravam nada)'
 );
 SELECT is(
-  (SELECT bool_and(octet_length(code_digest) = 32) FROM private.totp_code_uses),
+  (SELECT bool_and(octet_length(u.code_digest) = 32) FROM private.totp_code_uses u WHERE u.factor_id IN (SELECT f.factor_id FROM factor_of f)),
   true,
   'F-21: o que é guardado é um digest de 32 bytes, nunca o código'
 );
@@ -177,7 +177,7 @@ SELECT throws_ok(
 );
 RESET ROLE;
 SELECT is(
-  (SELECT count(*)::integer FROM private.totp_code_uses),
+  (SELECT count(*)::integer FROM private.totp_code_uses u WHERE u.factor_id IN (SELECT f.factor_id FROM factor_of f)),
   2,
   'F-21: as tentativas sobre fator alheio ou inexistente não gravaram nada'
 );
@@ -240,7 +240,7 @@ SELECT is(
 );
 RESET ROLE;
 SELECT is(
-  (SELECT count(*)::integer FROM private.totp_code_uses),
+  (SELECT count(*)::integer FROM private.totp_code_uses u WHERE u.factor_id IN (SELECT f.factor_id FROM factor_of f)),
   1,
   'F-21: a chamada apagou as linhas vencidas do fator e gravou a nova (o outro digest sumiu)'
 );
@@ -274,7 +274,7 @@ RESET ROLE;
 DELETE FROM auth.mfa_factors f
  WHERE f.id = (SELECT factor_id FROM factor_of WHERE user_id = '00000000-0000-4000-8000-0000000000c1');
 SELECT is(
-  (SELECT count(*)::integer FROM private.totp_code_uses),
+  (SELECT count(*)::integer FROM private.totp_code_uses u WHERE u.factor_id IN (SELECT f.factor_id FROM factor_of f)),
   0,
   'F-21: remover o fator apaga os códigos registrados dele (ON DELETE CASCADE)'
 );
@@ -283,7 +283,7 @@ SELECT is(
 -- c2 tem aal2 e fator verificado: lê tudo
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c2', 'aal2');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients),
+  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
   1,
   'F-24: CEO aal2 com fator TOTP verificado lê os clientes'
 );
@@ -356,7 +356,7 @@ SELECT throws_ok(
 SELECT tests.reset_first_activation('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients),
+  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
   1,
   'F-24: depois do reset do operador e de um verify novo pelo backend, o CEO lê os clientes'
 );

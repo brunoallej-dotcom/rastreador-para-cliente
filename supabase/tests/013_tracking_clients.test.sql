@@ -6,7 +6,17 @@
 -- idempotência das mudanças e a auditoria gravada na mesma transação (ator, papel, recurso, cliente,
 -- request_id, sem PII).
 BEGIN;
-SELECT plan(143);
+SELECT plan(144);
+
+-- A tabela inteira como o dono a vê (SECURITY DEFINER), para comparar com o que o RLS dá ao CEO. Vive só nesta transação.
+CREATE FUNCTION tests.clients_count_all()
+RETURNS integer
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$ SELECT count(*)::integer FROM public.clients $$;
+GRANT EXECUTE ON FUNCTION tests.clients_count_all() TO anon, authenticated, service_role;
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A, B, D e E são os clientes das fixtures (A ativo, B arquivado há 3 dias, D e E ativos), com datas no
@@ -23,6 +33,9 @@ INSERT INTO public.clients (id, name, archived_at, created_at, updated_at) VALUE
    now() - interval '6 days', now() - interval '6 days');
 
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a1', 'client', '00000000-0000-4000-8000-00000000000a');
+-- o login de A é um cliente plenamente ativo (senha definitiva): com a senha temporária o RLS não lê o cliente
+-- dele (F-83, arquivo 020), e aqui o que se prova é o isolamento entre clientes
+UPDATE public.profiles SET must_change_password = false WHERE id = '00000000-0000-4000-8000-0000000000a1';
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c1', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c2', 'ceo');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000c3', 'ceo');
@@ -316,14 +329,16 @@ SELECT throws_ok(
 );
 SELECT tests.clear_authentication();
 
+-- Só o que ESTE arquivo escreveu (a mesma transação: `now()` é o instante dele, e as fixtures têm datas no passado):
+-- o banco pode guardar os clientes e a auditoria de outros testes.
 SELECT is_empty(
-  $$ SELECT id FROM public.audit_events WHERE action LIKE 'client.%' $$,
+  $$ SELECT id FROM public.audit_events WHERE action LIKE 'client.%' AND occurred_at = now() $$,
   'AC-08: nenhuma chamada negada gravou auditoria'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.clients $$,
-  $$ VALUES (4) $$,
-  'AC-08: nenhuma chamada negada criou cliente (só as 4 fixtures)'
+  $$ SELECT count(*)::int FROM public.clients WHERE created_at = now() $$,
+  $$ VALUES (0) $$,
+  'AC-08: nenhuma chamada negada criou cliente (as 4 fixtures têm data no passado)'
 );
 
 -- AC-11: CEO aal2 com fator verificado, criação ---------------------------------------------------------------
@@ -346,8 +361,8 @@ SELECT throws_ok(
 SELECT tests.clear_authentication();
 
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.clients $$,
-  $$ SELECT (4 + 1 + count(*))::int FROM good_names $$,
+  $$ SELECT count(*)::int FROM public.clients WHERE created_at = now() $$,
+  $$ SELECT (1 + count(*))::int FROM good_names $$,
   'AC-11: só os nomes válidos criaram cliente; os inválidos não deixaram linha'
 );
 SELECT results_eq(
@@ -361,7 +376,7 @@ SELECT results_eq(
   'SEC-16: create_client grava client.created com ator, papel, recurso, cliente e request_id'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action = 'client.created' $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action = 'client.created' AND occurred_at = now() $$,
   $$ SELECT (1 + count(*))::int FROM good_names $$,
   'SEC-16: uma linha de auditoria por cliente criado'
 );
@@ -468,9 +483,15 @@ SELECT throws_ok(
   '42501', NULL, 'SEC-04: CEO aal2 não faz DELETE direto em clients'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.clients $$,
+  $$ SELECT count(*)::int FROM public.clients
+      WHERE created_at = now() OR id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000d', '00000000-0000-4000-8000-00000000000e') $$,
   $$ SELECT (4 + 1 + count(*))::int FROM good_names $$,
   'AC-09: CEO aal2 lê todos os clientes (fixtures e criados)'
+);
+SELECT results_eq(
+  $$ SELECT count(*)::integer FROM public.clients $$,
+  $$ SELECT tests.clients_count_all() $$,
+  'AC-09: e o que o RLS dá ao CEO é a tabela inteira, a mesma contagem que o dono vê (sem filtro de fixture)'
 );
 SELECT tests.clear_authentication();
 
@@ -478,7 +499,7 @@ SELECT tests.clear_authentication();
 SELECT results_eq(
   $$ SELECT e.resource_id::text, e.action
        FROM public.audit_events e
-      WHERE e.action IN ('client.updated', 'client.archived', 'client.unarchived')
+      WHERE e.action IN ('client.updated', 'client.archived', 'client.unarchived') AND e.occurred_at = now()
       ORDER BY e.id $$,
   $$ VALUES ('00000000-0000-4000-8000-00000000000a', 'client.updated'),
             ('00000000-0000-4000-8000-00000000000a', 'client.archived'),
@@ -491,7 +512,7 @@ SELECT results_eq(
 SELECT is_empty(
   $$ SELECT e.id
        FROM public.audit_events e
-      WHERE e.action LIKE 'client.%'
+      WHERE e.action LIKE 'client.%' AND e.occurred_at = now()
         AND (e.actor_id IS DISTINCT FROM '00000000-0000-4000-8000-0000000000c1'::uuid
              OR e.actor_role IS DISTINCT FROM 'ceo'
              OR e.resource_type <> 'client'
@@ -520,7 +541,7 @@ SELECT is_empty(
   'AC-11: o estado final de A (arquivado) e de B (desarquivado) é o esperado'
 );
 SELECT results_eq(
-  $$ SELECT count(*)::int FROM public.audit_events WHERE action LIKE 'client.%' $$,
+  $$ SELECT count(*)::int FROM public.audit_events WHERE action LIKE 'client.%' AND occurred_at = now() $$,
   $$ SELECT (1 + count(*) + 6)::int FROM good_names $$,
   'SEC-16: as criações e 6 mudanças, nenhuma linha a mais'
 );

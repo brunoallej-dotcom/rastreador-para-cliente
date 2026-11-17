@@ -38,6 +38,7 @@ import {
 } from '../helpers/client-users';
 import { expectToMatchContract } from '../helpers/contract';
 import { POST as logoutRoute } from '@/app/api/v1/auth/logout/route';
+import { GET as sessionRoute } from '@/app/api/v1/auth/session/route';
 import {
   approveCurrentStageAsFixture,
   deleteProcessFixture,
@@ -54,7 +55,8 @@ import {
   type CookieStore,
 } from '../helpers/http';
 import { loginAsCeoWithMfa, type CeoWithMfa } from '../helpers/mfa';
-import { changePassword, sessionJarFor } from '../helpers/password';
+import { publishableClient } from '../helpers/fixtures';
+import { changePassword, jarOf, sessionJarFor } from '../helpers/password';
 import {
   createProcessOrFail,
   createProcessViaApi,
@@ -915,10 +917,59 @@ describe('who may read the client panel', () => {
       newPassword: `Panel-${randomUUID()}`,
     });
     expect(changed.status).toBe(204);
+    expectToMatchContract('changePassword', 204, undefined, changed);
     const opened = await listMyProcessesViaApi(jar);
     const body = await expectContract<MyProcessListBody>('listMyProcesses', opened);
     expect(opened.status).toBe(200);
     expect(idsOf(body.items)).toEqual(idsOf(a.processes));
+  });
+
+  it('F-83: straight through PostgREST, a client that still has the temporary password reads nothing of the tracking tables, its session still shows the client, and the same login reads after the change', async () => {
+    const created = await provisionOrFail(ceo.cookies, a.tenant.id);
+    const supabase = publishableClient();
+    const signIn = await supabase.auth.signInWithPassword({
+      email: created.user.email,
+      password: created.temporaryPassword,
+    });
+    if (signIn.error || signIn.data.session === null) throw new Error('sign-in fixture failed');
+    const jar = jarOf(signIn.data.session);
+
+    // the BFF still knows the principal and names the client: the first access and the change depend on it
+    const session = await invoke(sessionRoute, { path: '/auth/session', cookies: jar });
+    const sessionBody = await expectContract<{
+      client: { id: string; name: string } | null;
+      pendingActions: string[];
+    }>('getSession', session);
+    expect(session.status).toBe(200);
+    expect(sessionBody.client).toEqual({ id: a.tenant.id, name: a.tenant.name });
+    expect(sessionBody.pendingActions).toEqual(['CHANGE_PASSWORD']);
+
+    // ...but the same JWT, straight at PostgREST, gets no row of any tracking table, not its own client's
+    const processes = await supabase.from('processes').select('id');
+    const stages = await supabase.from('process_stages').select('id');
+    const clients = await supabase.from('clients').select('id');
+    const approvals = await supabase.from('stage_approvals').select('id');
+    expect([processes.error, stages.error, clients.error, approvals.error]).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect([processes.data, stages.data, clients.data, approvals.data]).toEqual([[], [], [], []]);
+
+    const changed = await changePassword(jar, {
+      currentPassword: created.temporaryPassword,
+      newPassword: `Panel-${randomUUID()}`,
+    });
+    expect(changed.status).toBe(204);
+    expectToMatchContract('changePassword', 204, undefined, changed);
+
+    // the pending password was the only difference: the same session now reads its own tenant, and only it
+    const after = await supabase.from('processes').select('id');
+    expect(after.error).toBeNull();
+    expect((after.data ?? []).map((row) => row.id).sort()).toEqual(idsOf(a.processes).sort());
+    const own = await supabase.from('clients').select('id');
+    expect(own.data).toEqual([{ id: a.tenant.id }]);
   });
 
   it('E-08: a login that a CEO disables is 401 on the next read, with the JWT still valid, and the other login of the client keeps reading', async () => {

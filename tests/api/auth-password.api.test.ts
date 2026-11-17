@@ -17,6 +17,7 @@ import { sessionIdOfToken } from '@/shared/db/session-cookies';
 import { json, withRoute } from '@/shared/http';
 import { timing } from '@/shared/http/response-floor';
 import { expectToMatchContract } from '../helpers/contract';
+import { markPasswordPendingFixture } from '../helpers/db';
 import {
   ceoAal2Client,
   createCeo,
@@ -429,6 +430,9 @@ describe('AC-06: the change of password', () => {
 
   it('AC-06: a CEO with a verified second factor changes the password on an aal2 session, and is then free', async () => {
     const { ceo, supabase } = await ceoAal2Client();
+    // the temporary password is back (an operator's reset, F-41) on a session that is already attested:
+    // `mark_password_changed` asks for the attestation, not for `is_ceo()`, so the change works
+    await markPasswordPendingFixture(ceo.id);
     const { data } = await supabase.auth.getSession();
     const jar = jarOf(data.session!);
     expect(((await bodyOf(await getSession(jar))) as SessionBody).pendingActions).toEqual([

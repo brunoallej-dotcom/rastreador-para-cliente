@@ -16,6 +16,7 @@ import {
 import type { Logger } from '@/shared/observability/logger';
 import type { Client, ClientListPosition, ClientPage, ClientPatch } from '../domain/client';
 import type { ClientRepository } from '../domain/client-repository';
+import { DATA_EXCEPTION_CLASS, invalidPosition, safeCause } from './database-errors';
 import { timestampSchema } from './timestamp-schema';
 
 /** Postgres: `insufficient_privilege`, what the database functions raise for a denied caller. */
@@ -24,8 +25,6 @@ const INSUFFICIENT_PRIVILEGE = '42501';
 const RAISE_EXCEPTION = 'P0001';
 const CHECK_VIOLATION = '23514';
 const STRING_DATA_RIGHT_TRUNCATION = '22001';
-/** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
-const DATA_EXCEPTION_CLASS = '22';
 const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
 /**
@@ -102,17 +101,6 @@ function parseRows(data: unknown): ClientWithCountsRow[] {
 
 const NEW_CLIENT_COUNTERS: ClientCounters = { activeProcessCount: 0, processCount: 0 };
 
-/**
- * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message or
- * the details of the database error. Those can carry the row ("Failing row contains (..., <name>)")
- * and the logger writes the `cause` chain of every 5xx error, so a client name would end up in the
- * logs (SEC-16 keeps names out of the trail; the logs follow the same rule).
- */
-const safeCause = (error: { code?: string }, status: number) => ({
-  code: error.code ?? '',
-  status,
-});
-
 const invalidInput = (code: string | undefined) =>
   new ValidationError(
     'the database refused the input',
@@ -120,14 +108,6 @@ const invalidInput = (code: string | undefined) =>
     {
       cause: { code: code ?? '' },
     },
-  );
-
-/** The refusal of a list position (the cursor) that the database could not read as a timestamp. */
-const invalidPosition = (code: string) =>
-  new ValidationError(
-    'the database refused the list position',
-    [{ path: 'query.cursor', message: 'Invalid cursor' }],
-    { cause: { code } },
   );
 
 export type ClientRepositoryOptions = {

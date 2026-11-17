@@ -2,7 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
-import { ServiceUnavailableError, ValidationError } from '@/shared/kernel';
+import { ServiceUnavailableError } from '@/shared/kernel';
 import type { Logger } from '@/shared/observability/logger';
 import {
   stageOrderViolations,
@@ -20,10 +20,9 @@ import {
   type SummaryCounters,
 } from '../domain/process';
 import { MAX_STAGES_PER_PROCESS, STAGE_STATUSES } from '../domain/stage';
+import { DATA_EXCEPTION_CLASS, invalidPosition, safeCause } from './database-errors';
 import { timestampSchema } from './timestamp-schema';
 
-/** SQLSTATE class 22, "data exception": the database refused a value it was given (a bad timestamp...). */
-const DATA_EXCEPTION_CLASS = '22';
 /**
  * Postgres rolled the statement back and nothing of it persisted: `deadlock_detected` and
  * `serialization_failure`. For a read it means "try again", which is a 503 with `Retry-After`, never a
@@ -165,25 +164,6 @@ function toDetail(row: DetailRow): MyProcessDetail {
 
 /** What `detailRowSchema` and `summaryRowSchema` refuse is data the panel does not understand: 500. */
 const notUnderstood = () => new Error('the processes table returned a row that is not understood');
-
-/**
- * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message, the
- * details or the hint of the database error. Those can carry the row ("Failing row contains (...,
- * <title>)") and the logger writes the `cause` chain of every 5xx error, so a title would end up in the
- * logs (SEC-16). The same shape as `supabase-process-repository.ts`.
- */
-const safeCause = (error: { code?: string }, status: number) => ({
-  code: error.code ?? '',
-  status,
-});
-
-/** The refusal of a list position (the cursor) that the database could not read as a timestamp. */
-const invalidPosition = (code: string) =>
-  new ValidationError(
-    'the database refused the list position',
-    [{ path: 'query.cursor', message: 'Invalid cursor' }],
-    { cause: { code } },
-  );
 
 export type ClientProcessQueriesOptions = {
   readonly logger: Pick<Logger, 'error' | 'warn'>;

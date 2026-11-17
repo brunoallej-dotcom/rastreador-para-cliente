@@ -2,7 +2,6 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
-import { ValidationError } from '@/shared/kernel';
 import {
   PROCESS_EVENT_ACTIONS,
   type ProcessEvent,
@@ -14,10 +13,9 @@ import {
 } from '../domain/process-event';
 import type { ProcessEventQueries } from '../domain/process-event-queries';
 import { MAX_STAGES_PER_PROCESS, STAGE_NAME_MAX_LENGTH } from '../domain/stage';
+import { DATA_EXCEPTION_CLASS, invalidPosition, parseRows, safeCause } from './database-errors';
 import { timestampSchema } from './timestamp-schema';
 
-/** SQLSTATE class 22, "data exception": the database refused a value it was given (an id out of range...). */
-const DATA_EXCEPTION_CLASS = '22';
 /** The audit action that names a stage as its resource (every other timeline action names the process). */
 const STAGE_APPROVED: (typeof PROCESS_EVENT_ACTIONS)[number] = 'stage.approved';
 
@@ -62,30 +60,6 @@ const stageRowsSchema = z.array(
 const profileRowsSchema = z.array(z.object({ id: z.guid(), display_name: z.string() }));
 
 type EventRow = z.infer<typeof eventRowSchema>;
-
-/**
- * What may travel as the `cause` of an error: the SQLSTATE and the HTTP status, never the message or
- * the details of the database error (the logger writes the `cause` chain of every 5xx error).
- */
-const safeCause = (error: { code?: string }, status: number) => ({
-  code: error.code ?? '',
-  status,
-});
-
-/** The refusal of a list position (the cursor) that the database could not read as an id. */
-const invalidPosition = (code: string) =>
-  new ValidationError(
-    'the database refused the list position',
-    [{ path: 'query.cursor', message: 'Invalid cursor' }],
-    { cause: { code } },
-  );
-
-/** A row is read from the database as untrusted data: what does not match fails closed (500). */
-function parseRows<T>(schema: z.ZodType<T>, data: unknown, what: string): T {
-  const parsed = schema.safeParse(data);
-  if (!parsed.success) throw new Error(`${what} returned a row that is not understood`);
-  return parsed.data;
-}
 
 /**
  * What an event says about a stage: only `stage.approved` names one (its resource). The audit event

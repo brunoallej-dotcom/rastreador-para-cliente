@@ -11,6 +11,7 @@ import {
   NotFoundError,
   ok,
   ServiceUnavailableError,
+  ValidationError,
   type DomainError,
   type Result,
 } from '@/shared/kernel';
@@ -19,8 +20,10 @@ import {
   ClientUserProvisionUnconfirmedError,
   EmailAlreadyRegisteredError,
 } from '../domain/client-user-errors';
+import type { ProvisionTakeBackReason } from '../domain/client-user-errors';
 import type {
   AccountAdminGateway,
+  AuthWriteAction,
   ClientStatusDirectory,
   ClientUserRepository,
 } from '../domain/client-user-ports';
@@ -44,7 +47,10 @@ export type FakeAccountRecord = {
   /**
    * The audit events the database functions would have written, in order: `account.provisioned`,
    * `account.disabled` / `account.enabled` (only on a change of state, like the function),
-   * `account.updated` (on EVERY rename, like the function) and `account.password_reset` (every call).
+   * `account.updated` (on EVERY rename, like the function), `account.password_reset` (every call, after
+   * a late `account.provisioned` when the login never had one), the intents of the Auth writes
+   * (`account.ban_intent`, `account.unban_intent`, `account.password_set_intent`, one per call) and
+   * `account.provision_reverted` (once). The same events, for every account, are in `trail`.
    */
   readonly audit: string[];
   readonly createdAt: Date;
@@ -54,6 +60,8 @@ export type FakeMethod =
   | 'status'
   | 'list'
   | 'recordProvisioned'
+  | 'recordProvisionReverted'
+  | 'beginAuthWrite'
   | 'setDisabled'
   | 'setDisplayName'
   | 'requirePasswordChange'
@@ -68,6 +76,15 @@ export type FakeClientUsers = {
   readonly accounts: AccountAdminGateway;
   /** Every call, in order, as `method`. */
   readonly calls: string[];
+  /**
+   * The audit events of every account in the order they were written, deleted accounts included (the
+   * trail of the database outlives the account: `audit_events` has no foreign key to it).
+   */
+  readonly trail: { readonly userId: string; readonly event: string }[];
+  /** What was recorded as the intent of an Auth write, in order (`beginAuthWrite`). */
+  readonly intents: { readonly userId: string; readonly action: AuthWriteAction }[];
+  /** What `recordProvisionReverted` recorded, in order. */
+  readonly reversals: { readonly userId: string; readonly reason: ProvisionTakeBackReason }[];
   readonly records: Map<string, FakeAccountRecord>;
   /** Adds an account directly (a fixture), without going through the ports. */
   seed(account: Partial<FakeAccountRecord> & Pick<FakeAccountRecord, 'id'>): FakeAccountRecord;
@@ -83,7 +100,13 @@ export type FakeClientUsers = {
    * caller, a login that is gone): the database answered, and said no.
    */
   refuseNext(
-    method: 'recordProvisioned' | 'setDisabled' | 'setDisplayName' | 'requirePasswordChange',
+    method:
+      | 'recordProvisioned'
+      | 'recordProvisionReverted'
+      | 'beginAuthWrite'
+      | 'setDisabled'
+      | 'setDisplayName'
+      | 'requirePasswordChange',
     error: DomainError,
   ): void;
   /**
@@ -105,6 +128,9 @@ export function createFakeClientUsers(
   clients: readonly (ClientStatus & { readonly name: string })[],
 ): FakeClientUsers {
   const calls: string[] = [];
+  const trail: FakeClientUsers['trail'] = [];
+  const intents: { userId: string; action: AuthWriteAction }[] = [];
+  const reversals: { userId: string; reason: ProvisionTakeBackReason }[] = [];
   const records = new Map<string, FakeAccountRecord>();
   const clientRows = new Map(
     clients.map((client) => [client.id, { name: client.name, archived: client.archived }]),
@@ -134,6 +160,12 @@ export function createFakeClientUsers(
   };
   const leave = (loseAnswer: boolean, method: FakeMethod) => {
     if (loseAnswer) throw unavailable(method);
+  };
+
+  /** One audit event of a record, and of the trail that outlives it. */
+  const audit = (record: FakeAccountRecord, event: string) => {
+    record.audit.push(event);
+    trail.push({ userId: record.id, event });
   };
 
   const toUser = (record: FakeAccountRecord): ClientUser => ({
@@ -209,9 +241,66 @@ export function createFakeClientUsers(
       if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
+      // like the function: one `account.provisioned` per login, the second record is INVALID_INPUT (400)
+      if (record.provisioned) {
+        return Promise.resolve(
+          err(
+            new ValidationError('the login is already provisioned', [
+              { path: 'body', message: 'Invalid input' },
+            ]),
+          ),
+        );
+      }
       record.provisioned = true;
-      record.audit.push('account.provisioned');
+      audit(record, 'account.provisioned');
       leave(lose, 'recordProvisioned');
+      return Promise.resolve(ok(toUser(record)));
+    },
+    recordProvisionReverted(userId, reason) {
+      const lose = enter('recordProvisionReverted');
+      const refusal = refusalOf('recordProvisionReverted');
+      if (refusal !== undefined) return Promise.resolve(refusal);
+      const record = clientLogin(userId);
+      // like the function: only a login nobody used (pending password, no sign-in). The window of 15
+      // minutes is not mirrored: the use cases run on fixed clocks, and pgTAP 021 proves the window.
+      if (record === undefined || !record.mustChangePassword || record.lastSignInAt !== null) {
+        return Promise.resolve(notFound());
+      }
+      // like the function: a login that already has `account.provisioned` is not a provisioning to undo
+      if (record.provisioned) {
+        return Promise.resolve(
+          err(
+            new ValidationError('the login is already provisioned', [
+              { path: 'body', message: 'Invalid input' },
+            ]),
+          ),
+        );
+      }
+      // like the function: once only
+      if (!record.audit.includes('account.provision_reverted')) {
+        audit(record, 'account.provision_reverted');
+        reversals.push({ userId, reason });
+      }
+      leave(lose, 'recordProvisionReverted');
+      return Promise.resolve(ok(undefined));
+    },
+    beginAuthWrite(clientId, userId, action) {
+      const lose = enter('beginAuthWrite');
+      const refusal = refusalOf('beginAuthWrite');
+      if (refusal !== undefined) return Promise.resolve(refusal);
+      const record = clientLogin(userId);
+      // like the function: a login of ANOTHER client, a CEO and an unknown id are the same 404
+      if (record === undefined || record.clientId !== clientId) return Promise.resolve(notFound());
+      intents.push({ userId, action });
+      audit(
+        record,
+        action === 'ban'
+          ? 'account.ban_intent'
+          : action === 'unban'
+            ? 'account.unban_intent'
+            : 'account.password_set_intent',
+      );
+      leave(lose, 'beginAuthWrite');
       return Promise.resolve(ok(undefined));
     },
     setDisabled(userId, disabled) {
@@ -222,7 +311,7 @@ export function createFakeClientUsers(
       if (record === undefined) return Promise.resolve(notFound());
       // like the function: an event only when the state changes
       if (record.disabled !== disabled)
-        record.audit.push(disabled ? 'account.disabled' : 'account.enabled');
+        audit(record, disabled ? 'account.disabled' : 'account.enabled');
       record.disabled = disabled;
       if (disabled) record.sessions = 0;
       leave(lose, 'setDisabled');
@@ -236,7 +325,7 @@ export function createFakeClientUsers(
       if (record === undefined) return Promise.resolve(notFound());
       record.displayName = displayName;
       // like the function: an event on EVERY call, the same name included
-      record.audit.push('account.updated');
+      audit(record, 'account.updated');
       leave(lose, 'setDisplayName');
       return Promise.resolve(ok(undefined));
     },
@@ -249,7 +338,12 @@ export function createFakeClientUsers(
       record.mustChangePassword = true;
       record.passwordBaselines += 1;
       record.sessions = 0;
-      record.audit.push('account.password_reset');
+      // like the function: a login that never had `account.provisioned` (an orphan, E-53) gets it, late
+      if (!record.provisioned) {
+        record.provisioned = true;
+        audit(record, 'account.provisioned');
+      }
+      audit(record, 'account.password_reset');
       leave(lose, 'requirePasswordChange');
       return Promise.resolve(ok(undefined));
     },
@@ -324,6 +418,9 @@ export function createFakeClientUsers(
     users: repository,
     accounts: gateway,
     calls,
+    trail,
+    intents,
+    reversals,
     records,
     seed,
     clientRows,

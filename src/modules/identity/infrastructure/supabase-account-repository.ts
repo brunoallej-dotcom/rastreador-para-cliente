@@ -157,10 +157,47 @@ export function createSupabaseAccountRepository(
       return ok(rows.data.map(toClientUser));
     },
 
-    recordProvisioned: (userId) =>
-      write('record_account_provisioned', () =>
-        supabase.rpc('record_account_provisioned', { p_user_id: userId }),
+    async recordProvisioned(userId) {
+      const { data, error, status } = await supabase.rpc('record_account_provisioned', {
+        p_user_id: userId,
+      });
+      if (error) return err(refusalOf('record_account_provisioned', error, status));
+
+      // the login as `list_client_users` shows it: exactly one row, read as untrusted data
+      const rows = z.array(loginRowSchema).safeParse(data);
+      const [row] = rows.success ? rows.data : [];
+      if (!rows.success || rows.data.length !== 1 || row === undefined) {
+        throw new Error('record_account_provisioned returned a row that is not understood');
+      }
+      return ok(toClientUser(row));
+    },
+
+    recordProvisionReverted: (userId, reason) =>
+      write('record_account_provision_reverted', () =>
+        supabase.rpc('record_account_provision_reverted', { p_user_id: userId, p_reason: reason }),
       ),
+
+    async beginAuthWrite(clientId, userId, action) {
+      const { error, status } = await supabase.rpc('begin_client_login_admin', {
+        p_client_id: clientId,
+        p_user_id: userId,
+        p_action: action,
+      });
+      if (!error) return ok(undefined);
+      // The action comes from a closed list of ours and the ids from a login the use case just found:
+      // an INVALID_INPUT here is a defect of the app, never the CEO's input (like F-86), so it is a 500.
+      // The same for a CHECK violation or a value too long (23514, 22001): `refusalOf` would make them a
+      // 422/400 about the CEO's input, and neither `updateClientUser` nor `resetClientUserPassword`
+      // documents a 422.
+      const isDefect =
+        (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) ||
+        error.code === CHECK_VIOLATION ||
+        error.code === STRING_DATA_RIGHT_TRUNCATION;
+      if (isDefect) {
+        throw upstreamFailure('begin_client_login_admin', safeCause(error, status), status);
+      }
+      return err(refusalOf('begin_client_login_admin', error, status));
+    },
 
     setDisabled: (userId, disabled) =>
       write('set_account_disabled', () =>

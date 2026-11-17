@@ -7,10 +7,11 @@
 //   const created = await createProcessViaApi(session.cookies, client.id, { title: 'Site' });
 //   const listed = await listProcessesViaApi(session.cookies, client.id, { limit: '2' });
 //
-// Fixtures write with the secret key, which keeps DML on `processes`, `process_stages` and
-// `stage_approvals` for tests (spec §4.2); they are never how a behavior is checked, and they exist for
-// what no API route does yet (the "Ok" is Wave 9: `approveStageAsFixture` plays it). Test code only:
-// nothing in `src/` may import it.
+// Fixtures write and read the tracking tables as the operator (psql in the database container,
+// `tests/helpers/db.ts`): the secret key has no privilege on `clients`, `processes`, `process_stages` or
+// `stage_approvals` since Wave 10.1 (F-81, spec §4.2). They are never how a behavior is checked, and they
+// exist for states no API route produces on demand (`approveStageAsFixture` plays the "Ok" without its
+// checks). Test code only: nothing in `src/` may import it.
 import { randomUUID } from 'node:crypto';
 import {
   GET as listRoute,
@@ -22,6 +23,14 @@ import {
 } from '@/app/api/v1/admin/processes/[processId]/route';
 import { GET as templateRoute } from '@/app/api/v1/admin/stage-templates/default/route';
 import { expectToMatchContract } from './contract';
+import {
+  approveCurrentStageAsFixture,
+  countProcessesOf,
+  insertTitledProcessesAtFixture,
+  readProcessRow,
+  readProcessTitlesOf,
+  readStageRows,
+} from './db';
 import { adminClient } from './fixtures';
 import { bodyOf, invoke, type CookieStore, type InvokeInit } from './http';
 
@@ -190,117 +199,28 @@ export async function createProcessesAt(
   createdAt: string,
   count: number,
 ): Promise<{ id: string; title: string }[]> {
-  const prefix = uniqueProcessTitle('Marcado');
-  const rows = Array.from({ length: count }, (_value, index) => ({
-    client_id: clientId,
-    title: `${prefix} ${index + 1}`,
-    created_at: createdAt,
-    updated_at: createdAt,
-  }));
-  const inserted = await adminClient().from('processes').insert(rows).select('id, title');
-  if (inserted.error)
-    throw new Error(`insert of dated processes failed: ${inserted.error.message}`);
-
-  const stages = inserted.data.map((process) => ({
-    process_id: process.id,
-    position: 1,
-    name: 'Unica',
-    status: 'in_progress' as const,
-    started_at: createdAt,
-  }));
-  const stageInsert = await adminClient().from('process_stages').insert(stages);
-  if (stageInsert.error) throw new Error(`insert of stages failed: ${stageInsert.error.message}`);
-  return inserted.data.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return insertTitledProcessesAtFixture(clientId, createdAt, count, uniqueProcessTitle('Marcado'));
 }
 
 /**
- * Plays the "Ok" that Wave 9 will expose, with the secret key: completes the current stage of an
- * active process with an approval by `approverId`, and starts the next one (or completes the
- * process). It exists only so the read of an approval can be tested before the route exists; it does
- * what `approve_current_stage` will do, and it is not how an approval is ever checked.
+ * Plays the "Ok" without the checks of `approve_current_stage`: completes the current stage of an
+ * active process with an approval by `approverId`, and starts the next one (or completes the process).
+ * It exists so a test can reach the state of a completed stage cheaply; it is not how an approval is
+ * ever checked (no role, no `aal2`, no audit event: see `approveCurrentStageAsFixture`).
  */
-export async function approveStageAsFixture(processId: string, approverId: string): Promise<void> {
-  const admin = adminClient();
-  const stages = await admin
-    .from('process_stages')
-    .select('id, position, status')
-    .eq('process_id', processId)
-    .order('position', { ascending: true });
-  if (stages.error) throw new Error(`reading stages failed: ${stages.error.message}`);
+export const approveStageAsFixture = approveCurrentStageAsFixture;
 
-  const current = stages.data.find((stage) => stage.status === 'in_progress');
-  if (current === undefined) throw new Error('approveStageAsFixture: no stage in progress');
-  const next = stages.data.find((stage) => stage.position === current.position + 1);
-  const now = new Date().toISOString();
+/** How many processes the client has, read as the operator (a fixture, not a behavior). */
+export const processCountOf = countProcessesOf;
 
-  const completed = await admin
-    .from('process_stages')
-    .update({ status: 'completed', completed_at: now })
-    .eq('id', current.id);
-  if (completed.error) throw new Error(`completing a stage failed: ${completed.error.message}`);
-  const approval = await admin
-    .from('stage_approvals')
-    .insert({ process_stage_id: current.id, process_id: processId, approved_by: approverId });
-  if (approval.error) throw new Error(`inserting the approval failed: ${approval.error.message}`);
+/** The titles of the client's processes, read as the operator. */
+export const processTitlesOf = readProcessTitlesOf;
 
-  if (next === undefined) {
-    const process = await admin
-      .from('processes')
-      .update({ status: 'completed', completed_at: now })
-      .eq('id', processId);
-    if (process.error) throw new Error(`completing the process failed: ${process.error.message}`);
-    return;
-  }
-  const started = await admin
-    .from('process_stages')
-    .update({ status: 'in_progress', started_at: now })
-    .eq('id', next.id);
-  if (started.error) throw new Error(`starting a stage failed: ${started.error.message}`);
-}
+/** The process row as the database holds it, read as the operator. */
+export const processRowOf = readProcessRow;
 
-/** How many processes the client has, read with the secret key (a fixture, not a behavior). */
-export async function processCountOf(clientId: string): Promise<number> {
-  const { count, error } = await adminClient()
-    .from('processes')
-    .select('id', { count: 'exact', head: true })
-    .eq('client_id', clientId);
-  if (error) throw new Error(`counting processes failed: ${error.message}`);
-  return count ?? 0;
-}
-
-/** The titles of the client's processes, read with the secret key. */
-export async function processTitlesOf(clientId: string): Promise<string[]> {
-  const { data, error } = await adminClient()
-    .from('processes')
-    .select('title')
-    .eq('client_id', clientId);
-  if (error) throw new Error(`reading processes failed: ${error.message}`);
-  return data.map((row) => row.title);
-}
-
-/** The process row as the database holds it, read with the secret key. */
-export async function processRowOf(processId: string) {
-  const { data, error } = await adminClient()
-    .from('processes')
-    .select(
-      'id, client_id, title, status, version, created_at, updated_at, completed_at, cancelled_at',
-    )
-    .eq('id', processId)
-    .single();
-  if (error) throw new Error(`reading a process failed: ${error.message}`);
-  return data;
-}
-
-/** The stages of a process in position order, read with the secret key. */
-export async function stageRowsOf(processId: string) {
-  const { data, error } = await adminClient()
-    .from('process_stages')
-    .select('id, position, name, description, status, started_at, completed_at')
-    .eq('process_id', processId)
-    .order('position', { ascending: true });
-  if (error) throw new Error(`reading stages failed: ${error.message}`);
-  return data;
-}
+/** The stages of a process in position order, read as the operator. */
+export const stageRowsOf = readStageRows;
 
 export type ProcessAuditRow = {
   action: string;

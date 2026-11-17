@@ -40,6 +40,13 @@ SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c2');
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c3');
 
+-- Todo login de cliente nasce com a senha temporária pendente, e com ela o RLS não lê nada de negócio
+-- (F-83, arquivo 020); estes representam o cliente plenamente ativo, e o que isso muda é o que 020 prova.
+UPDATE public.profiles SET must_change_password = false WHERE id IN (
+  '00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000a2',
+  '00000000-0000-4000-8000-0000000000a3', '00000000-0000-4000-8000-0000000000a5',
+  '00000000-0000-4000-8000-0000000000b1'
+);
 UPDATE public.profiles SET disabled_at = now() WHERE id IN (
   '00000000-0000-4000-8000-0000000000a3', '00000000-0000-4000-8000-0000000000c2'
 );

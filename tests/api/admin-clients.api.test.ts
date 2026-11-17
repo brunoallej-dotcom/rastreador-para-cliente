@@ -9,6 +9,7 @@ import { randomInt } from 'node:crypto';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { encodeCursor } from '@/shared/http';
 import { expectToMatchContract } from '../helpers/contract';
+import { countClients, countClientsNamed, readClientRow } from '../helpers/db';
 import {
   auditOfClient,
   createClientOrFail,
@@ -25,7 +26,6 @@ import {
   type ClientListBody,
 } from '../helpers/clients';
 import {
-  adminClient,
   ceoAal2Client,
   createCeo,
   createClient,
@@ -78,12 +78,8 @@ async function expectContract<T = unknown>(operationId: string, response: Respon
 
 type Problem = { code: string; detail?: string; errors?: { path: string; message: string }[] };
 
-/** The clients with this exact name, read with the secret key (a fixture, not a behavior). */
-async function clientsNamed(name: string): Promise<number> {
-  const { data, error } = await adminClient().from('clients').select('id').eq('name', name);
-  if (error) throw new Error(`reading clients failed: ${error.message}`);
-  return data.length;
-}
+/** The clients with this exact name, read as the operator (a fixture, not a behavior). */
+const clientsNamed = countClientsNamed;
 
 /** Archives a client through the API and checks the answer: a setup step that must not fail silently. */
 async function archiveOrFail(cookies: CookieStore, clientId: string): Promise<ClientDetailBody> {
@@ -94,14 +90,8 @@ async function archiveOrFail(cookies: CookieStore, clientId: string): Promise<Cl
   return body;
 }
 
-/** How many clients there are, read with the secret key (a fixture, not a behavior). */
-async function clientCount(): Promise<number> {
-  const { count, error } = await adminClient()
-    .from('clients')
-    .select('id', { count: 'exact', head: true });
-  if (error) throw new Error(`counting clients failed: ${error.message}`);
-  return count ?? 0;
-}
+/** How many clients there are, read as the operator (a fixture, not a behavior). */
+const clientCount = countClients;
 
 /** ASCII to full-width letters and digits, the space to the ideographic space (what NFKC folds back). */
 const toFullwidth = (text: string) =>
@@ -120,15 +110,8 @@ const uniqueJapaneseName = () =>
     String.fromCodePoint(CJK_FIRST + randomInt(CJK_SPAN)),
   ).join('');
 
-const nameOfClient = async (clientId: string): Promise<string | undefined> => {
-  const { data, error } = await adminClient()
-    .from('clients')
-    .select('name')
-    .eq('id', clientId)
-    .maybeSingle();
-  if (error) throw new Error(`reading a client failed: ${error.message}`);
-  return data?.name;
-};
+const nameOfClient = async (clientId: string): Promise<string | undefined> =>
+  (await readClientRow(clientId))?.name;
 
 describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/{clientId}', () => {
   describe('creating and reading', () => {
@@ -174,7 +157,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
 
     it('AC-11: counts the processes of a client, active ones apart', async () => {
       const created = await createClientOrFail(ceo.cookies);
-      await seedProcesses(created.id, { active: 2, completed: 1, cancelled: 1 });
+      await seedProcesses(created.id, { active: 2, completed: 1, cancelled: 1 }, ceo.ceo.id);
 
       const detail = await expectContract<ClientDetailBody>(
         'getClient',
@@ -424,7 +407,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
 
     it('AC-11: renames and archives in one request, and keeps the counters', async () => {
       const created = await createClientOrFail(ceo.cookies);
-      await seedProcesses(created.id, { active: 1, completed: 2 });
+      await seedProcesses(created.id, { active: 1, completed: 2 }, ceo.ceo.id);
       const name = uniqueClientName('Duplo');
 
       const response = await updateClientViaApi(ceo.cookies, created.id, { name, archived: true });
@@ -1012,12 +995,7 @@ describe('GET /admin/clients, POST /admin/clients, GET and PATCH /admin/clients/
       expect([rename.status, archive.status, read.status]).toEqual([403, 403, 403]);
       expect(bodies.map((body) => body.code)).toEqual(['FORBIDDEN', 'FORBIDDEN', 'FORBIDDEN']);
       expect(await nameOfClient(tenant.id)).toBe(tenant.name);
-      const { data } = await adminClient()
-        .from('clients')
-        .select('archived_at')
-        .eq('id', tenant.id)
-        .single();
-      expect(data?.archived_at).toBeNull();
+      expect((await readClientRow(tenant.id))?.archived_at).toBeNull();
     });
 
     it('SEC-11: a CEO whose session is aal1, with a verified factor, is 403 MFA_VERIFICATION_REQUIRED', async () => {
