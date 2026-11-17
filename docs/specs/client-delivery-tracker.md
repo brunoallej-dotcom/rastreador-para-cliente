@@ -397,8 +397,9 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
   tipo, o status e o código (a mensagem pode ecoar o e-mail).
   - **Provisionar:** confere cliente existente, não arquivado (E-16), sem login do cliente com o mesmo
     e-mail (409, E-17) e com vaga (E-18) para responder 404, 422 ou 409 limpos; cria a conta com a senha
-    temporária na mesma chamada; chama `record_account_provisioned` e relê a lista (o 201 mostra o login
-    como a lista o mostra). **Depois de qualquer falha de classe 503 do `createUser`** (queda, recusa do
+    temporária na mesma chamada; chama `record_account_provisioned`, que devolve a linha do login (o 201 o
+    mostra como a lista o mostra, **sem reler a lista**: a releitura podia falhar depois do registro e forçar a
+    compensação, F-93). **Depois de qualquer falha de classe 503 do `createUser`** (queda, recusa do
     gatilho, resposta sem id), o caso de uso descobre o que aconteceu antes de responder, lendo a lista do
     cliente de novo, **nesta ordem** (F-90): (1) há um login com o e-mail do pedido, **novo** (não estava
     na lista de antes), com a senha temporária ainda em uso e sem nenhum acesso? Então a criação
@@ -414,10 +415,16 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     Auth aceita e responde **sem id de usuário** é `ClientUserProvisionUnconfirmedError` (503, nunca 500):
     se a conta está na lista, é apagada como acima; se não se acha (a lista falha), o log traz
     `identity.client_user.provision_unconfirmed`, sem e-mail nem id. Falha **depois** de `createUser` (o
-    registro ou a releitura): a conta é apagada (compensação, E-23) e a resposta é 503. Quando a exclusão
+    registro): a conta é apagada (compensação, E-23) e a resposta é 503. **Antes de apagar, a compensação grava
+    `account.provision_reverted` (F-93, §3.7.4) e, se esse registro falha, NÃO apaga** (falha fechada: a conta
+    fica como órfã, abaixo, em vez de uma exclusão sem rastro). Quando a exclusão
     também falha (duas tentativas), o log traz `provision_orphaned` (falha do registro) ou
     `provision_answer_lost` (resposta perdida), com o id da conta que sobrou e o porquê da falha da
     exclusão (um tipo e um status), e a recuperação é achar o login na lista e resetar a senha (E-53).
+  - **Antes de cada escrita no Auth sobre um login que já existe** (banir, desbanir, trocar a senha), o caso de
+    uso chama `begin_client_login_admin` (F-92 b, §3.7.4), que grava a **intenção** numa transação própria; se
+    a gravação falha, o Auth **não** é tocado (um reset ou um desbanir respondem com o erro dela; o ban de uma
+    desativação vira o aviso `ban_failed` com o motivo `not_audited`, porque o banco já bloqueia o login).
   - **Desativar e reativar:** desativar grava o banco primeiro (apaga as sessões e `current_principal()`
     deixa de devolver o usuário: é o bloqueio que vale) e bane no Auth depois (`ban_duration` de um
     século), como segunda trava; reativar tira o ban **antes** de reativar no banco, nunca o contrário (o
@@ -428,7 +435,8 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     trancaria para fora um login ativo (M2). O ban que falha
     depois de o banco desativar não desfaz nada e continua 200 (E-24), mas é registrado em `error` com o
     motivo (`unavailable`, `not_found` ou `unexpected`); só esses três são engolidos, e um erro que
-    ninguém classificou sobe. Repetir o mesmo `PATCH` repara, e `{ "disabled": true }` tenta o ban de novo
+    ninguém classificou sobe (e `not_audited`: a intenção do ban não pôde ser gravada e o Auth nem foi chamado).
+    Repetir o mesmo `PATCH` repara, e `{ "disabled": true }` tenta o ban de novo
     mesmo com o login já desativado. A função do banco só audita mudança de estado, então repetir
     desativar ou reativar não grava um segundo evento; o **renomear** para o nome que o login já tem é
     pulado (a função audita toda chamada). O renomear vai antes de tudo, por não ser sobre acesso. Dois
@@ -444,7 +452,10 @@ o header `x-request-id`, que as funções do banco gravam na auditoria
     o reset não aconteceu: a senha antiga não vale mais, as sessões já caíram, e faltam `CHANGE_PASSWORD`,
     a linha de base nova e a auditoria; a senha temporária **nunca** foi mostrada, e repetir o reset
     conclui (E-51). Só uma queda é repetida na própria chamada, e a repetição de uma tentativa que tinha
-    gravado, com a resposta perdida, grava um **segundo** `account.password_reset` na auditoria.
+    gravado, com a resposta perdida, grava um **segundo** `account.password_reset` na auditoria. O reset também
+    é a **recuperação de uma conta órfã** (E-53): um login que nunca teve `account.provisioned` (o registro
+    falhou, ou a resposta da criação se perdeu) ganha o evento no reset que o entrega, com `{"late": true}` nos
+    metadados e antes do `account.password_reset` (F-93).
   - **Arquivar um cliente não toca nos logins** (F-58, Q-08): eles continuam entrando, e o CEO ainda os
     lista, renomeia, desativa, reativa e reseta (E-54); só um login NOVO é recusado.
 
@@ -534,9 +545,14 @@ tabelas que um cliente lê: `processes` e `process_stages`, nunca `stage_approva
   `requestId` da linha e o usuário da linha de acesso, dizem quem leu o quê (F-99); nenhuma leva título, nome
   de fase nem id de cliente.
 - **Limite, pendências e arquivados.** `reads`, 300 por minuto por usuário (o contador é do próprio login).
-  `allowPending: []`: login com a senha temporária por trocar recebe 403 `PASSWORD_CHANGE_REQUIRED` (E-81). O
-  mesmo login lendo direto pelo PostgREST não passa por essa recusa: é o F-83, planejado para a Onda 10.1. Um
-  cliente arquivado continua lendo os processos que já tem (E-83, Q-13).
+  `allowPending: []`: login com a senha temporária por trocar recebe 403 `PASSWORD_CHANGE_REQUIRED` (E-81).
+  **O banco diz o mesmo (F-83, Onda 10.1):** `private.current_client_id()` exige `NOT must_change_password`, então o
+  mesmo login, chamando o PostgREST direto com o próprio JWT, não lê `processes` nem `process_stages` (nem
+  `clients`, nem `stage_approvals`) enquanto a senha temporária estiver pendente, e lê assim que a troca vale. O
+  principal dele continua existindo (`current_active_user_id()` não muda: o `GET /auth/session`, a troca de
+  senha e o logout dependem disso), e o nome do próprio cliente, que o login e o `GET /auth/session` mostram
+  (`SessionClient`), vem de `current_client_summary()`, uma função sem argumento que devolve só `id` e `name` do cliente
+  do próprio perfil, e não da tabela. Um cliente arquivado continua lendo os processos que já tem (E-83, Q-13).
 
 ### 3.6 Máquina de estados do processo
 
@@ -574,10 +590,13 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 | `create_client(p_name)` | authenticated + `is_ceo()` | Cria o cliente e devolve a linha. Evento `client.created`. Nome já usado por um cliente não arquivado: `CLIENT_NAME_TAKEN`, sem evento (§3.7.1) |
 | `update_client(p_client_id, p_name, p_archived)` | idem | Renomeia, arquiva ou desarquiva; `NULL` = não mexe. Eventos `client.updated` / `client.archived` / `client.unarchived`, só quando algo muda. Renomear ou desarquivar para um nome já usado por um cliente não arquivado: `CLIENT_NAME_TAKEN`, sem evento e sem mudança (§3.7.1) |
 | `list_client_users(p_client_id)` | authenticated + `is_ceo()` | Logins do cliente com e-mail e último acesso (junta `profiles` com `auth.users`, que não é exposto) |
-| `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`) |
+| `record_account_provisioned(p_user_id)` | idem | Evento `account.provisioned` (após `auth.admin.createUser`). **Devolve a linha do login**, com as colunas de `list_client_users` (F-93) |
+| `begin_client_login_admin(p_client_id, p_user_id, p_action)` | idem; o login precisa ser `client` **do cliente informado** | Grava a **intenção** de uma escrita no Auth: `ban`, `unban` ou `set_password` (lista fechada; outra ação: `INVALID_INPUT`). Eventos `account.ban_intent`, `account.unban_intent`, `account.password_set_intent` (§3.7.4, F-92 b) |
+| `record_account_provision_reverted(p_user_id, p_reason)` | idem; alvo `client` que ninguém usou | A compensação do provisionamento: evento `account.provision_reverted`, antes de apagar a conta. `p_reason`: `record_failed` ou `answer_lost`. Uma vez por login (§3.7.4, F-93) |
+| `current_client_summary()` | authenticated (o próprio login, também com a senha temporária pendente) | `id` e `name` do cliente do próprio perfil, sem argumento (o `SessionClient` do login e do `GET /auth/session`, F-83) |
 | `set_account_disabled(p_user_id, p_disabled)` | idem; alvo precisa ser `client` | Marca o perfil, apaga as sessões. `account.disabled` / `account.enabled` (só quando o estado muda) |
 | `set_account_display_name(p_user_id, p_display_name)` | idem; alvo precisa ser `client` | Renomeia o login (`PATCH …/users/{userId}` com `displayName`). `account.updated` |
-| `require_password_change(p_user_id)` | idem; alvo precisa ser `client` | `must_change_password = true`, apaga as sessões. `account.password_reset` |
+| `require_password_change(p_user_id)` | idem; alvo precisa ser `client` | `must_change_password = true`, apaga as sessões. `account.password_reset`, precedido de um `account.provisioned` tardio (`{"late": true}`) quando o login nunca teve o seu (F-93) |
 | `mark_password_changed()` | authenticated (o próprio usuário) | Exige prova da troca: o hash atual em `auth.users` difere da linha de base (`private.password_baselines`, gravada na criação e no reset), senão `PASSWORD_UNCHANGED`; CEO com TOTP verificado precisa de sessão `aal2` atestada. Então `must_change_password = false`, renova a linha de base e apaga as **demais** sessões do usuário (mantém a da requisição, AC-06). `account.password_changed` |
 | `consume_totp_code(p_user_id, p_factor_id, p_code_digest)` | **somente `service_role`** (F-65) | Queima um código TOTP: `true` na primeira vez, `false` se o mesmo digest do mesmo fator já foi consumido nos últimos 120 s (F-21). Fator que não é TOTP do usuário: `NOT_FOUND`. Usuário que não existe ou está desativado: `FORBIDDEN`. Não audita (é estado do fluxo de login, e eventos de auth vão para o log) |
 | `list_backend_totp_factors()` | authenticated (o próprio usuário) | Ids dos fatores TOTP que o backend cadastrou para o usuário; o verify sem `factorId` só resolve entre eles (F-60) |
@@ -880,6 +899,47 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
     60 escritas por minuto por CEO é a única contenção). O pgTAP confere o índice. Retenção da trilha e um alerta de
     volume por processo ficam para a Onda 11 (T-50).
 
+#### 3.7.4 Auditoria do Auth e do provisionamento (Onda 10.1)
+
+Os logins de cliente são escritos em dois sistemas: o banco, por funções que auditam na mesma transação, e o Auth
+Admin API, que não passa por função nenhuma. Esta seção fecha o que a auditoria não via (F-92 b, F-93). Os eventos
+são **internos** da trilha (`audit_events` só é lida por CEO atestado, e nenhum DTO do contrato os lista).
+
+- **Intenção antes da escrita no Auth (F-92 b).** `begin_client_login_admin(p_client_id, p_user_id, p_action)` checa
+  `is_ceo() IS NOT TRUE` primeiro, valida a ação contra a lista fechada, confere que o login é `client` e **do cliente
+  informado** (outro cliente, um CEO e um id inexistente são o mesmo `NOT_FOUND`, E-19) e grava, em transação própria, um
+  evento por chamada (uma repetição é outra tentativa). Não muda estado nenhum. Os nomes seguem o `account.*` e a
+  lista é a mesma do `AccountAdminGateway`:
+
+  | `p_action` | Evento | Quando o app o grava |
+  |------------|--------|----------------------|
+  | `ban` | `account.ban_intent` | desativar (a segunda trava, depois do banco) e recolocar o ban de uma reativação que falhou no banco |
+  | `unban` | `account.unban_intent` | reativar (tira o ban antes do banco) |
+  | `set_password` | `account.password_set_intent` | resetar (grava a senha temporária nova) |
+
+  Criar e apagar a conta também escrevem no Auth, mas a criação ainda não tem id para auditar e a exclusão é a
+  compensação do provisionamento, que tem o evento abaixo. Os metadados levam só `{"action": "<palavra>"}`: o login
+  é o `resource_id`, e nenhum nome, e-mail ou senha entra. **Falha fechada:** se a intenção não é gravada o Auth não é
+  tocado (E-92); um reset ou um desbanir respondem com o erro da gravação (403, 404 ou 503), e o ban de uma
+  desativação, que vem depois de o banco bloquear o login, vira o aviso `ban_failed` com o motivo `not_audited`
+  (200, E-24); repetir o `PATCH { "disabled": true }` tenta de novo.
+- **A compensação deixa rastro (F-93).** `record_account_provision_reverted(p_user_id, p_reason)` grava
+  `account.provision_reverted`, com `{"reason": "record_failed" | "answer_lost"}`, **antes** de o app apagar no Auth a
+  conta que acabou de criar (depois da exclusão o perfil não existe mais). Só vale para um login que ninguém usou
+  (senha temporária pendente e nenhum acesso); uma segunda chamada para o mesmo login não grava outro evento (a
+  compensação tenta duas vezes). **Falha fechada:** se o registro falha, a conta **não** é apagada e a resposta é o 503 de
+  `provision_orphaned` (E-93); a trilha de uma conta que ficou e foi entregue por reset lê: `provision_reverted`,
+  `provisioned` (tardio) e `password_reset`.
+- **O registro devolve o login (F-93).** `record_account_provisioned` devolve a linha do login, com as colunas e a ordem de
+  `list_client_users`, lida depois do registro na mesma transação; o caso de uso para de reler a lista (E-94). Mudar o
+  tipo de retorno exigiu apagar a função e criá-la de novo (mesmo nome, mesma entrada, mesmos privilégios).
+- **Registro tardio no reset (F-93).** `require_password_change` grava `account.provisioned` com `{"late": true}`,
+  antes de `account.password_reset` e na mesma transação, quando o login nunca teve o seu: é a recuperação da conta
+  órfã de E-53 e de E-50 (que só é entregue pelo reset). Um login já registrado não ganha outro.
+- **Eventos de conta**, o catálogo completo (o pgTAP 021 recusa qualquer outro): `account.provisioned`,
+  `account.provision_reverted`, `account.disabled`, `account.enabled`, `account.updated`, `account.password_reset`,
+  `account.password_changed`, `account.ban_intent`, `account.unban_intent` e `account.password_set_intent`.
+
 ### 3.8 Prevenção de SQL injection (e de injeção em geral)
 
 1. **Sem SQL no app.** O app usa apenas `supabase.from(...).select/eq/...` e `supabase.rpc(...)`.
@@ -980,7 +1040,8 @@ XSS: a API só responde JSON com `Content-Type` correto, `nosniff` e CSP `defaul
   `.provision_rolled_back`, `.provision_orphaned`, `.provision_answer_lost`, `.provision_unconfirmed`,
   `.reset_incomplete`, `.ban_failed` e `.reban_after_failed_enable` (E-23, E-53, E-50, E-55, E-51, E-24,
   E-56). Os motivos vão em campos que não se chamam `code` (o redator de logs apaga todo valor sob essa
-  chave): `kind`, `status`, `reason`.
+  chave): `kind`, `status`, `reason`. O `reason` de `.ban_failed` é `unavailable`, `not_found`, `unexpected` ou `not_audited`
+  (a intenção do ban não pôde ser gravada e o Auth não foi chamado, F-92 b).
   `ipHash`, `accountHash` e `subjectHash` são HMACs com chave derivada de `RATE_LIMIT_KEY_SECRET`,
   diferentes dos valores gravados no banco: o log não guarda IP nem e-mail e não se liga às linhas
   de `rate_limit_counters`.
@@ -1173,10 +1234,15 @@ e sem linha, ou com a linha mais velha que o prazo, não tem principal.
 | `default_stage_template` | — | — | todas | migration |
 
 **`service_role` (secret key):** não escreve em `profiles`, `audit_events` nem
-`default_stage_template` (papel, trilha e template não são forjáveis nem com a secret key) e só
-executa `rate_limit_hit`. Mantém DML em `clients`, `processes`, `process_stages` e
-`stage_approvals` apenas para fixtures de teste no Supabase local e operação manual; o app nunca
-escreve com ela (AGENTS.md; ESLint e hooks restringem o admin client).
+`default_stage_template` (papel, trilha e template não são forjáveis nem com a secret key) e executa só as funções
+de `service_role` de §3.7 (`rate_limit_hit`, a queima de código TOTP e as três do atestado de CEO). **Não tem privilégio
+algum** em `clients`, `processes`, `process_stages` e `stage_approvals` (F-81, Onda 10.1: nem `SELECT`, nem `TRIGGER`,
+`REFERENCES` ou `MAINTAIN`), porque com `BYPASSRLS` uma linha feita à mão quebrava I1 a I5 sem auditoria e uma leitura
+via todos os clientes; nada na aplicação usa a chave nelas (a fachada do admin client não expõe `.from()`, e
+`scripts/create-ceo.ts` escreve só o Auth). O privilégio padrão do dono das migrations em `public` também não concede
+nada a ela, então uma tabela ou sequência nova não nasce acessível à secret key: cada migration concede o que precisa.
+Quem escreve é só a função `SECURITY DEFINER`, como o dono. As fixtures dos testes escrevem e leem essas tabelas pelo
+`psql` do contêiner do banco (`tests/helpers/db.ts`, com entradas validadas), nunca pela chave.
 
 **Texto visível** (nomes e títulos) recusa caracteres de controle **e** de formatação Unicode
 (bidi override, zero-width, BOM), que permitiriam falsificar nomes no painel (E-30), no Zod e nos
@@ -1184,7 +1250,11 @@ CHECKs do banco.
 
 **Helpers de RLS** (`private`, `SECURITY DEFINER STABLE`, sempre chamados como
 `(select private.fn())` nas policies para cache por statement): `private.current_client_id()`
-e `private.is_ceo()`. O helper `private.request_id()` lê o `x-request-id` do PostgREST
+e `private.is_ceo()`. Os dois exigem **senha definitiva** (`NOT must_change_password`, F-83): o tenant só vale para um
+cliente plenamente ativo, e um CEO com a senha temporária de volta, mesmo com a sessão atestada, não é CEO até a troca
+(o atestado de um CEO com a pendência já era inalcançável pelo produto, porque o enroll e o verify não aceitam
+`CHANGE_PASSWORD`; agora o banco também diz isso, e `mark_password_changed` e `current_principal` usam
+`session_is_attested()` direto, então a troca e o atestado não dependem de `is_ceo()`). O helper `private.request_id()` lê o `x-request-id` do PostgREST
 (saneado para `[A-Za-z0-9-]{1,64}`) para as funções gravarem na auditoria.
 
 ### 4.3 Índices
@@ -1280,6 +1350,12 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-07 | Cliente chama `/admin/*`; CEO chama `/me/*` | 403 `FORBIDDEN` |
 | E-80 | `GET /me/processes` com `clientId`, `status` ou outro parâmetro que o contrato não tem; `limit` fora de 1 a 100 ou que não é inteiro; cursor adulterado, truncado, de outro endpoint ou com um instante que o banco não lê | 400 `VALIDATION_ERROR` em `query.<campo>`: a validação recusa antes do banco, e a classe 22 do banco (um instante que a validação deixou passar) é a retaguarda, também 400. Um cursor bem formado que veio de outro cliente é aceito e anda só dentro das linhas de quem o envia (§3.5.1) |
 | E-81 | Cliente com `CHANGE_PASSWORD` pendente em `/me/*` | 403 `PASSWORD_CHANGE_REQUIRED` na lista e no detalhe; liberado depois de `POST /auth/password` |
+| E-90 | Cliente com a senha temporária pendente chama o PostgREST direto com o próprio JWT (`processes`, `process_stages`, `clients`, `stage_approvals`) | Lista vazia em todas, inclusive a do próprio cliente (F-83); o `GET /auth/session` dele segue mostrando o cliente (`current_client_summary()`); depois de `POST /auth/password` o mesmo JWT lê o próprio tenant |
+| E-91 | CEO atestado que volta a ter a senha temporária (reset de operador, F-41) | `is_ceo()` é falso: não lê nem escreve nada de negócio até trocar a senha; a troca e o `GET /auth/session` funcionam (F-83) |
+| E-92 | Reset, reativação ou ban sem a **intenção** gravada (`begin_client_login_admin` falha) | O Auth não é tocado. Reset e reativação: o erro da gravação (403, 404 ou 503), a senha antiga e o ban ficam como estavam. Desativação: 200 com o login bloqueado no banco, `ban_failed` com motivo `not_audited` em `error` (F-92 b) |
+| E-93 | Provisionar: o `account.provision_reverted` não grava antes de apagar a conta | A conta **não** é apagada (falha fechada): 503, `provision_orphaned` em `error` com o porquê da falha do registro; o login fica na lista e o reset o entrega (E-53, F-93) |
+| E-94 | Provisionar: a lista falha depois do registro | Não importa: o 201 vem do retorno de `record_account_provisioned`, sem releitura (F-93) |
+| E-95 | A secret key lê ou escreve `clients`, `processes`, `process_stages` ou `stage_approvals` pelo PostgREST | 403 `42501`, em toda operação (F-81) |
 | E-82 | Processo sem fase, ou que quebra I1 a I4, na lista ou no detalhe do cliente | 500 `INTERNAL_ERROR`, sem mostrar nada dele nem do título; o log leva só o id do processo e as invariantes (F-81). Os outros clientes não são afetados |
 | E-83 | Cliente arquivado lê os processos que já tem | 200 na lista e no detalhe (Q-13): arquivar só impede processos e logins novos |
 | E-08 | Conta desativada com JWT ainda válido | 401 na próxima requisição (sessões apagadas + checagem no banco) |
@@ -1297,12 +1373,12 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
 | E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes`, que cria sem chave natural, **pode duplicar**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 201 com um **segundo** processo e a auditoria tem dois `process.created` (§3.7.2), então o CEO confere a lista do cliente antes de repetir; no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
-| E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: apaga o usuário criado, responde 503 e loga em `error` |
+| E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: grava `account.provision_reverted`, apaga o usuário criado, responde 503 e loga em `error` (se o `provision_reverted` não grava, não apaga: E-93) |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
 | E-50 | Provisionar: o Auth criou a conta mas a resposta se perdeu (timeout depois do commit) | Antes de responder, o caso de uso relê a lista do cliente e acha o login novo pelo e-mail: se há exatamente um candidato e ele foi criado no começo da tentativa ou depois, apaga a conta e responde 503, sem nada pela metade e nunca 422 (mesmo que o cliente tenha ficado cheio por causa dela); repetir dá 201. Com mais de um candidato, ou com um criado antes da tentativa (outro CEO provisionou o mesmo endereço um instante antes), **não apaga nada**: 503 e `identity.client_user.provision_answer_lost` em `error` com os ids e `deleted: false`. Se a exclusão também falha: 503, o mesmo evento com o id e o porquê da falha; o login fica na lista, repetir dá 409 `EMAIL_ALREADY_REGISTERED` e um reset da senha o entrega |
 | E-51 | Resetar: o Auth já guardou a senha nova e o passo do banco (`require_password_change`) falha por **qualquer** motivo (queda mesmo com a segunda tentativa, 403 de atestado vencido, 404, entrada recusada) | 503 e `identity.client_user.reset_incomplete` em `error`, com só o tipo, o SQLSTATE e o status. A senha antiga e as sessões já não valem; faltam `CHANGE_PASSWORD`, a linha de base nova e a auditoria. A senha nova não é mostrada; repetir o reset conclui. Se a segunda tentativa de uma queda funciona, o reset conclui na mesma chamada (e, se a primeira tinha gravado com a resposta perdida, a auditoria ganha um segundo `account.password_reset`) |
 | E-52 | Provisionar com várias chamadas disputando as últimas vagas do cliente, ou com o cliente arquivado entre a checagem e a criação | O gatilho do perfil decide (trava o cliente) e o caso de uso explica, **só depois de ver que o login não existe**: as que cabem recebem 201 e as outras 422 `USER_LIMIT_REACHED` (ou 422 `CLIENT_ARCHIVED`), nunca 503 |
-| E-53 | Provisionar: o registro falha e a compensação (apagar a conta) também | 503, `identity.client_user.provision_orphaned` em `error` com o id da conta e o porquê da falha da exclusão. O login está na lista, nascido com uma senha que ninguém recebeu; a recuperação é resetar a senha (ou desativar) |
+| E-53 | Provisionar: o registro falha e a compensação (gravar a reversão e apagar a conta) também | 503, `identity.client_user.provision_orphaned` em `error` com o id da conta e o porquê da falha da exclusão. O login está na lista, nascido com uma senha que ninguém recebeu; a recuperação é resetar a senha (ou desativar), e o reset que o entrega grava o `account.provisioned` que faltava, tardio (F-93) |
 | E-54 | Cliente arquivado com logins que já existem | Eles continuam entrando; o CEO ainda lista, renomeia, desativa, reativa e reseta; só provisionar login novo é 422 `CLIENT_ARCHIVED` (E-16, F-58) |
 | E-55 | Provisionar: o Auth aceita a criação e responde sem id de usuário (corpo sem `user`) | 503, nunca 500. A conta existe e não tem nome: o caso de uso a acha pelo e-mail na lista do cliente e a apaga (como E-50); se não a acha, `identity.client_user.provision_unconfirmed` em `error` (sem e-mail e sem id) e o `detail` manda procurar na lista antes de repetir |
 | E-56 | Reativar um login que estava desativado: o Auth já tirou o ban e o passo do banco (`set_account_disabled`) falha (reativar um login que já está ativo não chama nada, M2) | 503. O ban é recolocado (melhor esforço) para o login seguir bloqueado nos dois lugares, e `identity.client_user.reban_after_failed_enable` sai em `error` (`rebanned` diz se deu certo); repetir a reativação conclui |
@@ -1347,7 +1423,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | Nível | Ferramenta | Cobre |
 |-------|-----------|-------|
 | Unit | Vitest | Agregado `Process` (todas as transições e invariantes), política de senha, cálculo de pendências, casos de uso com fakes in-memory, pipeline `withRoute` (ordem auth → authz → validação), mapeamento de erros, redator de logs |
-| Banco | pgTAP (`pnpm db:test`) | RLS cross-tenant, `anon` sem acesso, `authenticated` sem escrita direta, funções de CEO exigindo `aal2`, append-only de `audit_events`, `search_path` e `EXECUTE` de toda função `SECURITY DEFINER`, trigger de criação de perfil, invariantes de fase |
+| Banco | pgTAP (`pnpm db:test`) | RLS cross-tenant, `anon` sem acesso, `authenticated` sem escrita direta, funções de CEO exigindo `aal2`, append-only de `audit_events`, `search_path` e `EXECUTE` de toda função `SECURITY DEFINER`, trigger de criação de perfil, invariantes de fase, a secret key sem privilégio nas tabelas de rastreamento (019), a senha definitiva no RLS e em `is_ceo()` (020) e a auditoria do Auth e do provisionamento (021). Cada arquivo conta só as próprias linhas (roda depois de `pnpm test:api` sem `db:reset`) |
 | Integração | Vitest + Supabase local | Repositórios e gateways contra Postgres e Auth reais |
 | API | Vitest invocando os handlers com `NextRequest` + Supabase local | Fluxos completos por endpoint, cross-tenant (404), headers, problem+json, **validação das respostas contra o OpenAPI** |
 | Concorrência | Vitest (requisições paralelas) | AC-17 |
