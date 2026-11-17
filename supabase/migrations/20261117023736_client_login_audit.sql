@@ -24,8 +24,11 @@
 --       de entrada e privilégios iguais).
 --   (2) `record_account_provision_reverted`: o app a chama ANTES de apagar a conta que acabou de criar (a
 --       compensação de E-23 e de E-50). Sem ela a conta apagada deixava um `account.provisioned` sem fim, e o
---       log era o único rastro. Só vale para um login que ninguém usou (senha temporária pendente e nenhum
---       acesso): reverter o provisionamento de uma conta em uso seria um registro falso. Grava uma vez só.
+--       log era o único rastro. Só vale para a conta que a compensação pode ser: um login que ninguém usou
+--       (senha temporária pendente e nenhum acesso), criado há menos de 15 minutos (a compensação roda na mesma
+--       requisição) e que ainda NÃO tem `account.provisioned` (um login registrado não é um provisionamento a
+--       desfazer). Reverter uma conta em uso, velha ou já registrada seria um registro falso, e o app, ao ser
+--       recusado, não apaga a conta (falha fechada). Grava uma vez só.
 --   (3) `require_password_change` (o reset) faz o registro tardio de `account.provisioned` quando o login
 --       nunca o teve: é a recuperação de uma conta órfã (E-53, `provision_orphaned` e `provision_answer_lost`),
 --       que só é entregue pelo reset. O evento leva `{"late": true}` nos metadados e vem ANTES do
@@ -141,8 +144,13 @@ GRANT EXECUTE ON FUNCTION public.record_account_provisioned(uuid) TO authenticat
 -- B2. A compensação do provisionamento deixa rastro -----------------------------------------------------------------
 -- Chamada pelo app ANTES de apagar no Auth a conta que ele acabou de criar (e que o profile trigger já
 -- transformou em perfil): depois da exclusão o perfil não existe mais, e esta função não teria o que conferir.
--- O motivo é uma de duas palavras fechadas (as do `ProvisionTakeBackReason` do app). Só um login que ninguém
--- usou pode ser revertido; uma segunda chamada para o mesmo login não grava outro evento.
+-- O motivo é uma de duas palavras fechadas (as do `ProvisionTakeBackReason` do app). Só pode ser revertido um
+-- login que ninguém usou (senha temporária pendente e nenhum acesso) e criado há menos de 15 minutos: a
+-- compensação roda na mesma requisição que criou a conta, então um login mais velho não é dela (NOT_FOUND, como
+-- os outros alvos que não servem). Um login que JÁ tem `account.provisioned` é INVALID_INPUT: o registro
+-- aconteceu, e reverter seria contradizê-lo; o caminho do app em que o registro valeu mas a resposta se perdeu
+-- (ou não foi entendida) é recusado aqui e a conta fica como órfã, com o registro mantido, para o CEO resetar
+-- (falha fechada: nenhuma exclusão sem rastro). Uma segunda chamada para o mesmo login não grava outro evento.
 CREATE FUNCTION public.record_account_provision_reverted(p_user_id uuid, p_reason text)
 RETURNS void
 LANGUAGE plpgsql
@@ -151,6 +159,7 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
+  c_window    CONSTANT interval := interval '15 minutes';
   v_client_id uuid;
 BEGIN
   IF private.is_ceo() IS NOT TRUE THEN
@@ -168,9 +177,19 @@ BEGIN
      AND p.role = 'client'
      AND p.must_change_password
      AND u.last_sign_in_at IS NULL
+     AND p.created_at > now() - c_window
      FOR UPDATE OF p;
   IF NOT FOUND THEN
     RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.audit_events e
+     WHERE e.resource_id = p_user_id
+       AND e.action = 'account.provisioned'
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'INVALID_INPUT';
   END IF;
 
   IF EXISTS (

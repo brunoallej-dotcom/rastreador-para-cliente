@@ -1953,13 +1953,17 @@ describe('F-92 b and F-93: the audit of what is written to the Auth server and o
     const repeated = await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, {
       disabled: true,
     });
+    await expectContract('updateClientUser', repeated);
     expect(repeated.status).toBe(200);
     expect(await isBannedInAuth(login.id)).toBe(true);
   });
 
   it('F-92 b: an unban whose intent cannot be recorded is 503, the Auth server is not touched, and the login stays disabled and banned', async () => {
     const { tenant, login } = await tenantWithSignedInLogin();
-    await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true });
+    await expectContract(
+      'updateClientUser',
+      await updateClientUserViaApi(ceo.cookies, tenant.id, login.id, { disabled: true }),
+    );
     const spy = failing('/rest/v1/rpc/begin_client_login_admin');
     let response: Response;
     try {
@@ -2076,6 +2080,57 @@ describe('F-92 b and F-93: the audit of what is written to the Auth server and o
       await listClientUsersViaApi(ceo.cookies, tenant.id),
     );
     expect(listed.items).toEqual([body.user]);
+  });
+
+  it('F-117: a record whose ANSWER is lost but that did commit is on the trail: the reversal is refused, the account is NOT deleted (503, provision_orphaned) and the reset delivers it with no late event', async () => {
+    const tenant = await createClient();
+    const email = uniqueLoginEmail('registrada');
+    logged.lines.length = 0;
+
+    const lost = await whileWatching(
+      (method, path) =>
+        method === 'POST' && path === '/rest/v1/rpc/record_account_provisioned'
+          ? LOSE_ANSWER
+          : undefined,
+      async (traffic) => {
+        const response = await provisionClientUserViaApi(ceo.cookies, tenant.id, {
+          email,
+          displayName: 'Registro sem resposta',
+        });
+        return { response, deletes: traffic.calls.filter((call) => call.startsWith('DELETE ')) };
+      },
+    );
+
+    await expectUnavailable('provisionClientUser', lost.response);
+    // the account stayed: nothing was deleted, and the reversal was refused by the database
+    expect(lost.deletes).toEqual([]);
+    expect(await loginsWithEmail(email)).toBe(1);
+    const [orphaned] = events('identity.client_user.provision_orphaned');
+    expect(orphaned).toMatchObject({
+      level: 'error',
+      clientId: tenant.id,
+      deleteFailure: { kind: 'VALIDATION_ERROR' },
+    });
+    const [orphan] = (
+      await expectContract<ClientUserListBody>(
+        'listClientUsers',
+        await listClientUsersViaApi(ceo.cookies, tenant.id),
+      )
+    ).items;
+    expect(orphaned?.['targetUserId']).toBe(orphan?.id);
+    // the record is kept and nothing says the provisioning was reverted
+    expect((await auditOfAccount(orphan?.id ?? '')).map((row) => row.action)).toEqual([
+      'account.provisioned',
+    ]);
+
+    // the CEO delivers the account by resetting it: the record exists, so no late registration
+    const reset = await resetClientUserPasswordViaApi(ceo.cookies, tenant.id, orphan?.id ?? '');
+    await expectContract('resetClientUserPassword', reset);
+    expect((await auditOfAccount(orphan?.id ?? '')).map((row) => row.action)).toEqual([
+      'account.provisioned',
+      'account.password_set_intent',
+      'account.password_reset',
+    ]);
   });
 
   it('F-93: the compensation is fail closed: when the reversal cannot be recorded the account is NOT deleted, 503, and the log says why (provision_orphaned)', async () => {

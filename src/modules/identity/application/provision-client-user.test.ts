@@ -4,6 +4,7 @@ import {
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
+  ValidationError,
 } from '@/shared/kernel';
 import {
   ClientArchivedError,
@@ -18,6 +19,7 @@ import { UnexpectedAuthAnswerError } from '../domain/errors';
 import {
   CLIENT_A,
   UNKNOWN_CLIENT,
+  USER_A1,
   ceoPrincipal,
   clientPrincipal,
   fakePassword,
@@ -233,14 +235,28 @@ describe('provisionClientUser', () => {
     expect([...world.records.values()].some((record) => record.email === INPUT.email)).toBe(false);
   });
 
-  it('E-23: the record whose answer was lost is compensated all the same (the account is deleted)', async () => {
+  it('F-117: the record whose answer was lost IS on the trail: the reversal is refused (a login with account.provisioned is not a provisioning to undo), so the account is NOT deleted and stays an orphan with its record', async () => {
     const world = worldWithTwoClients();
     world.loseAnswerOf('recordProvisioned');
 
-    await expect(provisionClientUser(deps(world), ceoPrincipal, INPUT)).rejects.toBeInstanceOf(
-      ClientUserProvisionRolledBackError,
+    const error: unknown = await provisionClientUser(deps(world), ceoPrincipal, INPUT).catch(
+      (caught: unknown) => caught,
     );
-    expect([...world.records.values()].some((record) => record.email === INPUT.email)).toBe(false);
+
+    expect(error).toBeInstanceOf(ClientUserProvisionOrphanedError);
+    expect(error).toBeInstanceOf(ServiceUnavailableError);
+    expect(error).toMatchObject({
+      reason: 'record_failed',
+      deleteFailure: { kind: 'VALIDATION_ERROR' },
+    });
+    const orphan = [...world.records.values()].find((record) => record.email === INPUT.email);
+    // the account is there, its `account.provisioned` is kept, and nothing says it was reverted
+    expect(orphan).toMatchObject({ provisioned: true, mustChangePassword: true });
+    expect(world.trail).toEqual([{ userId: orphan?.id, event: 'account.provisioned' }]);
+    expect(world.reversals).toEqual([]);
+    expect(world.calls).not.toContain('deleteUser');
+    // a refusal of the database is final: the reversal was not tried a second time
+    expect(world.calls.filter((call) => call === 'recordProvisionReverted')).toHaveLength(1);
   });
 
   it('F-93: the record answers with the login, so nothing is read after it: a list that would fail then changes nothing', async () => {
@@ -454,6 +470,8 @@ describe('provisionClientUser', () => {
                 email: INPUT.email,
                 mustChangePassword: true,
                 lastSignInAt: null,
+                // a login the Auth server just created: nobody recorded `account.provisioned` yet
+                provisioned: false,
                 createdAt,
               });
             });
@@ -687,7 +705,7 @@ describe('provisionClientUser', () => {
       expect(accountOf(world)).toBeDefined();
     });
 
-    it('fail closed on the 403 branch too: a CEO the database no longer sees cannot record the reversal, so the account stays (an orphan), not an unaudited deletion', async () => {
+    it('F-114: Forbidden on the record and then Forbidden on the reversal (a CEO the database no longer sees) is DETERMINISTIC: 503 orphaned, the account stays, nothing is deleted without a trace', async () => {
       const world = worldWithTwoClients();
       const users = {
         ...world.users,
@@ -696,12 +714,56 @@ describe('provisionClientUser', () => {
       };
       world.refuseNext('recordProvisionReverted', new ForbiddenError('denied'));
 
-      await expect(
-        provisionClientUser({ ...deps(world), users }, ceoPrincipal, INPUT),
-      ).rejects.toBeInstanceOf(ClientUserProvisionOrphanedError);
+      const error: unknown = await provisionClientUser(
+        { ...deps(world), users },
+        ceoPrincipal,
+        INPUT,
+      ).catch((caught: unknown) => caught);
 
+      // not the 403 the record answered: the account exists and nobody was given its password
+      expect(error).toBeInstanceOf(ClientUserProvisionOrphanedError);
+      expect(error).toBeInstanceOf(ServiceUnavailableError);
+      expect(error).toMatchObject({
+        reason: 'record_failed',
+        deleteFailure: { kind: 'FORBIDDEN' },
+      });
+      expect(world.calls.filter((call) => call === 'recordProvisionReverted')).toHaveLength(1);
       expect(world.calls).not.toContain('deleteUser');
-      expect(accountOf(world)).toBeDefined();
+      expect(world.reversals).toEqual([]);
+      const orphan = accountOf(world);
+      expect(orphan).toBeDefined();
+      expect((error as ClientUserProvisionOrphanedError).userId).toBe(orphan?.id);
+    });
+
+    it('F-117: a login that is in use, or that already has account.provisioned, is refused by the reversal in the fake as the function does', async () => {
+      const world = worldWithTwoClients();
+      // a seeded login has its definitive password: not an unused login
+      const refusedOld = await world.users.recordProvisionReverted(USER_A1, 'record_failed');
+      expect(!refusedOld.ok && refusedOld.error).toBeInstanceOf(NotFoundError);
+      // a young login that already has its record
+      const young = world.seed({
+        id: '00000000-0000-4000-8000-0000000000a9',
+        clientId: CLIENT_A,
+        email: 'young@cliente.test',
+        mustChangePassword: true,
+        provisioned: true,
+        createdAt: new Date(),
+      });
+      const refusedRecorded = await world.users.recordProvisionReverted(young.id, 'record_failed');
+      expect(!refusedRecorded.ok && refusedRecorded.error).toBeInstanceOf(ValidationError);
+      expect(world.reversals).toEqual([]);
+    });
+
+    it('F-93: a second record of the same login is refused by the fake with a ValidationError, as the function does', async () => {
+      const world = worldWithTwoClients();
+      const created = await provisionClientUser(deps(world), ceoPrincipal, INPUT);
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+
+      const again = await world.users.recordProvisioned(created.value.user.id);
+
+      expect(!again.ok && again.error).toBeInstanceOf(ValidationError);
+      expect(world.trail.filter((entry) => entry.event === 'account.provisioned')).toHaveLength(1);
     });
 
     it('a deletion that fails after the reversal was recorded: the orphan error carries the deletion failure, and the reversal stays on the trail', async () => {

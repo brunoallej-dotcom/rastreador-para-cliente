@@ -7,7 +7,7 @@
 -- cliente, alvo CEO, alvo inexistente, entrada inválida, o evento gravado (ator, papel, recurso, cliente,
 -- request_id, metadados sem PII), nada gravado nas recusas, e o REVOKE de PUBLIC e anon.
 BEGIN;
-SELECT plan(92);
+SELECT plan(96);
 
 -- arrange (como postgres) ---------------------------------------------------------------------------------------
 -- Clientes A e B. a1 e a2 são logins de A, b1 é login de B (todos com a senha temporária, como nascem). a3 é login de A
@@ -402,6 +402,11 @@ SELECT tests.create_user('00000000-0000-4000-8000-0000000000a4', 'client', '0000
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a5', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a6', 'client', '00000000-0000-4000-8000-00000000000a');
 SELECT tests.create_user('00000000-0000-4000-8000-0000000000a7', 'client', '00000000-0000-4000-8000-00000000000a');
+-- a8 foi criado há 16 minutos (fora da janela da compensação) e a9 há 14 (dentro dela)
+SELECT tests.create_user('00000000-0000-4000-8000-0000000000a8', 'client', '00000000-0000-4000-8000-00000000000a');
+SELECT tests.create_user('00000000-0000-4000-8000-0000000000a9', 'client', '00000000-0000-4000-8000-00000000000a');
+UPDATE public.profiles SET created_at = now() - interval '16 minutes' WHERE id = '00000000-0000-4000-8000-0000000000a8';
+UPDATE public.profiles SET created_at = now() - interval '14 minutes' WHERE id = '00000000-0000-4000-8000-0000000000a9';
 UPDATE auth.users SET last_sign_in_at = now() WHERE id = '00000000-0000-4000-8000-0000000000a5';
 
 SELECT tests.set_request_id('req-rev-0001');
@@ -434,6 +439,20 @@ SELECT throws_ok(
   $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a1', 'record_failed') $$,
   'P0001', 'NOT_FOUND', 'F-93: nem um login que já trocou a senha'
 );
+SELECT throws_ok(
+  $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a8', 'record_failed') $$,
+  'P0001', 'NOT_FOUND', 'F-117: um login criado há mais de 15 minutos não é da compensação (que roda na mesma requisição): NOT_FOUND'
+);
+SELECT throws_ok(
+  $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a2', 'record_failed') $$,
+  'P0001', 'INVALID_INPUT', 'F-117: um login que JÁ tem account.provisioned (a2, novo e nunca usado) não é revertido: INVALID_INPUT, o registro vale'
+);
+SELECT is_empty(
+  $$ SELECT e.id FROM public.audit_events e
+      WHERE e.action = 'account.provision_reverted'
+        AND e.resource_id IN ('00000000-0000-4000-8000-0000000000a8', '00000000-0000-4000-8000-0000000000a2') $$,
+  'F-117: as duas recusas não gravaram account.provision_reverted'
+);
 
 SELECT lives_ok(
   $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a4', 'record_failed') $$,
@@ -446,6 +465,10 @@ SELECT lives_ok(
 SELECT lives_ok(
   $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a6', 'answer_lost') $$,
   'F-93: o outro motivo (answer_lost) vale também'
+);
+SELECT lives_ok(
+  $$ SELECT public.record_account_provision_reverted('00000000-0000-4000-8000-0000000000a9', 'record_failed') $$,
+  'F-117: um login de 14 minutos ainda está dentro da janela de 15'
 );
 SELECT tests.clear_authentication();
 
@@ -460,7 +483,10 @@ SELECT results_eq(
         'req-rev-0001', '{"reason": "record_failed"}'::jsonb),
        ('account.provision_reverted', '00000000-0000-4000-8000-0000000000c1'::uuid, 'ceo', 'account',
         '00000000-0000-4000-8000-0000000000a6'::uuid, '00000000-0000-4000-8000-00000000000a'::uuid, NULL::uuid,
-        'req-rev-0001', '{"reason": "answer_lost"}'::jsonb) $$,
+        'req-rev-0001', '{"reason": "answer_lost"}'::jsonb),
+       ('account.provision_reverted', '00000000-0000-4000-8000-0000000000c1'::uuid, 'ceo', 'account',
+        '00000000-0000-4000-8000-0000000000a9'::uuid, '00000000-0000-4000-8000-00000000000a'::uuid, NULL::uuid,
+        'req-rev-0001', '{"reason": "record_failed"}'::jsonb) $$,
   'F-93: a reversão vira um evento com o CEO, o cliente, o request_id e só o motivo; a segunda chamada não gravou outro'
 );
 SELECT is_empty(

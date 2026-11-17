@@ -186,7 +186,14 @@ export function createSupabaseAccountRepository(
       if (!error) return ok(undefined);
       // The action comes from a closed list of ours and the ids from a login the use case just found:
       // an INVALID_INPUT here is a defect of the app, never the CEO's input (like F-86), so it is a 500.
-      if (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) {
+      // The same for a CHECK violation or a value too long (23514, 22001): `refusalOf` would make them a
+      // 422/400 about the CEO's input, and neither `updateClientUser` nor `resetClientUserPassword`
+      // documents a 422.
+      const isDefect =
+        (error.code === RAISE_EXCEPTION && error.message === INVALID_INPUT_MESSAGE) ||
+        error.code === CHECK_VIOLATION ||
+        error.code === STRING_DATA_RIGHT_TRUNCATION;
+      if (isDefect) {
         throw upstreamFailure('begin_client_login_admin', safeCause(error, status), status);
       }
       return err(refusalOf('begin_client_login_admin', error, status));

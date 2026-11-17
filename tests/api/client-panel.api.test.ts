@@ -917,6 +917,7 @@ describe('who may read the client panel', () => {
       newPassword: `Panel-${randomUUID()}`,
     });
     expect(changed.status).toBe(204);
+    expectToMatchContract('changePassword', 204, undefined, changed);
     const opened = await listMyProcessesViaApi(jar);
     const body = await expectContract<MyProcessListBody>('listMyProcesses', opened);
     expect(opened.status).toBe(200);
@@ -961,6 +962,7 @@ describe('who may read the client panel', () => {
       newPassword: `Panel-${randomUUID()}`,
     });
     expect(changed.status).toBe(204);
+    expectToMatchContract('changePassword', 204, undefined, changed);
 
     // the pending password was the only difference: the same session now reads its own tenant, and only it
     const after = await supabase.from('processes').select('id');

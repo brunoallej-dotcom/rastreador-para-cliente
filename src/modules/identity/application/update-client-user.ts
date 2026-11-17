@@ -160,8 +160,13 @@ async function rebanAfterFailedEnable(
  * otherwise why not, as data (E-24, F-94): `unavailable` (transient), `not_found`, `unexpected`, or
  * `not_audited` (the intent could not be recorded, so the Auth server was NOT called: fail closed on the
  * audit, F-92 b; the database blocks the login all the same). Only these four are swallowed: an error
- * nobody classified (a bug) is thrown, because it is not something a CEO can retry into working. The
- * disable itself is already in the database either way.
+ * nobody classified (a bug) in the Auth call is thrown, because it is not something a CEO can retry into
+ * working. The disable itself is already in the database either way.
+ *
+ * The record of the intent is different: ANY failure of it, an outage or an error nobody classified, leaves
+ * the Auth server untouched, and the login is already disabled in the database, so a 500 would tell the CEO
+ * the disable failed when it did not. It is `not_audited` for an outage and a refusal, and `unexpected` for
+ * the rest (the notice is logged at `error`, so the defect is seen), like `rebanAfterFailedEnable` does.
  */
 async function tryBan(
   deps: UpdateClientUserDeps,
@@ -172,8 +177,7 @@ async function tryBan(
     const begun = await deps.users.beginAuthWrite(clientId, userId, 'ban');
     if (!begun.ok) return 'not_audited';
   } catch (error) {
-    if (error instanceof ServiceUnavailableError) return 'not_audited';
-    throw error;
+    return error instanceof ServiceUnavailableError ? 'not_audited' : 'unexpected';
   }
   try {
     const banned = await deps.accounts.setBanned(userId, true);

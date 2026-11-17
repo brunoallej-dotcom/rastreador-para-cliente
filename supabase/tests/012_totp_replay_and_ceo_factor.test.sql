@@ -296,7 +296,7 @@ SELECT tests.clear_authentication();
 -- c1 teve o fator removido acima: o JWT aal2 continua válido, mas não vale mais como CEO
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
+  (SELECT count(*)::integer FROM public.clients),
   0,
   'F-24: aal2 sem fator TOTP verificado (removido) não lê os clientes'
 );
@@ -309,7 +309,7 @@ SELECT tests.clear_authentication();
 -- c3: fator só candidato (não verificado): aal2 no JWT não basta
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c3', 'aal2');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
+  (SELECT count(*)::integer FROM public.clients),
   0,
   'F-24: aal2 com fator ainda não verificado não lê os clientes'
 );
@@ -322,7 +322,7 @@ VALUES ('00000000-0000-4000-8000-0000000006c6', '00000000-0000-4000-8000-0000000
         'telefone', 'phone', 'verified', now(), now(), '+5511999990002');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c6', 'aal2');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
+  (SELECT count(*)::integer FROM public.clients),
   0,
   'F-24: aal2 com um fator verificado que não é TOTP não lê os clientes'
 );
@@ -331,7 +331,7 @@ SELECT tests.clear_authentication();
 -- aal1 continua negado, mesmo com o fator verificado
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c2', 'aal1');
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
+  (SELECT count(*)::integer FROM public.clients),
   0,
   'AC-08: aal1, mesmo com fator verificado, não lê os clientes'
 );
@@ -342,7 +342,7 @@ SELECT tests.clear_authentication();
 SELECT tests.verify_totp('00000000-0000-4000-8000-0000000000c1');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2', false);
 SELECT is(
-  (SELECT count(*)::integer FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000000a'),
+  (SELECT count(*)::integer FROM public.clients),
   0,
   'F-24, F-63: um fator verificado novo não devolve o acesso ao mesmo JWT aal2: o atestado era do fator removido'
 );

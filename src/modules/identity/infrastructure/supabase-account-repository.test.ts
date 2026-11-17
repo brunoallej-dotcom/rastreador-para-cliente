@@ -224,6 +224,25 @@ describe('beginAuthWrite', () => {
     expect(error.cause).toEqual({ code: 'P0001', status: 400 });
   });
 
+  it.each([
+    ['a CHECK violation', '23514'],
+    ['a value that is too long', '22001'],
+  ])(
+    '%s is a defect of the app too: a 500, never a 400 or a 422 about the CEO',
+    async (_label, code) => {
+      const { repository } = fakeSupabase(failure(code, 'row with pessoa@cliente.test', 400));
+
+      const error = (await repository
+        .beginAuthWrite(CLIENT_ID, USER_ID, 'set_password')
+        .catch((caught: unknown) => caught)) as Error;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(ServiceUnavailableError);
+      expect(error).not.toBeInstanceOf(ValidationError);
+      expect(error.cause).toEqual({ code, status: 400 });
+    },
+  );
+
   it('a deadlock is a 503 that is safe to repeat, a transport failure too', async () => {
     for (const outcome of [
       failure('40P01', 'deadlock detected', 500),

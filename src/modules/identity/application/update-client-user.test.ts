@@ -630,14 +630,46 @@ describe('updateClientUser', () => {
       expect(world.intents).toEqual([{ userId: USER_A1, action: 'ban' }]);
     });
 
-    it('a bug in the record of the intent (not an outage, not a refusal) is thrown after the database disabled the login, like a bug in the ban', async () => {
+    it('a bug in the record of the intent (not an outage, not a refusal) is NOT a 500 after the database disabled the login: the Auth server is untouched, the answer is 200 and the notice says `unexpected`', async () => {
       const world = worldWithTwoClients();
+      const notices: ClientUserNotice[] = [];
       world.failNext('beginAuthWrite', 1, new TypeError('a bug'));
 
-      await expect(update(world, true)).rejects.toBeInstanceOf(TypeError);
+      const result = await update(world, true, notices);
 
-      expect(world.records.get(USER_A1)?.disabled).toBe(true);
+      expect(result.ok && result.value.disabled).toBe(true);
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: false });
       expect(world.calls).not.toContain('setBanned');
+      expect(notices).toEqual([{ kind: 'ban_failed', reason: 'unexpected' }]);
+    });
+
+    it('a bug in the record of the intent of the ban put back is reported as `unexpected` too, and the first failure is still the answer', async () => {
+      const world = worldWithTwoClients();
+      await update(world, true);
+      world.failNext('setDisabled', 1);
+      const notices: ClientUserNotice[] = [];
+      let calls = 0;
+      const users = {
+        ...world.users,
+        beginAuthWrite: (...args: Parameters<typeof world.users.beginAuthWrite>) => {
+          calls += 1;
+          if (calls === 2) return Promise.reject(new TypeError('a bug'));
+          return world.users.beginAuthWrite(...args);
+        },
+      };
+
+      await expect(
+        updateClientUser({ ...deps(world, notices), users }, ceoPrincipal, {
+          clientId: CLIENT_A,
+          userId: USER_A1,
+          disabled: false,
+        }),
+      ).rejects.toBeInstanceOf(ServiceUnavailableError);
+
+      expect(notices).toEqual([
+        { kind: 'reban_after_failed_enable', rebanned: false, reason: 'unexpected' },
+      ]);
+      expect(world.records.get(USER_A1)).toMatchObject({ disabled: true, banned: false });
     });
 
     it('E-56: the ban put back after a failed re-enable records its own intent first', async () => {

@@ -10,10 +10,10 @@
 -- `/me/*` com `CHANGE_PASSWORD` pendente (403 `PASSWORD_CHANGE_REQUIRED`, E-81).
 --
 -- A decisão (a regra vale no banco, não só na camada de cima):
---   * `current_client_id()`, o tenant que as policies de `processes` e `process_stages` usam, passa a
---     exigir `NOT must_change_password`. Os chamadores foram conferidos: só essas policies a usam
---     (nenhuma função de conta, e nenhum caminho de pendência). `current_active_user_id()` NÃO muda:
---     o principal do usuário pendente continua existindo.
+--   * `current_client_id()`, o tenant que as policies de `clients` (`clients_select_own_tenant`),
+--     `processes` e `process_stages` usam, passa a exigir `NOT must_change_password`. Os chamadores foram
+--     conferidos: só essas três policies a usam (nenhuma função de conta, e nenhum caminho de pendência).
+--     `current_active_user_id()` NÃO muda: o principal do usuário pendente continua existindo.
 --   * `is_ceo()` passa a exigir o mesmo. O atestado de um CEO com a senha pendente já era inalcançável
 --     pelo produto (enroll e verify têm `allowPending` sem `CHANGE_PASSWORD`, então o BFF os recusa), mas
 --     o banco não dizia isso: `attest_mfa_session` e `register_backend_totp_factor` não olham a

@@ -12,7 +12,7 @@
 -- privilégio; (5) as funções SECURITY DEFINER continuam escrevendo (o dono não depende destes
 -- privilégios) e `authenticated` continua só lendo.
 BEGIN;
-SELECT plan(46);
+SELECT plan(47);
 
 -- arrange (como postgres) -------------------------------------------------------------------------------
 INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000000a', 'Cliente A');
@@ -165,6 +165,18 @@ SELECT is_empty(
       WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'S'
         AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege('service_role', c.oid, 'USAGE,SELECT,UPDATE') END $$,
   'F-81: service_role não tem privilégio em sequência alguma de public'
+);
+
+-- O privilégio padrão revogado é o do dono das migrations (`FOR ROLE postgres`): uma relação de `public` de outro dono
+-- (criada pelo supabase_admin, por exemplo) herdaria o padrão da plataforma, que dá tudo a service_role, anon e
+-- authenticated (F-119). Toda relação de public é do postgres.
+SELECT is_empty(
+  $$ SELECT c.relname
+       FROM pg_class c
+      WHERE c.relnamespace = 'public'::regnamespace
+        AND c.relkind IN ('r', 'p', 'S', 'v', 'm')
+        AND c.relowner <> 'postgres'::regrole $$,
+  'T-39: toda relação de public é do postgres (o privilégio padrão revogado é o dele)'
 );
 
 -- (4) o privilégio padrão não concede nada à secret key -------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import {
   NotFoundError,
   ok,
   ServiceUnavailableError,
+  ValidationError,
   type DomainError,
   type Result,
 } from '@/shared/kernel';
@@ -240,6 +241,16 @@ export function createFakeClientUsers(
       if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
       if (record === undefined) return Promise.resolve(notFound());
+      // like the function: one `account.provisioned` per login, the second record is INVALID_INPUT (400)
+      if (record.provisioned) {
+        return Promise.resolve(
+          err(
+            new ValidationError('the login is already provisioned', [
+              { path: 'body', message: 'Invalid input' },
+            ]),
+          ),
+        );
+      }
       record.provisioned = true;
       audit(record, 'account.provisioned');
       leave(lose, 'recordProvisioned');
@@ -250,9 +261,20 @@ export function createFakeClientUsers(
       const refusal = refusalOf('recordProvisionReverted');
       if (refusal !== undefined) return Promise.resolve(refusal);
       const record = clientLogin(userId);
-      // like the function: only a login nobody used (pending password, no sign-in)
+      // like the function: only a login nobody used (pending password, no sign-in). The window of 15
+      // minutes is not mirrored: the use cases run on fixed clocks, and pgTAP 021 proves the window.
       if (record === undefined || !record.mustChangePassword || record.lastSignInAt !== null) {
         return Promise.resolve(notFound());
+      }
+      // like the function: a login that already has `account.provisioned` is not a provisioning to undo
+      if (record.provisioned) {
+        return Promise.resolve(
+          err(
+            new ValidationError('the login is already provisioned', [
+              { path: 'body', message: 'Invalid input' },
+            ]),
+          ),
+        );
       }
       // like the function: once only
       if (!record.audit.includes('account.provision_reverted')) {

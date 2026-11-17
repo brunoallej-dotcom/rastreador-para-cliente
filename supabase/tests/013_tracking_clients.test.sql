@@ -6,7 +6,17 @@
 -- idempotência das mudanças e a auditoria gravada na mesma transação (ator, papel, recurso, cliente,
 -- request_id, sem PII).
 BEGIN;
-SELECT plan(143);
+SELECT plan(144);
+
+-- A tabela inteira como o dono a vê (SECURITY DEFINER), para comparar com o que o RLS dá ao CEO. Vive só nesta transação.
+CREATE FUNCTION tests.clients_count_all()
+RETURNS integer
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$ SELECT count(*)::integer FROM public.clients $$;
+GRANT EXECUTE ON FUNCTION tests.clients_count_all() TO anon, authenticated, service_role;
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A, B, D e E são os clientes das fixtures (A ativo, B arquivado há 3 dias, D e E ativos), com datas no
@@ -477,6 +487,11 @@ SELECT results_eq(
       WHERE created_at = now() OR id IN ('00000000-0000-4000-8000-00000000000a', '00000000-0000-4000-8000-00000000000b', '00000000-0000-4000-8000-00000000000d', '00000000-0000-4000-8000-00000000000e') $$,
   $$ SELECT (4 + 1 + count(*))::int FROM good_names $$,
   'AC-09: CEO aal2 lê todos os clientes (fixtures e criados)'
+);
+SELECT results_eq(
+  $$ SELECT count(*)::integer FROM public.clients $$,
+  $$ SELECT tests.clients_count_all() $$,
+  'AC-09: e o que o RLS dá ao CEO é a tabela inteira, a mesma contagem que o dono vê (sem filtro de fixture)'
 );
 SELECT tests.clear_authentication();
 

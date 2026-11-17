@@ -13,7 +13,7 @@
 -- escreve), mas troca a senha, e depois da troca volta a ser CEO; sem atestado nada muda; (5) a função nova
 -- e o inventário das policies.
 BEGIN;
-SELECT plan(67);
+SELECT plan(69);
 
 -- arrange (como postgres) ---------------------------------------------------------------------------------------
 -- Clientes A e B, cada um com um processo de duas fases. a1: login de A com a senha definitiva (controle
@@ -326,6 +326,25 @@ SELECT is(
 );
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c3', 'aal2');
 SELECT is((SELECT private.is_ceo()), false, 'F-83: mas a sessão atestada dele não dá acesso de CEO enquanto a senha for temporária');
+SELECT tests.clear_authentication();
+
+-- Cliente arquivado: o login dele (senha definitiva) lê a própria linha, como a policy antiga fazia; arquivar só impede
+-- processos e logins novos (E-83, Q-13). É uma decisão documentada aqui, não um efeito colateral.
+INSERT INTO public.clients (id, name, archived_at)
+VALUES ('00000000-0000-4000-8000-00000000000c', 'Cliente Arquivado', now());
+SELECT tests.create_user('00000000-0000-4000-8000-0000000000d1', 'client', '00000000-0000-4000-8000-00000000000c');
+UPDATE public.profiles SET must_change_password = false WHERE id = '00000000-0000-4000-8000-0000000000d1';
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000d1');
+SELECT results_eq(
+  $$ SELECT id, name FROM public.current_client_summary() $$,
+  $$ VALUES ('00000000-0000-4000-8000-00000000000c'::uuid, 'Cliente Arquivado') $$,
+  'E-83: current_client_summary() devolve a própria linha de um cliente ARQUIVADO (id e nome), como a policy antiga'
+);
+SELECT results_eq(
+  $$ SELECT id FROM public.clients $$,
+  $$ VALUES ('00000000-0000-4000-8000-00000000000c'::uuid) $$,
+  'E-83: e a policy lê a mesma linha do cliente arquivado (arquivar não tira a leitura do que o cliente já tem)'
+);
 SELECT tests.clear_authentication();
 
 -- (5) a função nova e o inventário das policies ---------------------------------------------------------------------------------------------
