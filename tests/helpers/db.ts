@@ -346,21 +346,35 @@ export function insertProcessesAtSql(
 /**
  * Inserts `count` processes of a client that all carry the same creation instant (the tie a keyset on
  * `created_at` alone gets wrong), each with ONE stage in progress, so the read side accepts them, in one
- * transaction. Titles are `<label> 1` to `<label> <count>`. Returns the ids in the order the list shows
- * equals (`id` ascending).
+ * transaction. Titles are `<label> 1` to `<label> <count>`. Returns the ids and titles in the order the
+ * list shows equals (`id` ascending).
  */
+export async function insertTitledProcessesAtFixture(
+  clientId: string,
+  createdAt: string,
+  count: number,
+  label: string,
+): Promise<{ id: string; title: string }[]> {
+  if (!Number.isInteger(count) || count < 1 || count > MAX_FIXTURE_PROCESSES) {
+    throw new Error('insertProcessesAtFixture: the count is not a whole number from 1 to 50');
+  }
+  const ids = Array.from({ length: count }, () => randomUUID());
+  await execLocal(insertProcessesAtSql(clientId, createdAt, label, ids));
+  // the statement numbers the titles in the order of `ids` (WITH ORDINALITY): the same order here
+  return ids
+    .map((id, index) => ({ id, title: `${label} ${index + 1}` }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** `insertTitledProcessesAtFixture` for a test that needs the ids only. */
 export async function insertProcessesAtFixture(
   clientId: string,
   createdAt: string,
   count: number,
   label: string,
 ): Promise<string[]> {
-  if (!Number.isInteger(count) || count < 1 || count > MAX_FIXTURE_PROCESSES) {
-    throw new Error('insertProcessesAtFixture: the count is not a whole number from 1 to 50');
-  }
-  const ids = Array.from({ length: count }, () => randomUUID());
-  await execLocal(insertProcessesAtSql(clientId, createdAt, label, ids));
-  return ids.sort();
+  const inserted = await insertTitledProcessesAtFixture(clientId, createdAt, count, label);
+  return inserted.map((row) => row.id);
 }
 
 /**
@@ -557,4 +571,277 @@ export async function readAuditIds(
       `WHERE process_id = '${processId}' ORDER BY id`,
   );
   return auditIdRowsSchema.parse(rows);
+}
+
+// ------------------------------------------- tracking fixtures and reads (Wave 10.1, F-81) ----
+// The secret key no longer has any privilege on `clients`, `processes`, `process_stages` or
+// `stage_approvals` (migration `tracking_service_role_revoke`), so every fixture that writes them, and
+// every check that reads them past RLS, runs here as the operator, with the same discipline as above:
+// a UUID, a timestamp of one strict shape, a small whole number, or a text that goes into the statement
+// as the HEX of its UTF-8 bytes (`textLiteral`), so no character of it is ever SQL. No value the database
+// returns is put back into a statement.
+
+const MAX_TEXT_BYTES = 16 * 1024;
+const MAX_FIXTURE_CLIENTS = 50;
+
+/**
+ * SQL for a text value that cannot be anything but that text: the hex of its UTF-8 bytes, decoded by
+ * the database. Quotes, backslashes, `$`, NBSP, a BOM or a full-width letter all arrive exactly as they
+ * are, and nothing in them is ever parsed as SQL. Refuses an empty or oversized text.
+ */
+export function textLiteral(value: string, what: string): string {
+  if (typeof value !== 'string' || value === '' || Buffer.byteLength(value) > MAX_TEXT_BYTES) {
+    throw new Error(`${what}: the text is empty or too long`);
+  }
+  return `convert_from(decode('${Buffer.from(value, 'utf8').toString('hex')}', 'hex'), 'UTF8')`;
+}
+
+export type FixtureClientRow = { id: string; name: string };
+
+function assertCount(count: number, max: number, what: string): void {
+  if (!Number.isInteger(count) || count < 1 || count > max) {
+    throw new Error(`${what}: the count is not a whole number from 1 to ${max}`);
+  }
+}
+
+/**
+ * The statement of `insertClientsFixture`: ONE multi-row `INSERT`, so every client gets the same
+ * `created_at` (`now()` is the start of the transaction) unless an instant is given. The ids are the ones
+ * given, made by the caller.
+ */
+export function insertClientsSql(rows: readonly FixtureClientRow[], createdAt?: string): string {
+  const what = 'insertClientsFixture';
+  if (rows.length === 0) throw new Error(`${what}: no client to insert`);
+  if (createdAt !== undefined) assertTimestamp(createdAt, what);
+  const values = rows.map((row) => {
+    assertUuid(row.id, what);
+    const name = textLiteral(row.name, what);
+    return createdAt === undefined
+      ? `('${row.id}', ${name})`
+      : `('${row.id}', ${name}, '${createdAt}', '${createdAt}')`;
+  });
+  const columns = createdAt === undefined ? '(id, name)' : '(id, name, created_at, updated_at)';
+  return `INSERT INTO public.clients ${columns} VALUES ${values.join(', ')}`;
+}
+
+/**
+ * Inserts clients with the given names in ONE statement (same creation instant, or `createdAt` for all
+ * of them) and returns them in the order a list shows equals (`id` ascending). The names are inserted
+ * as they are, with no normalization: that is the point of a fixture.
+ */
+export async function insertClientsFixture(
+  names: readonly string[],
+  createdAt?: string,
+): Promise<FixtureClientRow[]> {
+  assertCount(names.length, MAX_FIXTURE_CLIENTS, 'insertClientsFixture');
+  const rows = names.map((name) => ({ id: randomUUID(), name }));
+  await execLocal(insertClientsSql(rows, createdAt));
+  return rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** One client (a tenant) for a test. */
+export async function insertClientFixture(name: string): Promise<FixtureClientRow> {
+  const [row] = await insertClientsFixture([name]);
+  if (row === undefined) throw new Error('insertClientFixture: the database inserted nothing');
+  return row;
+}
+
+/** The statement of `archiveClientFixture`. */
+export function archiveClientSql(clientId: string): string {
+  assertUuid(clientId, 'archiveClientFixture');
+  return `UPDATE public.clients SET archived_at = now() WHERE id = '${clientId}' RETURNING id`;
+}
+
+/** Archives a client as the operator (the API path of it is `PATCH /admin/clients`). */
+export async function archiveClientFixture(clientId: string): Promise<void> {
+  const rows = await queryLocal(archiveClientSql(clientId));
+  if (rows.length !== 1) throw new Error('archiveClientFixture: there is no such client');
+}
+
+/** How many processes of each state `seedProcessesFixture` makes. */
+export type SeedProcessCounts = { active?: number; completed?: number; cancelled?: number };
+
+type SeedIds = Readonly<Record<'active' | 'completed' | 'cancelled', readonly string[]>>;
+
+const SEED_STATES = [
+  ['active', 'Ativo'],
+  ['completed', 'Concluído'],
+  ['cancelled', 'Cancelado'],
+] as const;
+
+/**
+ * The statement of `seedProcessesFixture`: ONE statement with three chained data-modifying CTEs, so the
+ * processes, their stage and the approvals of the completed ones commit together. Every process has ONE
+ * stage that respects its state (I1 to I5): `in_progress` for an active process (I2) and for a cancelled
+ * one (frozen where it stopped, I4), `completed` with an approval for a completed one (I3, I5).
+ */
+export function seedProcessesSql(
+  clientId: string,
+  ids: SeedIds,
+  approverId: string | undefined,
+): string {
+  const what = 'seedProcessesFixture';
+  assertUuid(clientId, what);
+  if (approverId !== undefined) assertUuid(approverId, what);
+  const values = SEED_STATES.flatMap(([status, label]) =>
+    ids[status].map((id, index) => {
+      assertUuid(id, what);
+      const title = textLiteral(`${label} ${index + 1}`, what);
+      const completedAt = status === 'completed' ? 'now()' : 'NULL::timestamptz';
+      const cancelledAt = status === 'cancelled' ? 'now()' : 'NULL::timestamptz';
+      return `('${id}'::uuid, '${clientId}'::uuid, ${title}, '${status}'::public.process_status, ${completedAt}, ${cancelledAt})`;
+    }),
+  );
+  if (values.length === 0) throw new Error(`${what}: no process to insert`);
+  return [
+    'WITH p AS (',
+    '  INSERT INTO public.processes (id, client_id, title, status, completed_at, cancelled_at)',
+    `  VALUES ${values.join(', ')}`,
+    '  RETURNING id, status',
+    '), s AS (',
+    '  INSERT INTO public.process_stages (process_id, position, name, status, started_at, completed_at)',
+    "  SELECT id, 1, 'Unica',",
+    "         CASE WHEN status = 'completed' THEN 'completed' ELSE 'in_progress' END::public.stage_status,",
+    "         now(), CASE WHEN status = 'completed' THEN now() END",
+    '    FROM p',
+    '  RETURNING id, process_id, status',
+    ')',
+    'INSERT INTO public.stage_approvals (process_stage_id, process_id, approved_by)',
+    `SELECT s.id, s.process_id, ${approverId === undefined ? 'NULL::uuid' : `'${approverId}'::uuid`}`,
+    "  FROM s WHERE s.status = 'completed'",
+  ].join('\n');
+}
+
+/**
+ * Gives a client processes in the given states, each with a stage that respects the invariants of its
+ * state (the read side refuses a process that does not). `approverId` (a CEO) is required when any
+ * process is completed: the approval of its stage names who approved it.
+ */
+export async function seedProcessesFixture(
+  clientId: string,
+  counts: SeedProcessCounts,
+  approverId?: string,
+): Promise<void> {
+  const ids: SeedIds = {
+    active: Array.from({ length: counts.active ?? 0 }, () => randomUUID()),
+    completed: Array.from({ length: counts.completed ?? 0 }, () => randomUUID()),
+    cancelled: Array.from({ length: counts.cancelled ?? 0 }, () => randomUUID()),
+  };
+  const total = ids.active.length + ids.completed.length + ids.cancelled.length;
+  if (total === 0) return;
+  assertCount(total, MAX_FIXTURE_PROCESSES, 'seedProcessesFixture');
+  if (ids.completed.length > 0 && approverId === undefined) {
+    throw new Error('seedProcessesFixture: a completed process needs the CEO who approved it');
+  }
+  await execLocal(seedProcessesSql(clientId, ids, approverId));
+}
+
+const countRowsSchema = z.array(z.object({ n: z.number().int().nonnegative() }));
+
+async function countOf(sql: string): Promise<number> {
+  const row = countRowsSchema.parse(await queryLocal(sql))[0];
+  if (row === undefined) throw new Error('the database counted nothing');
+  return row.n;
+}
+
+/** How many clients exist, past RLS (a fixture check, never a behavior). */
+export async function countClients(): Promise<number> {
+  return countOf('SELECT count(*)::int AS n FROM public.clients');
+}
+
+/** How many clients carry exactly this name. */
+export async function countClientsNamed(name: string): Promise<number> {
+  return countOf(
+    `SELECT count(*)::int AS n FROM public.clients WHERE name = ${textLiteral(name, 'countClientsNamed')}`,
+  );
+}
+
+const clientRowSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  archived_at: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type ClientRow = z.infer<typeof clientRowSchema>;
+
+/** The client row as the database holds it, or `undefined`. */
+export async function readClientRow(clientId: string): Promise<ClientRow | undefined> {
+  assertUuid(clientId, 'readClientRow');
+  const rows = await queryLocal(
+    'SELECT id, name, archived_at, created_at, updated_at FROM public.clients ' +
+      `WHERE id = '${clientId}'`,
+  );
+  return z.array(clientRowSchema).parse(rows)[0];
+}
+
+/** How many processes a client has, in any state. */
+export async function countProcessesOf(clientId: string): Promise<number> {
+  assertUuid(clientId, 'countProcessesOf');
+  return countOf(`SELECT count(*)::int AS n FROM public.processes WHERE client_id = '${clientId}'`);
+}
+
+/** The titles of a client's processes, oldest first. */
+export async function readProcessTitlesOf(clientId: string): Promise<string[]> {
+  assertUuid(clientId, 'readProcessTitlesOf');
+  const rows = await queryLocal(
+    `SELECT title FROM public.processes WHERE client_id = '${clientId}' ORDER BY created_at, id`,
+  );
+  return z
+    .array(z.object({ title: z.string() }))
+    .parse(rows)
+    .map((row) => row.title);
+}
+
+/** How many processes carry exactly this title, whoever owns them. */
+export async function countProcessesTitled(title: string): Promise<number> {
+  return countOf(
+    `SELECT count(*)::int AS n FROM public.processes WHERE title = ${textLiteral(title, 'countProcessesTitled')}`,
+  );
+}
+
+const processRowSchema = z.object({
+  id: z.string(),
+  client_id: z.string(),
+  title: z.string(),
+  status: z.enum(['active', 'completed', 'cancelled']),
+  version: z.number().int(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  completed_at: z.string().nullable(),
+  cancelled_at: z.string().nullable(),
+});
+export type ProcessRow = z.infer<typeof processRowSchema>;
+
+/** The process row as the database holds it. Throws when there is none. */
+export async function readProcessRow(processId: string): Promise<ProcessRow> {
+  assertUuid(processId, 'readProcessRow');
+  const rows = await queryLocal(
+    'SELECT id, client_id, title, status, version, created_at, updated_at, completed_at, ' +
+      `cancelled_at FROM public.processes WHERE id = '${processId}'`,
+  );
+  const row = z.array(processRowSchema).parse(rows)[0];
+  if (row === undefined) throw new Error('readProcessRow: there is no such process');
+  return row;
+}
+
+const stageRowSchema = z.object({
+  id: z.string(),
+  position: z.number().int(),
+  name: z.string(),
+  description: z.string().nullable(),
+  status: z.enum(['pending', 'in_progress', 'completed']),
+  started_at: z.string().nullable(),
+  completed_at: z.string().nullable(),
+});
+export type StageRow = z.infer<typeof stageRowSchema>;
+
+/** The stages of a process in position order. */
+export async function readStageRows(processId: string): Promise<StageRow[]> {
+  assertUuid(processId, 'readStageRows');
+  const rows = await queryLocal(
+    'SELECT id, position, name, description, status, started_at, completed_at ' +
+      `FROM public.process_stages WHERE process_id = '${processId}' ORDER BY position`,
+  );
+  return z.array(stageRowSchema).parse(rows);
 }

@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { createClient as createSupabaseClient, type SupabaseClient } from '@supabase/supabase-js';
 import * as OTPAuth from 'otpauth';
 import type { Database } from '@/shared/db/database.types';
+import { insertClientFixture } from './db';
 
 type Env = 'SUPABASE_URL' | 'SUPABASE_PUBLISHABLE_KEY' | 'SUPABASE_SECRET_KEY';
 
@@ -73,15 +74,13 @@ export async function authUserExists(email: string): Promise<boolean> {
 
 export type FixtureClient = { readonly id: string; readonly name: string };
 
-/** A tenant. The secret key keeps DML on `public.clients` for fixtures (spec §4.2). */
+/**
+ * A tenant, inserted as the operator (psql in the database container, `tests/helpers/db.ts`): the secret
+ * key has no privilege on `public.clients` any more (F-81, spec §4.2).
+ */
 export async function createClient(name = `Cliente ${shortId()}`): Promise<FixtureClient> {
-  const { data, error } = await adminClient()
-    .from('clients')
-    .insert({ name })
-    .select('id, name')
-    .single();
-  if (error) throw new Error(`createClient failed: ${error.message}`);
-  return { id: data.id, name: data.name };
+  const { id } = await insertClientFixture(name);
+  return { id, name };
 }
 
 export type FixtureUser = {

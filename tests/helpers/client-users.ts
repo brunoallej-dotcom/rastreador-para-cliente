@@ -196,11 +196,5 @@ export async function loginsWithEmail(email: string): Promise<number> {
   }
 }
 
-/** Archives a client with the secret key (a fixture: the API path of it is `PATCH /admin/clients`). */
-export async function archiveClientFixture(clientId: string): Promise<void> {
-  const { error } = await adminClient()
-    .from('clients')
-    .update({ archived_at: new Date().toISOString() })
-    .eq('id', clientId);
-  if (error) throw new Error(`archiving a client failed: ${error.message}`);
-}
+/** Archives a client as the operator (a fixture: the API path of it is `PATCH /admin/clients`). */
+export { archiveClientFixture } from './db';

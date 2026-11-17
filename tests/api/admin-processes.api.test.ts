@@ -13,6 +13,7 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { encodeCursor } from '@/shared/http';
 import { updateClientViaApi } from '../helpers/clients';
 import { expectToMatchContract } from '../helpers/contract';
+import { archiveClientFixture, countProcessesTitled } from '../helpers/db';
 import {
   adminClient,
   ceoAal2Client,
@@ -275,11 +276,7 @@ describe('POST /admin/clients/{clientId}/processes', () => {
       expect(outcomeOf(unknown, unknownBody)).toEqual([404, 'NOT_FOUND']);
       expect(outcomeOf(malformed, malformedBody)).toEqual([400, 'VALIDATION_ERROR']);
       expect(malformedBody.errors?.map((issue) => issue.path)).toEqual(['params.clientId']);
-      const { count } = await adminClient()
-        .from('processes')
-        .select('id', { count: 'exact', head: true })
-        .eq('title', title);
-      expect(count).toBe(0);
+      expect(await countProcessesTitled(title)).toBe(0);
     });
   });
 
@@ -1234,10 +1231,7 @@ describe('the database on its own (F-52)', () => {
   it('E-16: straight through PostgREST, an archived client is CLIENT_ARCHIVED and an unknown one NOT_FOUND', async () => {
     const { supabase } = await ceoAal2Client();
     const tenant = await createClient();
-    await adminClient()
-      .from('clients')
-      .update({ archived_at: new Date().toISOString() })
-      .eq('id', tenant.id);
+    await archiveClientFixture(tenant.id);
 
     const archived = await supabase.rpc('create_process', {
       p_client_id: tenant.id,

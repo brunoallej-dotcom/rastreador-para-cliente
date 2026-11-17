@@ -8,17 +8,18 @@
 // not of the code under test. CI starts the stack once and never resets it, so there this costs one
 // request per file.
 //
-// Bounded and deterministic: `vi.waitFor` polls a real read (a client row, with the secret key) every
-// 500 ms for at most 30 s, and the failure says what PostgREST last answered. It spends none of the
-// budgets the tests care about (no login, no rate limiter) and writes nothing.
+// Bounded and deterministic: `vi.waitFor` polls a real read (a row of the default stage template, with
+// the secret key: static data with no tenant in it, and the secret key has no access to the tracking
+// tables since F-81) every 500 ms for at most 30 s, and the failure says what PostgREST last answered.
+// It spends none of the budgets the tests care about (no login, no rate limiter) and writes nothing.
 import { beforeAll, vi } from 'vitest';
 
 const READY_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 500;
 const REQUEST_TIMEOUT_MS = 5_000;
 
-/** One read of one row. Throws what PostgREST answered (its `code` and `message`, never a secret). */
-async function readOneClient(): Promise<void> {
+/** One read of one row of the template. Throws what PostgREST answered (its `code` and `message`, never a secret). */
+async function readOneTemplateRow(): Promise<void> {
   const url = process.env.SUPABASE_URL;
   const secretKey = process.env.SUPABASE_SECRET_KEY;
   if (url === undefined || secretKey === undefined) {
@@ -26,7 +27,7 @@ async function readOneClient(): Promise<void> {
       'SUPABASE_URL and SUPABASE_SECRET_KEY are not set (tests/setup/apply-local-env.ts)',
     );
   }
-  const response = await fetch(`${url}/rest/v1/clients?select=id&limit=1`, {
+  const response = await fetch(`${url}/rest/v1/default_stage_template?select=position&limit=1`, {
     headers: { apikey: secretKey, Authorization: `Bearer ${secretKey}` },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
@@ -43,7 +44,7 @@ async function readOneClient(): Promise<void> {
 
 beforeAll(async () => {
   try {
-    await vi.waitFor(readOneClient, { timeout: READY_TIMEOUT_MS, interval: POLL_INTERVAL_MS });
+    await vi.waitFor(readOneTemplateRow, { timeout: READY_TIMEOUT_MS, interval: POLL_INTERVAL_MS });
   } catch (error) {
     const last = error instanceof Error ? error.message : String(error);
     throw new Error(
