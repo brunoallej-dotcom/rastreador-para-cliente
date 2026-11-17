@@ -4,13 +4,13 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-16). Ondas 0 a 10 concluídas, mais os contratos
+- **Fase:** implementação em andamento (2026-11-17). Ondas 0 a 10.1 concluídas, mais os contratos
   `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próximas ondas:** 10.1 (endurecimento do banco), depois 11 (hardening e go-live, que depende
-  da configuração de produção do usuário).
+- **Próxima onda:** 11 (hardening e go-live). Ela depende da configuração de produção do
+  usuário e herda os itens da Onda 10.1 anotados no plano.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -28,7 +28,7 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 8 | Rastreamento: processos e fases (criar, listar, detalhar, renomear e cancelar, template) | 6.1 | 7 | ✅ |
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
-| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ⬜ |
+| 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
 
 Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
@@ -48,6 +48,7 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
 | Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
 | Q-07 (retenção) e Q-12 (domínio) | Onda 11 |
+| Revisar as decisões que a sessão principal tomou sozinha na Onda 10.1, com autonomia dada pelo usuário (lista no log de 2026-11-17) | nada; cada uma é reversível numa onda futura |
 
 ## Observações
 
@@ -613,3 +614,73 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   `test:int` → 22/22; `test:api` → 543/543 duas vezes;
   `test:api -t "AC-(1[678]|28)|E-0[1-4]"` → 25, três vezes seguidas; `build`, `format:check` e
   `pnpm sast` (0 achados) ok.
+
+### 2026-11-17 — Onda 10.1: endurecimento do banco
+
+- **Como foi executada:** subagente Sonnet (xhigh) em worktree, sozinho. O usuário deixou a sessão
+  principal como manager durante a noite, com autonomia para commit, push, PR e merge, decidindo
+  pelos princípios AISAC. As decisões tomadas sem o usuário estão no fim desta entrada.
+- **Entregue:**
+  - Migrations novas: `20261117022303_tracking_service_role_revoke`,
+    `20261117023041_settled_password_rls` e `20261117023736_client_login_audit`.
+  - pgTAP novos: 019, 020 e 021. ADR 0016. Spec: §3.7.4 e E-90 a E-95.
+  - **F-81:** o `service_role` perdeu todo privilégio, inclusive SELECT, em `clients`,
+    `processes`, `process_stages` e `stage_approvals`.
+    - Os default privileges do `postgres` não dão nada ao `service_role` em tabela ou sequência
+      nova.
+    - O pgTAP confere que toda relação de `public` pertence ao `postgres` (F-119).
+    - As fixtures foram para `tests/helpers/db.ts`: psql no container, texto passado como hex
+      UTF-8. `seedProcesses` agora cria fases.
+  - **F-83 (T-42):** `current_client_id()` exige `NOT must_change_password`, então o login com a
+    senha temporária pendente não lê nada do rastreamento pelo PostgREST.
+    - O nome do cliente no login e na sessão vem de `current_client_summary()`. Ela não tem
+      argumento e devolve só `id` e `name` do próprio cliente (F-111).
+    - `is_ceo()` ganhou o mesmo predicado (F-109).
+  - **F-92 b:** `begin_client_login_admin` grava `account.ban_intent`, `account.unban_intent` ou
+    `account.password_set_intent` antes de cada escrita no Auth. Se essa gravação falhar, o Auth
+    não é tocado.
+  - **F-93:**
+    - `record_account_provisioned` devolve a linha do login;
+    - `account.provision_reverted` é gravado antes da compensação. Só vale para login criado há
+      menos de 15 min e ainda sem `account.provisioned` (F-117);
+    - o reset de recuperação grava `account.provisioned` com `{late: true}`.
+  - **Higiene do pgTAP:** 010, 012, 013 e 016 contam só as próprias linhas. As asserções
+    negativas continuam sem filtro.
+  - **Refactor opcional, parcial:** os helpers compartilhados foram para
+    `tracking/infrastructure/database-errors.ts`. A paginação keyset em duas consultas não foi
+    extraída, porque difere por tabela.
+- **Revisões:** threat-modeler (T-52 a T-54, F-109 a F-119), code-reviewer, contract-guardian e
+  rls-auditor estático. Nenhum CRÍTICO ou ALTO. Corrigido na rodada única:
+  - a desativação não responde mais 500 quando a intenção falha por motivo que não é queda;
+  - 23514 e 22001 da intenção viram 500, sem 422 fora do contrato;
+  - a reversão ganhou janela de tempo e recusa depois do registro;
+  - as negativas do pgTAP 012 voltaram a contar sem filtro;
+  - guarda de dono das relações de `public`;
+  - a skill `new-migration` passou a pedir `REVOKE ALL`;
+  - o ADR 0016 e o F-81 não prometem mais do que o `REVOKE` entrega (T-53);
+  - E-91, E-93 e §3.7.4 reescritos.
+- **Decisões tomadas pela sessão principal sem o usuário (AISAC), para revisão:**
+  1. **SELECT também revogado do `service_role`** (privilégio mínimo). Nada legítimo lê essas
+     tabelas com a secret key, e com BYPASSRLS ela leria todos os clientes.
+  2. **Função nova `current_client_summary()`, executável por `authenticated`.** É um desvio do
+     brief: o predicado puro quebraria o primeiro login. Ela expõe menos que a policy antiga
+     (2 colunas em vez de 5).
+  3. **`is_ceo()` com o mesmo predicado** (defesa em profundidade). O BFF já impedia; agora o
+     banco também impede.
+  4. **Fail closed quando a auditoria falha:**
+     - intenção não gravada → a desativação vale no banco, sem ban no Auth, com aviso
+       `ban_failed`/`not_audited`;
+     - reversão não gravada → o login fica órfão, recuperável pelo reset, em vez de ser apagado
+       sem auditoria.
+     - **Consequência:** o ramo 403 do provisionamento e a resposta perdida do registro agora
+       terminam em 503 `provision_orphaned` (F-114), e não em exclusão limpa.
+  5. **`account.provisioned {late: true}` mantém o nome da ação** e atribui a adoção ao CEO que
+     resetou (F-118, só documentação).
+  6. **Itens empurrados para a Onda 11** e anotados no plano: T-53, T-54, F-110 com F-115, F-113,
+     F-114, F-118, F-119 e F-112.
+- **Verificado pela sessão principal**, sob o lock, a partir de `pnpm db:reset`:
+  - `pnpm verify` → 2850 unit + 1713 pgTAP; `db:lint` ok; `db:types` sem diff;
+  - `test:int` → 22/22; `test:api` → 555/555 duas vezes;
+  - `db:test` logo depois, sem reset → 1713/1713;
+  - `test:api -t "F-8[13]|F-9[23]|F-110"` → 14, três vezes seguidas;
+  - `build`, `format:check`, `test:hooks` (179), `pnpm sast` (0 achados) e `contract:lint` ok.
