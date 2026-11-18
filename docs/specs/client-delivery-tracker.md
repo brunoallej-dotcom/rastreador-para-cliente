@@ -581,8 +581,10 @@ stateDiagram-v2
 
 Toda função de escrita é `SECURITY DEFINER`, `SET search_path = ''`, tem `EXECUTE` revogado de
 `PUBLIC`/`anon` e concedido só ao papel necessário, valida os inputs (espelhando o Zod), grava
-`audit_events` na mesma transação e trava as linhas afetadas (`SELECT … FOR NO KEY UPDATE` no pai:
-cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funções).
+`audit_events` na mesma transação e trava as linhas afetadas, sempre **de pai para filho** (cliente, processo,
+fase): `SELECT … FOR NO KEY UPDATE` no pai que a função escreve, `FOR SHARE` no cliente que a função só consulta
+(`update_process`, `approve_current_stage`: F-87, §3.7.3); nunca `FOR UPDATE`, que cruzaria com o modo das outras
+funções.
 
 | Função | Executada por | Efeito |
 |--------|---------------|--------|
@@ -603,12 +605,12 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 | `register_backend_totp_factor(p_user_id, p_factor_id, p_session_id)` | **somente `service_role`** | Registra o fator que o enroll acabou de criar (CEO ativo, fator TOTP não verificado do usuário, sessão do usuário); idempotente. Devolve `registered` ou, se o usuário já teve um primeiro fator ativado, `factor_reenrolled` (audita e apaga as sessões, F-64) |
 | `record_backend_mfa_challenge(p_user_id, p_factor_id, p_challenge_id)` | **somente `service_role`** | Registra o challenge que o backend criou, antes de o Auth verificá-lo, com o estado do fator naquele instante; só aceita um challenge novo (menos de 60 s) e não verificado (F-67); idempotente |
 | `attest_mfa_session(p_user_id, p_session_id, p_factor_id, p_challenge_id)` | **somente `service_role`** | Atesta a sessão depois de um verify aceito pelo Auth (§3.4). Devolve `attested`, `attested_activated` (este atestado ativou o fator) ou o motivo da recusa; toda recusa audita `auth.mfa_attestation_refused` e os sinais de ataque apagam todas as sessões do usuário (F-66) |
-| `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. Cliente inexistente: `NOT_FOUND`; arquivado: `CLIENT_ARCHIVED`, sem evento (§3.7.2). `process.created` |
-| `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia e/ou cancela um processo **ativo**; concluído ou cancelado: `PROCESS_NOT_ACTIVE`. `process.updated` / `process.cancelled`, só quando algo muda (§3.7.2) |
-| `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. `stage.approved` (+ `process.completed`) |
+| `create_process(p_client_id, p_title, p_stages jsonb)` | authenticated + `is_ceo()` | Cria o processo e as fases (do template se `p_stages` for nulo); fase 1 `in_progress`. Cliente inexistente: `NOT_FOUND`; arquivado: `CLIENT_ARCHIVED`, sem evento (§3.7.2). Título já ativo no mesmo cliente: `PROCESS_TITLE_TAKEN`, sem evento (F-80, §3.7.2). `process.created` |
+| `update_process(p_process_id, p_title, p_cancel)` | idem | Renomeia e/ou cancela um processo **ativo**; concluído ou cancelado: `PROCESS_NOT_ACTIVE`. Processo de cliente arquivado: `CLIENT_ARCHIVED`, antes de tudo o mais (F-87). Renomear para um título já ativo no mesmo cliente: `PROCESS_TITLE_TAKEN` (F-80). `process.updated` / `process.cancelled`, só quando algo muda (§3.7.2) |
+| `approve_current_stage(p_process_id, p_expected_stage_id)` | idem | Conclui a fase atual, grava a aprovação, inicia a próxima ou conclui o processo. Processo de cliente arquivado: `CLIENT_ARCHIVED` (F-87, §3.7.3). `stage.approved` (+ `process.completed`) |
 | `rate_limit_hit(p_bucket, p_window_seconds, p_max)` | **somente `service_role`** | Contador de janela fixa; retorna `allowed` e `retry_after_seconds` |
 
-**Mapeamento de erros do banco** (feito em `infrastructure/`; o que não for mapeado vira 500, o `23505` bruto inclusive: o único que o app espera, o do índice de nome de cliente, as funções já trocam por `CLIENT_NAME_TAKEN`):
+**Mapeamento de erros do banco** (feito em `infrastructure/`; o que não for mapeado vira 500, o `23505` bruto inclusive: os dois únicos que o app espera, o do índice de nome de cliente e o do índice de título ativo de processo, as funções já trocam por `CLIENT_NAME_TAKEN` e `PROCESS_TITLE_TAKEN`):
 
 | Banco | Erro de domínio | HTTP / `code` |
 |-------|-----------------|---------------|
@@ -616,12 +618,13 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 | `P0001` + `NOT_FOUND` | `NotFoundError` | 404 `NOT_FOUND` |
 | `P0001` + `STALE_STAGE` | `StaleStageError` (o `currentStageId` vem de uma releitura do processo, §3.7.3: o erro do banco não leva a linha) | 409 `STALE_STAGE` |
 | `P0001` + `PROCESS_NOT_ACTIVE` | `ProcessNotActiveError` | 422 `PROCESS_NOT_ACTIVE` |
-| `P0001` + `CLIENT_ARCHIVED` | `ClientArchivedError` | 422 `CLIENT_ARCHIVED` |
+| `P0001` + `CLIENT_ARCHIVED` (`create_process`, `update_process`, `approve_current_stage`) | `ClientArchivedError` | 422 `CLIENT_ARCHIVED` |
 | `P0001` + `PASSWORD_UNCHANGED` | `PasswordUnchangedError` | 422 `PASSWORD_UNCHANGED` |
 | `P0001` + `USER_LIMIT_REACHED` | `UserLimitReachedError` | 422 `USER_LIMIT_REACHED` |
 | `P0001` + `INVALID_INPUT`, `23514`, `22001` | `ValidationError` | 400 `VALIDATION_ERROR` (nas funções de processo só o `INVALID_INPUT`: `23514` e `22001` são 500, §3.7.2) |
 | `P0001` + `INVARIANT_VIOLATION` (só `approve_current_stage`, §3.7.3) | nenhum: não está no catálogo, é erro inesperado, com `cause` só `{ code, status }` | 500 `INTERNAL_ERROR` |
 | `P0001` + `CLIENT_NAME_TAKEN` | `ConflictError` (o `detail` não diz qual é o outro cliente) | 409 `CONFLICT` |
+| `P0001` + `PROCESS_TITLE_TAKEN` | `ConflictError` (o `detail` não diz qual é o outro processo) | 409 `CONFLICT` |
 | `40P01` (deadlock) e `40001` (falha de serialização), pelo SQLSTATE e qualquer que seja o status HTTP do PostgREST (que dá 500 aos dois) | `ServiceUnavailableError`: o Postgres desfez a transação inteira, sem linha nem auditoria, e repetir é seguro | 503 `SERVICE_UNAVAILABLE` com `Retry-After` |
 
 #### 3.7.1 Clientes (Onda 6)
@@ -723,10 +726,16 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
 - **Cliente.** A linha do cliente é travada com `FOR NO KEY UPDATE` (a mesma de `update_client`), então
   criar um processo e arquivar o cliente se serializam: um processo nunca nasce num cliente que acabou de ser
   arquivado (E-16). Duas criações para o mesmo cliente também se serializam, o que não custa nada na escala
-  do §2.2. Cliente inexistente é `NOT_FOUND` (404); arquivado, `CLIENT_ARCHIVED` (422), sem processo e sem
-  evento. A ordem é: papel, entrada, cliente.
-- **Atualização.** Só um processo `active` muda (I3, I4): concluído ou cancelado responde `PROCESS_NOT_ACTIVE`
-  (422) a qualquer coisa, até a um renome para o mesmo título (E-60). `p_title` nulo não renomeia; `p_cancel`
+  do §2.2, e é isso que faz de duas criações simultâneas com o mesmo título um 201 e um 409 (F-80). Cliente
+  inexistente é `NOT_FOUND` (404); arquivado, `CLIENT_ARCHIVED` (422), sem processo e sem evento. A ordem é:
+  papel, entrada, cliente, e só então o `INSERT` (e o índice de título). `update_process` e
+  `approve_current_stage` também olham o cliente, com uma trava **mais fraca** (`FOR SHARE`, §3.7.3: a ordem de
+  trava do módulo é cliente, processo, fase).
+- **Atualização.** O processo de um cliente **arquivado** não muda (F-87, Q-13): renomear e cancelar respondem
+  `CLIENT_ARCHIVED` (422), nada é gravado nem auditado, e isso vence o resto, `PROCESS_NOT_ACTIVE` inclusive (a
+  precedência completa está em §3.7.3; E-99). Só um processo `active` muda (I3, I4): concluído ou cancelado
+  responde `PROCESS_NOT_ACTIVE` (422) a qualquer coisa, até a um renome para o mesmo título (E-60). `p_title`
+  nulo não renomeia; `p_cancel`
   nulo não cancela; `true` cancela; `false`, ou nenhum dos dois, é `INVALID_INPUT` (não há caminho de volta).
   Cancelar preenche `cancelled_at` e **congela as fases como estão**: a fase em andamento continua em
   andamento. Uma chamada que não muda nada (o mesmo título depois da normalização) devolve a linha como está,
@@ -734,7 +743,9 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   **cancelamento** que já foi gravado, não: é 422 `PROCESS_NOT_ACTIVE` (E-60). Uma que muda soma 1 à
   `version`, **uma vez**, mesmo que renomeie e cancele juntos (dois eventos, nessa ordem, E-61). A linha do
   processo é travada com `FOR NO KEY UPDATE`: as escritas do mesmo processo (e a aprovação, na Onda 9) se
-  serializam. Cancelar um processo já cancelado **não** é idempotente: é 422.
+  serializam. Cancelar um processo já cancelado **não** é idempotente: é 422. Renomear para um título que já é de
+  outro processo **ativo** do mesmo cliente é `PROCESS_TITLE_TAKEN` (409, F-80, abaixo); a recusa vem do `UPDATE`,
+  antes da auditoria, e desfaz tudo (nenhuma versão, nenhum evento).
 - **Auditoria sem PII.** Os metadados não levam o título nem o nome de fase: `process.created` e
   `process.cancelled` não têm metadados, e `process.updated` guarda só `{"fields":["title"]}`. O recurso e o
   `process_id` são o próprio processo, e o `client_id` é o do cliente. Consequência para a linha do tempo da
@@ -763,16 +774,45 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   sem processo é uma página vazia; cliente inexistente é 404 (a leitura do cliente só roda quando a lista vem
   vazia: uma linha já prova que ele existe). `status` filtra por `active`, `completed` ou `cancelled`.
 - **Template.** `GET /admin/stage-templates/default` lê `default_stage_template` em ordem de `position`.
-- **Retry de `createProcess`.** Um 503 não diz se o COMMIT aconteceu, e nada na requisição é chave natural:
-  repetir o `POST` depois de um 503 em que a primeira chamada foi gravada **cria um segundo processo** (dois
-  `process.created`). O CEO confere a lista do cliente antes de repetir (E-21). Isso vale também quando o
-  processo foi gravado e só a releitura que devolve o corpo falha. O `PATCH` que renomeia, repetido, é
-  idempotente; o que cancela, repetido depois de gravado, responde 422 `PROCESS_NOT_ACTIVE` e o CEO lê o
-  detalhe para ver que o processo ficou cancelado.
-  *Pendência do contrato:* a descrição da resposta compartilhada `ServiceUnavailable` manda ler, nas demais
-  escritas, "a descrição da própria operação", e a de `createProcess` ainda não diz isso; entra no próximo bump
-  de contrato.
-- **Erros do banco** (a tabela de §3.7 vale): `CLIENT_ARCHIVED` e `PROCESS_NOT_ACTIVE` viram 422, `NOT_FOUND`
+- **Título único entre os processos ativos de um cliente (F-80, Q-14; E-96 a E-98).** Dentro de um mesmo
+  cliente não há dois processos `active` com a mesma chave de título: a de §3.7.1 (`lower(normalize(title, NFKC))`,
+  sem as marcas de variação invisíveis e com cada sequência de espaços reduzida a um), então "Site novo", "SITE
+  NOVO" e "Site  novo" são o **mesmo** título, e as regras de §3.7.1 sobre o que vale como o mesmo texto (NFKC,
+  acento decomposto, o que o `lower()` do locale não dobra, o residual do "А" cirílico) valem aqui sem mudança
+  (índice único parcial `processes_client_active_title_key (client_id, <chave>) WHERE status = 'active'`, §4.3).
+  O título de **outro cliente** não conta (a chave leva o `client_id`), e o de um processo `completed` ou
+  `cancelled` sai do índice, então um título concluído ou cancelado pode ser usado de novo. Quem decide é o
+  índice, não uma consulta prévia. `create_process` e `update_process` pegam a violação **desse** índice (pelo
+  esquema, pela tabela e pelo nome do constraint; a de qualquer outro sobe como `23505`, e o app responde 500) e a
+  trocam por `P0001` + `PROCESS_TITLE_TAKEN`, sem DETAIL, HINT nem nome de constraint e sem o texto do erro
+  original (que traz o título normalizado); o app a mapeia para `ConflictError` (409 `CONFLICT`, `cause` só
+  `{ code }`) e a resposta não diz qual é o outro processo nem repete o título. A recusa vem do `INSERT` ou do
+  `UPDATE`, antes da auditoria, e desfaz a transação: nenhum evento, nenhuma fase, nenhuma versão. O conflito vale
+  pelo **estado final** da linha, como em §3.7.1: renomear e cancelar na mesma chamada não disputa o título (o
+  processo cancelado sai do índice); renomear para outra grafia do próprio título (maiúsculas, espaços) é permitido
+  (o `UPDATE` troca a própria linha do índice); e uma chamada que não muda nada, a que `update_process` já devolve
+  como está (o mesmo título depois da normalização), nunca dá 409. Duas criações para o mesmo cliente se serializam
+  na trava do cliente e a segunda leva o 409; dois renomes para o mesmo título em processos do mesmo cliente
+  disputam o índice, e o que chega depois espera o COMMIT do outro e leva o 409. Dois renomes que se cruzam (o
+  processo P1 para o título do P2 e o P2 para o do P1) esperam um pelo índice do outro: o Postgres derruba uma das
+  transações (`40P01`), que o app responde 503, e a outra termina em 409 (E-102). **A migration falha** se algum
+  banco já tem dois processos ativos de um mesmo cliente com a mesma chave: renomeie ou cancele um deles antes de
+  aplicá-la. Não há ambiente hospedado ainda, e nem o seed local nem as fixtures dos testes repetem título num
+  cliente. Rejeitado: `Idempotency-Key` (uma tabela de chaves, um cabeçalho novo e um segundo caminho para o mesmo
+  problema, quando o título único já resolve o retry).
+- **Retry de `createProcess` (F-80).** Um 503 não diz se o COMMIT aconteceu, mas **o `POST` não duplica mais o
+  processo**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), o
+  retry responde **409 `CONFLICT`** (o título dela está ativo no cliente), com um processo só e um só
+  `process.created`; se não foi gravada, o retry é a criação, 201. O mesmo vale para o duplo clique. O CEO que
+  recebe o 409 de um retry lista os processos do cliente para achar o que já existe (o 409 não traz o id dele, de
+  propósito). Um **título igual de propósito**, para um segundo contrato, exige outro título: um dos dois processos
+  precisa terminar ou ser cancelado antes, ou o título precisa mudar (uma sufixação como "Site novo (2)" vale). O
+  `PATCH` que renomeia, repetido, é idempotente; o que cancela, repetido depois de gravado, responde 422
+  `PROCESS_NOT_ACTIVE` e o CEO lê o detalhe para ver que o processo ficou cancelado. A descrição da operação
+  `createProcess` e a de `updateProcess` no contrato (`1.0.0-draft.4`) dizem isso, e a da resposta compartilhada
+  `ServiceUnavailable` manda ler, nas demais escritas, a descrição da própria operação.
+- **Erros do banco** (a tabela de §3.7 vale): `CLIENT_ARCHIVED` e `PROCESS_NOT_ACTIVE` viram 422,
+  `PROCESS_TITLE_TAKEN` vira 409 `CONFLICT`, `NOT_FOUND`
   vira 404 (o texto diz "Client not found." na criação e "Process not found." na atualização) e `INVALID_INPUT`
   vira 400. **`23514` e `22001` não viram 400 aqui, e sim 500** (F-86): `private.visible_text` é mais estrito do
   que todo CHECK das tabelas que as duas funções escrevem, então uma violação de CHECK ou um valor longo demais
@@ -796,24 +836,53 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   `approveCurrentStage` do agregado (`tracking/domain/process.ts`: só a fase atual, uma aprovação por fase, a
   última fase conclui o processo, `completed_at` e `version` mudam uma vez), e um teste de API compara, passo
   a passo, o que o banco grava com o que a transição pura prevê.
-- **Ordem de trava e de erro (F-82, T-41).** A função trava **primeiro a linha do processo**, com `FOR NO KEY
-  UPDATE` (a mesma consulta e o mesmo modo de `update_process`, então as duas se serializam), lê o `status` **depois
-  da trava** e só então trava a fase em andamento, também com `FOR NO KEY UPDATE`. Nenhuma escrita vem antes
-  das duas travas e nada trava `public.clients`. Nunca `FOR UPDATE` no processo (cruzaria com o outro modo) e
-  nunca a fase antes do processo (deadlock com o cancelamento). A precedência dos erros é: papel (42501),
-  entrada (`INVALID_INPUT`), processo (`NOT_FOUND`), `status` (`PROCESS_NOT_ACTIVE`, que vence um `STALE_STAGE`:
-  E-03) e a fase esperada (`STALE_STAGE`). Uma fase esperada que não é a atual (já concluída, ainda `pending`, de
+- **Ordem de trava e de erro (F-82, T-41, F-87).** A ordem de trava do módulo é **de pai para filho: cliente,
+  processo, fase**. `approve_current_stage` lê o `client_id` do processo **sem trava** (ele nunca muda: nenhuma função
+  o escreve), trava a linha do **cliente** com `FOR SHARE` (e lê o `archived_at` já com a trava), trava a linha do
+  **processo** com `FOR NO KEY UPDATE` (a mesma consulta e o mesmo modo de `update_process`, então as duas se
+  serializam, e a consulta confere o `client_id` lido), lê o `status` **depois da trava** e só então trava a fase em
+  andamento, também com `FOR NO KEY UPDATE`. Nenhuma escrita vem antes das travas. Nunca `FOR UPDATE` no processo
+  (cruzaria com o outro modo), nunca a fase antes do processo (deadlock com o cancelamento) e nunca o processo antes
+  do cliente (abaixo). A precedência dos erros é: papel (42501), entrada (`INVALID_INPUT`), processo (`NOT_FOUND`),
+  **cliente arquivado (`CLIENT_ARCHIVED`)**, `status` (`PROCESS_NOT_ACTIVE`, que vence um `STALE_STAGE`: E-03) e a
+  fase esperada (`STALE_STAGE`). O arquivado vem antes do status porque a decisão de arquivar vale para todos os
+  processos do cliente, e o CEO precisa saber que desarquivar é o primeiro passo, mesmo que o processo, além disso,
+  já esteja concluído (E-99). Uma fase esperada que não é a atual (já concluída, ainda `pending`, de
   **outro** processo ou inexistente) é sempre `STALE_STAGE`, nunca `NOT_FOUND` e nunca pula fase (E-72). O pgTAP
   confere a ordem no catálogo (`prosrc`, sem os comentários, sem diferença de caixa), e os testes de API a provam
-  com a trava na mão: uma segunda sessão do banco segura a linha do processo (ou a da fase, ou roda a função de
-  verdade sem fazer COMMIT), as requisições disparadas esperam nela (o teste confere no `pg_stat_activity` e em
-  `pg_blocking_pids` que todas estão bloqueadas **por essa sessão**, direta ou através de outra requisição) e só então a
-  trava é solta, o que dá o mesmo resultado em toda execução, sem `sleep`. A ordem em si é provada pelo teste em que a
-  sessão segura **só a fase**: a aprovação já tem a trava do processo e espera pela fase, e um cancelamento disparado
-  nesse momento também espera, atrás dela. Com a fase travada antes do processo, o cancelamento passaria na hora e o
-  teste falha. A sessão segurada se limita sozinha (`lock_timeout`, `statement_timeout` e
+  com a trava na mão: uma segunda sessão do banco segura a linha do processo (ou a da fase, ou a do cliente, ou roda
+  a função de verdade sem fazer COMMIT), as requisições disparadas esperam nela (o teste confere no `pg_stat_activity`
+  e em `pg_blocking_pids` que todas estão bloqueadas **por essa sessão**, direta ou através de outra requisição) e só
+  então a trava é solta, o que dá o mesmo resultado em toda execução, sem `sleep`. A ordem em si é provada pelo teste
+  em que a sessão segura **só a fase**: a aprovação já tem a trava do processo e espera pela fase, e um cancelamento
+  disparado nesse momento também espera, atrás dela. Com a fase travada antes do processo, o cancelamento passaria
+  na hora e o teste falha. A sessão segurada se limita sozinha (`lock_timeout`, `statement_timeout` e
   `idle_in_transaction_session_timeout`, todos abaixo do timeout do teste) e é encerrada dos dois lados no `finally`
   (F-108).
+- **Por que o cliente vem antes do processo, e com `FOR SHARE` (F-87).** O congelamento do cliente arquivado só vale
+  se a aprovação vê o `archived_at` **depois** de ter esperado o que precisava esperar:
+  - *O `JOIN` na consulta que trava o processo não basta.* `FROM processes p JOIN clients c … FOR NO KEY UPDATE OF
+    p` não trava o cliente e, no `READ COMMITTED`, depois de esperar a trava do processo reavalia só a linha travada:
+    o `archived_at` que ele usa é o do começo da consulta. Uma aprovação parada atrás de outra (ou atrás de um
+    cancelamento) passaria sobre um arquivamento que gravou durante a espera. A janela seria o tempo da espera, e um
+    teste com a trava na mão a mostra.
+  - *`FOR SHARE` no cliente fecha a janela.* Ele conflita com o `FOR NO KEY UPDATE` de `update_client` (que arquiva) e
+    de `create_process`, e com o `FOR UPDATE` do gatilho do perfil, e **não** conflita com outro `FOR SHARE`: duas
+    aprovações (ou renomes) de processos do mesmo cliente não esperam uma pela outra. A aprovação que chega durante
+    um arquivamento espera o COMMIT dele e, ao seguir, lê a versão gravada da linha (o `READ COMMITTED` reavalia a
+    linha travada): vê `archived_at` e responde `CLIENT_ARCHIVED`. Um arquivamento que chega **depois** de a
+    aprovação ter pegado a trava espera o COMMIT dela: a aprovação vale, e o arquivamento vem depois. Não existe
+    escrita num processo que passe sobre um arquivamento já gravado.
+  - *O processo antes do cliente abriria um deadlock.* `create_process` segura o cliente (`FOR NO KEY UPDATE`) e o
+    `INSERT` espera, no índice único do título (F-80), um renome ainda não gravado; se esse renome já segurasse o
+    processo e pedisse o cliente, as duas esperariam uma pela outra. Com cliente, processo e fase sempre nessa ordem,
+    não há ciclo: quem segura o cliente nunca espera por processo nem por fase (`update_client` não toca em
+    processo, e o `INSERT` de `create_process` cria um processo que ninguém mais enxerga), e quem segura o processo
+    já passou pelo cliente. Nenhuma função pede `FOR SHARE` e depois `FOR NO KEY UPDATE` na mesma linha de cliente
+    (uma troca de trava que as duas esperariam).
+  - *Custo.* A aprovação e a edição de um processo esperam um `update_client` (ou um `create_process`, ou o gatilho de
+    perfil de um login novo) do mesmo cliente em andamento, que dura milissegundos. A trava marca a linha do cliente
+    (um `xmax` com a trava compartilhada, sem versão nova), sem relevância na escala do §2.2.
 - **Instantes.** A fase concluída, a aprovação, a fase iniciada e o `updated_at` e o `completed_at` do processo usam
   o mesmo instante `v_at`: o maior entre `now()` e o `started_at` da fase. **A auditoria não usa `v_at`:**
   `private.record_audit_event` não recebe instante, e o `occurred_at` dela é o `now()` da transação, o relógio do
@@ -852,24 +921,37 @@ cliente e processo; nunca `FOR UPDATE`, que cruzaria com o modo das outras funç
   primeira chamada o deixou; se não foi gravada, o retry é a própria aprovação, 200. Isso vale também quando a
   função gravou e só a releitura que devolve o corpo falhou. O CEO que recebe o 409 ou o 422 de um retry lê o
   detalhe (`GET /admin/processes/{processId}`): `stages[].approval` diz que a fase foi concluída e por quem.
-  *Pendência do contrato:* a descrição de `approveCurrentStage` já trata o 409 como "outro CEO já aprovou ou houve
-  um retry", mas não diz que o retry da última fase é 422 `PROCESS_NOT_ACTIVE`; entra no próximo bump de contrato,
-  junto com a pendência de `createProcess` (§3.7.2). A descrição da resposta 200 de `approveCurrentStage` ("devolve o
-  processo atualizado") também deve dizer que o corpo é o processo relido logo depois do COMMIT, que pode já incluir
-  uma mudança concorrente e nunca mostra um estado anterior a esta aprovação.
+  Contrato (`1.0.0-draft.4`): a descrição de `approveCurrentStage` diz que o retry da última fase é 422
+  `PROCESS_NOT_ACTIVE`, e a da resposta 200 diz que o corpo é o processo relido logo depois do COMMIT, que pode já
+  incluir uma mudança concorrente e nunca mostra um estado anterior a esta aprovação.
 - **Requisito para o frontend (T-51, F-107).** O `expectedStageId` protege contra aprovar a **mesma** fase duas
   vezes, mas não contra um cliente que reenvia o "Ok" com o `currentStageId` que acabou de receber: isso aprova a
   fase **seguinte**, que o CEO nunca viu. Então o cliente da API (a Onda de frontend) **nunca reenvia uma aprovação
   sozinho**, nem com o `currentStageId` de um 409 `STALE_STAGE`, nem depois de um 503, nem num `retry` automático da
   biblioteca de fetch. Um 409 ou um 503 mostra ao CEO a fase atual e **quem aprovou a anterior** (do detalhe), e um
-  novo "Ok" é sempre um clique novo, sobre o que a tela mostra naquele momento. Entra no próximo bump de contrato,
-  na descrição de `approveCurrentStage`.
-- **Cliente arquivado (F-87, Q-13).** Hoje arquivar o cliente **não** congela os processos que ele já tem: aprovar
-  vale, como renomear e cancelar (§3.7.2). O pgTAP registra o comportamento atual, e a decisão de produto é do
-  usuário. Se arquivar passar a congelar, a mudança é pequena e igual nas duas funções: ler o `archived_at` do
-  cliente na mesma consulta que trava o processo (um `JOIN`, sem travar `public.clients`: a ordem de trava do
-  processo antes do cliente seria o inverso da de `create_process`) e levantar o erro escolhido (`CLIENT_ARCHIVED`
-  ou `PROCESS_NOT_ACTIVE`) logo depois da trava do processo.
+  novo "Ok" é sempre um clique novo, sobre o que a tela mostra naquele momento. Está na descrição de
+  `approveCurrentStage` desde a `1.0.0-draft.4`.
+- **Cliente arquivado congela os processos (F-87, Q-13, decidido em 2026-11-17).** Arquivar o cliente impede
+  processos e logins novos (Q-08) **e** congela os processos que ele já tem: aprovar a fase, renomear e cancelar
+  respondem **422 `CLIENT_ARCHIVED`**, sem gravar nada e sem auditar, nas três funções (`approve_current_stage`,
+  `update_process` para o renome e para o cancelamento), e vale para o processo em qualquer status. A **leitura**
+  não muda: o cliente arquivado e o CEO continuam lendo a lista e o detalhe (E-83). **Desarquivar**
+  (`PATCH … { "archived": false }`) descongela: a aprovação, o renome e o cancelamento voltam a valer, com o
+  processo como estava (nada mudou nele enquanto isso). Criar processo para cliente arquivado segue 422
+  `CLIENT_ARCHIVED` (E-16). Os logins do cliente arquivado continuam entrando (Q-08, E-54): congelar processos não
+  é congelar contas.
+  - **Quem decide é a função, na ordem de §3.7.3 acima**, com a trava `FOR SHARE` do cliente. O que o app faz é o
+    mapeamento (`P0001` + `CLIENT_ARCHIVED` → `ClientArchivedError`, 422), o mesmo da criação.
+  - **Precedência** (a mesma nas três funções, E-99): papel (42501), entrada (`INVALID_INPUT`), processo (`NOT_FOUND`,
+    404), `CLIENT_ARCHIVED` (422), `PROCESS_NOT_ACTIVE` (422), título em uso (`PROCESS_TITLE_TAKEN`, 409, só na
+    atualização) ou fase esperada (`STALE_STAGE`, 409, só na aprovação). O 404 vem primeiro porque o cliente de um
+    processo que não existe não existe também, e o arquivado vem antes do status porque é a causa que o CEO resolve
+    primeiro.
+  - **Corrida com o arquivamento.** `update_client` com `archived: true` trava a linha do cliente com `FOR NO KEY
+    UPDATE` e só toca nessa linha. Como a aprovação e a edição de processo pedem `FOR SHARE` na mesma linha, as duas
+    coisas se serializam, e o resultado é o mesmo qualquer que seja a ordem em que chegam: a escrita que pega a trava
+    primeiro termina antes da outra começar a decidir (E-100). Não sobra janela: **nenhum processo muda depois de o
+    `archived_at` do cliente ser gravado**, a não ser que o cliente seja desarquivado.
 - **Linha do tempo (RF-12, AC-28).** `GET /admin/processes/{processId}/events` é um query service próprio
   (`supabase-process-event-queries.ts`), não o repositório do agregado. Lê, como o CEO (RLS), quatro coisas simples,
   nenhuma com valor numa string de filtro do PostgREST: o processo (inexistente: 404); uma página de `audit_events`
@@ -1275,6 +1357,7 @@ cliente plenamente ativo, e um CEO com a senha temporária de volta, mesmo com a
 |--------|-------------|
 | `profiles (client_id) WHERE role = 'client'` | listar os logins de um cliente |
 | `processes (client_id, created_at DESC)` | aba do cliente e `/me/processes` |
+| `processes (client_id, lower(normalize(title, NFKC)), sem marcas de variação invisíveis, espaços reduzidos) WHERE status = 'active'` (unique) | título de processo único entre os ativos de um cliente: 409 `CONFLICT` ao criar e ao renomear (F-80) |
 | `process_stages (process_id, position)` (unique) | detalhe do processo |
 | `process_stages (process_id) WHERE status = 'in_progress'` (unique) | fase atual / invariante I2 |
 | `stage_approvals (process_id)` | detalhe de CEO |
@@ -1369,7 +1452,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-94 | Provisionar: a lista falha depois do registro | Não importa: o 201 vem do retorno de `record_account_provisioned`, sem releitura (F-93) |
 | E-95 | A secret key lê ou escreve `clients`, `processes`, `process_stages` ou `stage_approvals` pelo PostgREST | 403 `42501`, em toda operação (F-81) |
 | E-82 | Processo sem fase, ou que quebra I1 a I4, na lista ou no detalhe do cliente | 500 `INTERNAL_ERROR`, sem mostrar nada dele nem do título; o log leva só o id do processo e as invariantes (F-81). Os outros clientes não são afetados |
-| E-83 | Cliente arquivado lê os processos que já tem | 200 na lista e no detalhe (Q-13): arquivar só impede processos e logins novos |
+| E-83 | Cliente arquivado lê os processos que já tem | 200 na lista e no detalhe (Q-13): arquivar impede processos e logins novos e congela os processos que já existem (E-99), mas não a leitura deles |
 | E-08 | Conta desativada com JWT ainda válido | 401 na próxima requisição (sessões apagadas + checagem no banco) |
 | E-09 | Logout em outro dispositivo | A sessão daquele dispositivo é revogada; as demais seguem (escopo `local`) |
 | E-10 | Refresh token reutilizado (roubo) | O Supabase revoga a família; 401 |
@@ -1378,12 +1461,12 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-13 | Nova senha igual à atual | 422 `PASSWORD_UNCHANGED` |
 | E-14 | `Content-Type` diferente de JSON / corpo > 16 KiB / campo desconhecido | 415 / 413 / 400 |
 | E-15 | POST sem `Origin` ou com origem estranha | 403 `ORIGIN_NOT_ALLOWED` |
-| E-16 | Criar processo ou login para cliente arquivado | 422 `CLIENT_ARCHIVED`. No processo (Onda 8), nada é criado nem auditado, com o template ou com fases informadas, e arquivar e criar ao mesmo tempo se serializam pelo cliente (§3.7.2); os processos que o cliente já tem continuam na lista e no detalhe |
+| E-16 | Criar processo ou login para cliente arquivado | 422 `CLIENT_ARCHIVED`. No processo (Onda 8), nada é criado nem auditado, com o template ou com fases informadas, e arquivar e criar ao mesmo tempo se serializam pelo cliente (§3.7.2); os processos que o cliente já tem continuam na lista e no detalhe, e não mudam (E-99) |
 | E-17 | Provisionar e-mail já cadastrado | 409 `EMAIL_ALREADY_REGISTERED` (visível só para CEO) |
 | E-18 | Limite de 10 logins por cliente atingido | 422 `USER_LIMIT_REACHED` |
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
-| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes`, que cria sem chave natural, **pode duplicar**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 201 com um **segundo** processo e a auditoria tem dois `process.created` (§3.7.2), então o CEO confere a lista do cliente antes de repetir; no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
+| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes` também nunca duplica, pelo título único entre os ativos do cliente (F-80): se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 409 `CONFLICT` (E-98), um processo só e um só `process.created`, e o CEO lista os processos do cliente para achar o que já existe (§3.7.2); no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: grava `account.provision_reverted`, apaga o usuário criado, responde 503 e loga em `error` (se o `provision_reverted` não grava, ou se o registro chegou a valer, não apaga: E-93) |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
@@ -1427,6 +1510,13 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-73 | Linha do tempo de um processo renomeado | `process.updated` sem `previousTitle` nem `newTitle`: a trilha não guarda títulos (SEC-16, §3.7.2), e o título de hoje estaria errado depois de um renome seguinte. Nenhum título aparece na resposta |
 | E-74 | Cursor da linha do tempo adulterado, de outro endpoint, com um id que não é decimal canônico (zero, zero à esquerda, sinal) ou acima do maior `bigint` | 400 `VALIDATION_ERROR` em `query.cursor` (E-29). O maior `bigint` é uma posição válida: página vazia |
 | E-75 | Evento da linha do tempo cujo ator não tem perfil legível, ou `stage.approved` cuja fase não é achada | `actor: null`, ou só `details.stageId` (os detalhes do contrato são opcionais): a linha do tempo mostra o que há, sem 500 |
+| E-96 | Criar processo com o título de outro processo **ativo** do mesmo cliente (igual depois da chave de §3.7.1: "Site novo" e "SITE NOVO", "Site  novo" com espaços repetidos, "Ｓite novo" de largura total), com o template ou com fases informadas | 409 `CONFLICT`; nada é criado, nenhuma fase, nenhum evento, e a resposta não traz o id nem o título do outro processo (F-80, §3.7.2) |
+| E-97 | `PATCH` que renomeia para o título de outro processo ativo do mesmo cliente | 409 `CONFLICT`; o processo fica como estava (mesma versão, sem evento). Trocar só as maiúsculas, ou os espaços, do próprio título é permitido (200); renomear para o mesmo título é o 200 sem mudança de E-61; título novo em uso **e** `status: "cancelled"` na mesma chamada vale (200, dois eventos): o estado final não disputa o título |
+| E-98 | Título que só existe em processos `completed` ou `cancelled`, ou só em outro cliente; duas criações simultâneas com o mesmo título; retry de `POST …/processes` depois de um 503 | Livre: criar e renomear funcionam, e o título de um processo concluído ou cancelado pode ser reusado. Duas criações simultâneas para o mesmo cliente: exatamente um 201 e um 409 `CONFLICT`, um processo só. Retry depois de um 503: primeira chamada gravada, 409 e um processo só; não gravada, 201 (E-21) |
+| E-99 | Aprovar a fase, renomear ou cancelar um processo de cliente **arquivado** (qualquer status do processo) | 422 `CLIENT_ARCHIVED`; nada muda, nada é auditado, as fases ficam como estavam (F-87, Q-13). Precedência: processo inexistente (404), `CLIENT_ARCHIVED`, `PROCESS_NOT_ACTIVE`, título em uso (409) ou `STALE_STAGE` (409): um processo concluído ou cancelado de cliente arquivado responde `CLIENT_ARCHIVED`, e um `expectedStageId` velho num processo de cliente arquivado também |
+| E-100 | Cliente arquivado e depois desarquivado | Arquivado: a lista e o detalhe seguem 200 (E-83) e criar processo segue 422 (E-16). Desarquivado (`archived: false`): aprovar, renomear e cancelar voltam a valer, no processo como estava |
+| E-101 | Aprovação (ou renome, ou cancelamento) e arquivamento do mesmo cliente ao mesmo tempo | Serializam pela trava `FOR SHARE` do cliente (§3.7.3): a escrita que pega a trava primeiro conclui antes de a outra decidir. Aprovação atrás de um arquivamento em andamento: 422 `CLIENT_ARCHIVED`, mesmo que ela tenha chegado antes do COMMIT dele. Arquivamento atrás de uma aprovação: a aprovação vale (200) e o cliente fica arquivado. Nunca uma escrita de processo depois de o `archived_at` ser gravado, nunca deadlock |
+| E-102 | Dois `PATCH` que se cruzam ao mesmo tempo no mesmo cliente, o processo P1 para o título do P2 e o P2 para o do P1 | O Postgres detecta o deadlock dos dois índices e derruba uma das transações: 503 `SERVICE_UNAVAILABLE` com `Retry-After`, sem nada gravado nem auditado. A outra termina em 409 `CONFLICT` (o título do outro processo não saiu). Repetir a que caiu dá 409 ou 200, conforme o estado de então (como E-47) |
 
 ---
 
@@ -1485,21 +1575,21 @@ para o goal command de cada onda conseguir contá-los.
 
 ## 8. Questões em aberto
 
-Todas têm um **default adotado**, para a implementação não travar. Os CEOs confirmam ou ajustam.
+Todas têm um **default adotado**, para a implementação não travar. Os CEOs confirmam ou ajustam. As que dizem **Decidido** já passaram por essa confirmação (decisões do usuário em 2026-11-17, Onda 10.2) e deixaram de ser default.
 
 | ID | Questão | Default adotado |
 |----|---------|-----------------|
-| Q-01 | Quais são as fases padrão e os nomes delas? | Placeholder no seed: Contrato assinado · Briefing · Planejamento · Execução · Revisão · Entrega final |
+| Q-01 | Quais são as fases padrão e os nomes delas? | **Decidido (2026-11-17):** os nomes ficam como estão na migration (`default_stage_template`): Contrato assinado · Briefing · Planejamento · Execução · Revisão · Entrega final. Mudar o template é uma migration nova |
 | Q-02 | Um cliente pode ter mais de um processo (vários contratos)? | Sim, o modelo é 1:N. O painel do cliente lista todos |
 | Q-03 | Um cliente pode ter mais de um login? | Sim, até 10 por cliente |
 | Q-04 | A senha inicial é gerada pelo sistema ou digitada pelo CEO? | Gerada (20 caracteres, CSPRNG), exibida uma vez e trocada no primeiro acesso |
 | Q-05 | É preciso desfazer um "Ok" dado por engano? | Fora da v1; candidato à v1.1 (`POST …/approvals/revert` com auditoria) |
 | Q-06 | O cliente deve ver mensagens por fase ("aguardando aprovação do layout")? | Fora da v1; candidato à v1.1 (coluna `client_message`) |
-| Q-07 | Por quanto tempo guardar auditoria e contas depois do fim do contrato? | Auditoria por 5 anos; contas desativadas ao arquivar e anonimizadas após 1 ano (validar com o jurídico) |
-| Q-08 | Arquivar um cliente deve desativar os logins dele automaticamente? | Não na v1: arquivar só impede novos processos e novos logins |
+| Q-07 | Por quanto tempo guardar auditoria e contas depois do fim do contrato? | **Decidido (2026-11-17):** a auditoria é guardada por 5 anos, e as contas de cliente são anonimizadas 1 ano depois de o cliente ser arquivado. A implementação (`pg_cron`) é da Onda 11. Arquivar **não** desativa as contas (Q-08, E-54, E-83): elas seguem entrando até a anonimização. Validar os prazos com o jurídico antes do go-live |
+| Q-08 | Arquivar um cliente deve desativar os logins dele automaticamente? | Não na v1: arquivar impede novos processos e novos logins e congela os processos que já existem (Q-13), mas as contas seguem entrando |
 | Q-09 | O cliente pode ver o nome do CEO que aprovou cada fase? | Não (dado interno) |
 | Q-10 | Notificar o cliente quando a fase muda (e-mail ou WhatsApp)? | Fora da v1 |
 | Q-11 | Limite rígido de 4 contas de CEO? | Não no banco; o script avisa quando passar de 4 |
-| Q-12 | Qual é o domínio de produção? | A definir; vai em `APP_ORIGIN` |
-| Q-13 | Arquivar um cliente também congela os processos que ele já tem (F-87)? | Não: arquivar só impede processos e logins novos (Q-08); renomear e cancelar os processos existentes continua valendo. Decisão de produto do usuário |
-| Q-14 | Como evitar o processo duplicado quando o CEO repete um `POST` depois de um 503 (F-80, T-38)? | Nada no contrato hoje: o CEO confere a lista antes de repetir (E-21). Opções, as duas mudam o contrato: título único e normalizado entre os processos ativos de um cliente (409 `CONFLICT`), ou `Idempotency-Key`. Decisão do usuário |
+| Q-12 | Qual é o domínio de produção? | **Decidido por ora (2026-11-17):** o domínio padrão que a Vercel atribui (`*.vercel.app`) vai em `APP_ORIGIN`. Um domínio próprio pode vir depois, e aí só o valor de `APP_ORIGIN` (e o CSRF de SEC-08) muda |
+| Q-13 | Arquivar um cliente também congela os processos que ele já tem (F-87)? | **Decidido (2026-11-17): sim.** Aprovar a fase, renomear e cancelar um processo de cliente arquivado respondem 422 `CLIENT_ARCHIVED`; a leitura continua (E-83) e desarquivar descongela (§3.7.3, E-99 a E-101) |
+| Q-14 | Como evitar o processo duplicado quando o CEO repete um `POST` depois de um 503 (F-80, T-38)? | **Decidido (2026-11-17):** título único e normalizado entre os processos **ativos** de um cliente, com 409 `CONFLICT` ao criar e ao renomear (§3.7.2, E-96 a E-98). `Idempotency-Key` foi rejeitado |
