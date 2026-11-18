@@ -151,6 +151,53 @@ export function approveStageSql(
   );
 }
 
+/** The titles a held statement may carry: letters, digits, spaces, dot, dash and underscore (nothing to escape). */
+const HELD_TITLE_PATTERN = /^[A-Za-z0-9 ._-]{1,160}$/;
+
+function assertTitle(value: string): void {
+  if (!HELD_TITLE_PATTERN.test(value)) {
+    throw new Error('held transaction: the title has characters a held statement does not carry');
+  }
+}
+
+/**
+ * `update_client` archiving the client, as the CEO (Wave 10.2, F-87): it takes the row lock the freeze is
+ * decided against (`FOR NO KEY UPDATE` on the client), and the transaction stays open.
+ */
+export function archiveClientSql(identity: CeoIdentity, clientId: string): string {
+  assertUuid(clientId, 'the client id');
+  return (
+    `${asCeoSql(identity)} ` +
+    `SELECT id FROM public.update_client('${clientId}', NULL, true); RESET ROLE;`
+  );
+}
+
+/**
+ * `create_process`, as the CEO (F-80): it takes the client row lock and inserts the process, so a second
+ * creation for the same client parks behind it and then meets the title in the unique index.
+ */
+export function createProcessSql(identity: CeoIdentity, clientId: string, title: string): string {
+  assertUuid(clientId, 'the client id');
+  assertTitle(title);
+  return (
+    `${asCeoSql(identity)} ` +
+    `SELECT id FROM public.create_process('${clientId}', '${title}'); RESET ROLE;`
+  );
+}
+
+/**
+ * `update_process` renaming the process, as the CEO (F-80): it holds the process row and an uncommitted
+ * entry of the title in the unique index, which another rename to the same title waits for.
+ */
+export function renameProcessSql(identity: CeoIdentity, processId: string, title: string): string {
+  assertUuid(processId, 'the process id');
+  assertTitle(title);
+  return (
+    `${asCeoSql(identity)} ` +
+    `SELECT id FROM public.update_process('${processId}', '${title}', NULL); RESET ROLE;`
+  );
+}
+
 export type HeldTransaction = {
   /** The backend pid of the held session: what `waitForLockWaiters` counts the blocked requests against. */
   readonly pid: number;
@@ -162,6 +209,12 @@ export type HeldTransaction = {
   cancelProcess(identity: CeoIdentity, processId: string): Promise<void>;
   /** Runs the REAL `approve_current_stage`; the transaction stays open. */
   approveStage(identity: CeoIdentity, processId: string, expectedStageId: string): Promise<void>;
+  /** Runs the REAL `update_client` that archives the client; the transaction stays open. */
+  archiveClient(identity: CeoIdentity, clientId: string): Promise<void>;
+  /** Runs the REAL `create_process`; the transaction stays open. */
+  createProcess(identity: CeoIdentity, clientId: string, title: string): Promise<void>;
+  /** Runs the REAL `update_process` that renames the process; the transaction stays open. */
+  renameProcess(identity: CeoIdentity, processId: string, title: string): Promise<void>;
   /** Commits, which releases every lock the transaction holds. */
   commit(): Promise<void>;
   /**
@@ -294,6 +347,10 @@ export async function openHeldTransaction(): Promise<HeldTransaction> {
     cancelProcess: (identity, processId) => run(cancelProcessSql(identity, processId)),
     approveStage: (identity, processId, expectedStageId) =>
       run(approveStageSql(identity, processId, expectedStageId)),
+    archiveClient: (identity, clientId) => run(archiveClientSql(identity, clientId)),
+    createProcess: (identity, clientId, title) => run(createProcessSql(identity, clientId, title)),
+    renameProcess: (identity, processId, title) =>
+      run(renameProcessSql(identity, processId, title)),
     async commit() {
       await run('COMMIT;');
       child.stdin.end();

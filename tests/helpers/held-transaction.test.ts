@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   approveStageSql,
+  archiveClientSql,
   asCeoSql,
   cancelProcessSql,
+  createProcessSql,
   lockProcessSql,
   lockStageSql,
   OPEN_TRANSACTION_SQL,
   parseBackendPid,
+  renameProcessSql,
   REPORT_PID_SQL,
   type CeoIdentity,
 } from './held-transaction';
@@ -83,6 +86,34 @@ describe('the statements of a held transaction (what a test sends to the databas
     expect(() => approveStageSql(IDENTITY, PROCESS_ID, bad)).toThrow(/not a UUID/);
     expect(() => asCeoSql({ ...IDENTITY, userId: bad })).toThrow(/not a UUID/);
     expect(() => asCeoSql({ ...IDENTITY, sessionId: bad })).toThrow(/not a UUID/);
+  });
+});
+
+describe('the statements of Wave 10.2 (F-80, F-87): archive, create and rename as the CEO', () => {
+  it('archiveClientSql calls the REAL update_client with archived = true, as the CEO, and gives the role back', () => {
+    const sql = archiveClientSql(IDENTITY, PROCESS_ID);
+
+    expect(sql.startsWith(asCeoSql(IDENTITY))).toBe(true);
+    expect(sql).toContain(`public.update_client('${PROCESS_ID}', NULL, true)`);
+    expect(sql.trimEnd().endsWith('RESET ROLE;')).toBe(true);
+  });
+
+  it('createProcessSql and renameProcessSql call the REAL functions with the title as a plain literal', () => {
+    expect(createProcessSql(IDENTITY, PROCESS_ID, 'Site novo')).toContain(
+      `public.create_process('${PROCESS_ID}', 'Site novo')`,
+    );
+    expect(renameProcessSql(IDENTITY, PROCESS_ID, 'Site novo')).toContain(
+      `public.update_process('${PROCESS_ID}', 'Site novo', NULL)`,
+    );
+  });
+
+  it('refuses an id that is not a UUID and a title that needs escaping, before any SQL is built', () => {
+    expect(() => archiveClientSql(IDENTITY, "x'; DROP TABLE public.clients; --")).toThrow(
+      /not a UUID/,
+    );
+    expect(() => createProcessSql(IDENTITY, PROCESS_ID, "O'Brien")).toThrow(/title/);
+    expect(() => renameProcessSql(IDENTITY, PROCESS_ID, '')).toThrow(/title/);
+    expect(() => renameProcessSql(IDENTITY, 'not-a-uuid', 'Site')).toThrow(/not a UUID/);
   });
 });
 
