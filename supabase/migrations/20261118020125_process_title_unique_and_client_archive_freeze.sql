@@ -198,10 +198,15 @@ GRANT EXECUTE ON FUNCTION public.create_process(uuid, text, jsonb) TO authentica
 --     `archived_at` gravado (READ COMMITTED reavalia a linha travada). Um `JOIN` que lesse o `archived_at` na mesma
 --     consulta que trava o processo NÃO fecharia a janela: depois de esperar a trava do processo, a reavaliação só
 --     refaz a linha travada, e o cliente seria o do começo da consulta.
---   * Nunca o processo antes do cliente: `create_process` segura o cliente e o `INSERT` espera, no índice de título,
---     um renome ainda não gravado; se esse renome já segurasse o processo e pedisse o cliente, seria deadlock.
--- A trava do processo confere o `client_id` lido; se o processo sumiu ou trocou de cliente nesse intervalo (nunca
--- acontece pelas funções), é `NOT_FOUND`.
+--   * É também a convenção única do módulo: de pai para filho (cliente, processo, fase) em toda função de escrita. Não
+--     há ciclo de espera: quem segura o cliente em modo EXCLUSIVO (`update_client`, `create_process`, o gatilho do
+--     perfil) nunca espera por processo nem por fase, e quem segura o processo já passou pelo cliente. O único ciclo
+--     possível é o dos renomes cruzados, abaixo (F-123). Nenhuma função pede `FOR SHARE` e depois `FOR NO KEY UPDATE`
+--     na mesma linha de cliente.
+-- A trava do cliente que não acha a linha é `NOT_FOUND` (falha fechada: a chave estrangeira é `ON DELETE RESTRICT`, então
+-- hoje não acontece, mas um cliente que sumiu nunca é lido como "não arquivado"). A trava do processo confere o
+-- `client_id` lido; se o processo sumiu ou trocou de cliente nesse intervalo (nunca acontece pelas funções), é
+-- `NOT_FOUND`.
 --
 -- Título único (F-80): como em `create_process`, a violação do NOSSO índice vira `PROCESS_TITLE_TAKEN` e as outras
 -- sobem cruas. O conflito vale pelo estado FINAL da linha: renomear e cancelar na mesma chamada não disputa o título
@@ -258,6 +263,9 @@ BEGIN
     FROM public.clients c
    WHERE c.id = v_client_id
      FOR SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
+  END IF;
 
   -- 3. O processo, com a mesma trava de `approve_current_stage` (as duas se serializam).
   SELECT p.id, p.client_id, p.title, p.status, p.version, p.created_at, p.updated_at,
@@ -329,11 +337,11 @@ GRANT EXECUTE ON FUNCTION public.update_process(uuid, text, boolean) TO authenti
 -- mensagem do banco fica fixa.
 --
 -- Ordem de trava, de pai para filho: cliente (`FOR SHARE`), processo (`FOR NO KEY UPDATE`), fase em andamento
--- (`FOR NO KEY UPDATE`). A razão e a análise do deadlock estão no comentário de `update_process` acima (F-82, T-41,
--- F-87): o processo é a primeira linha que ESTA função escreve a travar (a mesma consulta e o mesmo modo de
--- `update_process`), a fase só vem depois do `status` lido com a trava, e o cliente, que ela só consulta, vem antes
--- dos dois para um arquivamento em andamento ser esperado (e visto) em vez de ultrapassado. Nenhuma escrita vem antes
--- das travas, e nunca `FOR UPDATE` no processo.
+-- (`FOR NO KEY UPDATE`). A razão está no comentário de `update_process` acima (F-82, T-41, F-87): o processo é a
+-- primeira linha que ESTA função escreve a travar (a mesma consulta e o mesmo modo de `update_process`), a fase só
+-- vem depois do `status` lido com a trava, e o cliente, que ela só consulta, vem antes dos dois para um arquivamento
+-- em andamento ser esperado (e visto) em vez de ultrapassado. Nenhuma escrita vem antes das travas, e nunca
+-- `FOR UPDATE` no processo.
 --
 -- Instantes. A fase concluída, a aprovação, a fase iniciada e o processo usam o MESMO instante `v_at`, o maior
 -- entre `now()` e o `started_at` da fase. A auditoria NÃO usa `v_at`: `private.record_audit_event` não recebe
@@ -389,6 +397,9 @@ BEGIN
     FROM public.clients c
    WHERE c.id = v_client_id
      FOR SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'NOT_FOUND';
+  END IF;
 
   -- 3. O processo, travado ANTES de qualquer fase (F-82). `FOR NO KEY UPDATE`, nunca `FOR UPDATE`.
   SELECT p.id, p.client_id, p.title, p.status, p.version, p.created_at, p.updated_at,

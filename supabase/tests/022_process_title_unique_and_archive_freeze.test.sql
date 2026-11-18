@@ -15,7 +15,7 @@
 --   cliente (FOR SHARE), processo e fase (FOR NO KEY UPDATE), de pai para filho. A espera de verdade (um arquivamento
 --   em andamento) está nos testes de API, que seguram a trava numa segunda sessão.
 BEGIN;
-SELECT plan(155);
+SELECT plan(165);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A e B são clientes ativos; X é arquivado no meio do arquivo, pelo próprio `update_client`. a1 é login de A e x1,
@@ -61,15 +61,17 @@ AS $$
     FROM public.processes p WHERE p.id = p_id
 $$;
 
--- O que o banco guarda de um cliente: processos, fases e eventos de auditoria de processo (a recusa de um título
--- repetido não deixa nada: nem processo, nem fase órfã, nem evento).
-CREATE FUNCTION pg_temp.client_state(p_id uuid)
+-- O que o banco guarda, sem filtro nenhum (nem por cliente, nem por processo, nem por ação): as linhas de processos,
+-- de fases e de auditoria. Um caso que precisa provar "a recusa não escreveu nada" compara esta linha antes e depois, e
+-- por isso uma escrita com o `client_id`, o `process_id` ou a ação trocados por um defeito também aparece (RA3).
+CREATE FUNCTION pg_temp.table_state()
 RETURNS text
 LANGUAGE sql
 AS $$
-  SELECT 'processes=' || (SELECT count(*) FROM public.processes p WHERE p.client_id = p_id)
-         || '/stages=' || (SELECT count(*) FROM public.process_stages s JOIN public.processes p ON p.id = s.process_id WHERE p.client_id = p_id)
-         || '/audit=' || (SELECT count(*) FROM public.audit_events e WHERE e.client_id = p_id AND e.process_id IS NOT NULL)
+  SELECT 'processes=' || (SELECT count(*) FROM public.processes)
+         || '/stages=' || (SELECT count(*) FROM public.process_stages)
+         || '/approvals=' || (SELECT count(*) FROM public.stage_approvals)
+         || '/audit=' || (SELECT count(*) FROM public.audit_events)
 $$;
 
 -- Os processos de teste, pelo apelido (preenchida depois da criação, como postgres).
@@ -203,6 +205,24 @@ SELECT ok(
   'F-55: as duas abrem com IF private.is_ceo() IS NOT TRUE, antes da trava do cliente'
 );
 SELECT ok(
+  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.clients c\s+WHERE c\.id = v_client_id\s+FOR SHARE;\s+IF NOT FOUND THEN\s+RAISE EXCEPTION USING ERRCODE = ''P0001'', MESSAGE = ''NOT_FOUND'';'
+     FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure)
+  AND (SELECT pg_temp.code(p.oid) ~ 'FROM public\.clients c\s+WHERE c\.id = v_client_id\s+FOR SHARE;\s+IF NOT FOUND THEN\s+RAISE EXCEPTION USING ERRCODE = ''P0001'', MESSAGE = ''NOT_FOUND'';'
+         FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
+  'F-127: as duas falham fechadas se a trava do cliente não acha a linha (NOT_FOUND logo depois do FOR SHARE, nunca "cliente não arquivado")'
+);
+-- Inventário (T-56, F-124): quem escreve em processes, process_stages ou stage_approvals, em qualquer esquema que não
+-- seja o dos helpers de teste, é exatamente este conjunto. Uma função nova que escreva ali passa a falhar este teste
+-- até alguém decidir a trava do cliente e a recusa do arquivado para ela (F-87).
+SELECT is(
+  (SELECT array_agg(n.nspname || '.' || p.proname ORDER BY n.nspname, p.proname)
+     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'tests') AND n.nspname !~ '^pg_(temp|toast)'
+      AND pg_temp.code(p.oid) ~* '(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+public\.(processes|process_stages|stage_approvals)\M'),
+  ARRAY['public.approve_current_stage', 'public.create_process', 'public.update_process'],
+  'F-87, T-56: os únicos escritores de processes, process_stages e stage_approvals são create_process, update_process e approve_current_stage; qualquer escritor novo precisa travar o cliente com FOR SHARE antes de tudo e recusar o cliente arquivado (e entrar nesta lista)'
+);
+SELECT ok(
   (SELECT position('NOT_FOUND' IN pg_temp.code(p.oid)) > 0
           AND position('NOT_FOUND' IN pg_temp.code(p.oid)) < position('CLIENT_ARCHIVED' IN pg_temp.code(p.oid))
           AND position('CLIENT_ARCHIVED' IN pg_temp.code(p.oid)) < position('PROCESS_NOT_ACTIVE' IN pg_temp.code(p.oid))
@@ -273,7 +293,8 @@ SELECT 'b-novo', p.id FROM public.processes p
  WHERE p.client_id = '00000000-0000-4000-8000-00000000a002' AND p.title = 'Site novo';
 
 -- F-80: criar com um título já ativo no cliente (E-96) -------------------------------------------------------
-SELECT set_config('t.a_before', pg_temp.client_state('00000000-0000-4000-8000-00000000a001'), false);
+SELECT set_config('t.a_before', pg_temp.table_state(), false);
+SELECT set_config('t.mark_create', (SELECT coalesce(max(e.id), 0) FROM public.audit_events e)::text, false);
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT tests.set_request_id('req-title-0002');
 SELECT throws_ok(
@@ -294,9 +315,13 @@ SELECT throws_ok(
 );
 SELECT tests.clear_authentication();
 SELECT is(
-  pg_temp.client_state('00000000-0000-4000-8000-00000000a001'),
+  pg_temp.table_state(),
   current_setting('t.a_before'),
   'E-96, F-80: as recusas não deixaram processo, fase nem evento de auditoria (a transação inteira voltou)'
+);
+SELECT is_empty(
+  $$ SELECT e.id FROM public.audit_events e WHERE e.id > current_setting('t.mark_create')::bigint $$,
+  'E-96, F-80: nenhum evento de auditoria nasceu depois das recusas, seja qual for o cliente, o processo ou a ação'
 );
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT lives_ok(
@@ -363,7 +388,8 @@ SELECT tests.clear_authentication();
 
 -- F-80: renomear para um título já ativo no cliente (E-97) ----------------------------------------------------
 SELECT set_config('t.pronto_before', pg_temp.state_of((SELECT p.id FROM proc p WHERE p.label = 'a-pronto')), false);
-SELECT set_config('t.a_before2', pg_temp.client_state('00000000-0000-4000-8000-00000000a001'), false);
+SELECT set_config('t.a_before2', pg_temp.table_state(), false);
+SELECT set_config('t.mark_rename', (SELECT coalesce(max(e.id), 0) FROM public.audit_events e)::text, false);
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT tests.set_request_id('req-title-0003');
 SELECT throws_ok(
@@ -383,9 +409,13 @@ SELECT is(
   'E-97, F-80: o processo recusado fica como estava (título, versão, fases e auditoria)'
 );
 SELECT is(
-  pg_temp.client_state('00000000-0000-4000-8000-00000000a001'),
+  pg_temp.table_state(),
   current_setting('t.a_before2'),
-  'E-97, F-80: nenhum evento de auditoria nasceu das recusas'
+  'E-97, F-80: nenhuma linha de processo, de fase nem de auditoria nasceu das recusas'
+);
+SELECT is_empty(
+  $$ SELECT e.id FROM public.audit_events e WHERE e.id > current_setting('t.mark_rename')::bigint $$,
+  'E-97, F-80: nenhum evento de auditoria nasceu depois das recusas, seja qual for o cliente, o processo ou a ação'
 );
 SELECT is_empty(
   $$ SELECT e.id FROM public.audit_events e WHERE e.process_id IS NOT NULL AND e.metadata::text ~* '(Site novo|SITE NOVO|Caf)' $$,
@@ -665,6 +695,10 @@ SELECT lives_ok(
   $$ SELECT * FROM public.update_client('00000000-0000-4000-8000-00000000a003', NULL, true) $$,
   'F-87: o CEO arquiva o cliente X'
 );
+SELECT tests.clear_authentication();
+SELECT set_config('t.mark_freeze', (SELECT coalesce(max(e.id), 0) FROM public.audit_events e)::text, false);
+SELECT set_config('t.freeze_state', pg_temp.table_state(), false);
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT tests.set_request_id('req-freeze-0002');
 -- aprovar ---------------------------------------------------------------------------------------------------------
 SELECT throws_ok(
@@ -752,11 +786,12 @@ SELECT is(pg_temp.state_of((SELECT p.id FROM proc p WHERE p.label = 'x-concluido
 SELECT is(pg_temp.state_of((SELECT p.id FROM proc p WHERE p.label = 'x-cancelado')), current_setting('t.x_cancelado'),
   'E-99, F-87: nada mudou em "X cancelado"');
 SELECT is_empty(
-  $$ SELECT e.id FROM public.audit_events e
-      WHERE e.client_id = '00000000-0000-4000-8000-00000000a003' AND e.process_id IS NOT NULL
-        AND e.id > (SELECT max(a.id) FROM public.audit_events a
-                     WHERE a.action = 'client.archived' AND a.client_id = '00000000-0000-4000-8000-00000000a003') $$,
-  'E-99, F-87: nenhum evento de processo depois do arquivamento (a recusa não grava nada)'
+  $$ SELECT e.id FROM public.audit_events e WHERE e.id > current_setting('t.mark_freeze')::bigint $$,
+  'E-99, F-87: nenhum evento de auditoria depois do arquivamento, seja qual for o cliente, o processo ou a ação (a recusa não grava nada)'
+);
+SELECT is(
+  pg_temp.table_state(), current_setting('t.freeze_state'),
+  'E-99, F-87: nenhuma linha de processo, de fase, de aprovação nem de auditoria nasceu das recusas'
 );
 
 -- a leitura continua (E-83): o CEO e o login do próprio cliente arquivado ---------------------------------------------
@@ -895,6 +930,55 @@ SELECT is(
     WHERE e.action IN ('client.archived', 'client.unarchived') AND e.client_id = '00000000-0000-4000-8000-00000000a003'),
   3,
   'E-100: arquivar, desarquivar e arquivar de novo gravam um evento cada (client.archived, client.unarchived, client.archived)'
+);
+
+-- F-127: a trava do cliente que não acha a linha é NOT_FOUND, nunca "cliente não arquivado" -------------------------
+-- A chave estrangeira é ON DELETE RESTRICT, então o estado só existe se a restrição sumir: o teste a tira (e as de todas
+-- as tabelas que apontam para clients), apaga o cliente com o processo ainda lá, e chama as duas funções. Está no fim do
+-- arquivo, e a transação inteira volta.
+INSERT INTO public.clients (id, name) VALUES ('00000000-0000-4000-8000-00000000a004', 'Cliente Z');
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT lives_ok(
+  $$ SELECT * FROM public.create_process('00000000-0000-4000-8000-00000000a004', 'Orfao', '[{"name":"Um"},{"name":"Dois"}]'::jsonb) $$,
+  'F-127: cria o processo "Orfao" no cliente Z'
+);
+SELECT tests.clear_authentication();
+INSERT INTO proc (label, id)
+SELECT 'z-orfao', p.id FROM public.processes p
+ WHERE p.client_id = '00000000-0000-4000-8000-00000000a004' AND p.title = 'Orfao';
+SELECT set_config('t.z_stage', (SELECT s.id::text FROM public.process_stages s
+   WHERE s.process_id = (SELECT p.id FROM proc p WHERE p.label = 'z-orfao') AND s.status = 'in_progress'), false);
+DO $$
+DECLARE
+  v_fk record;
+BEGIN
+  FOR v_fk IN
+    SELECT c.conrelid::regclass AS rel, c.conname
+      FROM pg_constraint c
+     WHERE c.contype = 'f' AND c.confrelid = 'public.clients'::regclass
+  LOOP
+    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', v_fk.rel, v_fk.conname);
+  END LOOP;
+  DELETE FROM public.clients WHERE id = '00000000-0000-4000-8000-00000000a004';
+END $$;
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT throws_ok(
+  format('SELECT * FROM public.approve_current_stage(%L, %L)', (SELECT p.id FROM proc p WHERE p.label = 'z-orfao'), current_setting('t.z_stage')),
+  'P0001', 'NOT_FOUND', 'F-127: approve_current_stage com o cliente do processo sumido é NOT_FOUND (falha fechada)'
+);
+SELECT throws_ok(
+  format('SELECT * FROM public.update_process(%L, NULL, true)', (SELECT p.id FROM proc p WHERE p.label = 'z-orfao')),
+  'P0001', 'NOT_FOUND', 'F-127: update_process (cancelar) com o cliente do processo sumido é NOT_FOUND'
+);
+SELECT throws_ok(
+  format('SELECT * FROM public.update_process(%L, %L, NULL)', (SELECT p.id FROM proc p WHERE p.label = 'z-orfao'), 'Renomeado'),
+  'P0001', 'NOT_FOUND', 'F-127: update_process (renomear) com o cliente do processo sumido é NOT_FOUND'
+);
+SELECT tests.clear_authentication();
+SELECT is(
+  (SELECT p.status::text || '/v' || p.version FROM public.processes p WHERE p.id = (SELECT x.id FROM proc x WHERE x.label = 'z-orfao')),
+  'active/v1',
+  'F-127: e o processo não mudou'
 );
 
 SELECT * FROM finish();

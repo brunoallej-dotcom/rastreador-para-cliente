@@ -230,8 +230,10 @@ SELECT ok(
 -- numa segunda sessão: um teste de uma sessão só não prova a espera). De pai para filho: o cliente primeiro, com
 -- FOR SHARE (lê o `archived_at` já com a trava, Onda 10.2); depois o processo, com FOR NO KEY UPDATE, a mesma
 -- consulta e o mesmo modo de update_process; o status é lido depois da trava; a fase em andamento só é travada
--- depois disso, também com FOR NO KEY UPDATE; nenhuma escrita vem antes das três travas. O processo antes do
--- cliente seria deadlock contra create_process (que segura o cliente e espera o índice de título, F-80).
+-- depois disso, também com FOR NO KEY UPDATE; nenhuma escrita vem antes das três travas. O cliente vem antes porque
+-- um `JOIN` na consulta do processo deixaria uma janela (no READ COMMITTED a reavaliação refaz só a linha travada), e
+-- porque é a convenção única do módulo, de pai para filho (ADR 0017). Estes asserts conferem as duas funções que
+-- existem; quem confere que nenhuma função nova escreve sem a trava é o inventário do arquivo 022.
 SELECT ok(
   (SELECT pg_temp.code(p.oid) ~ 'FROM public\.clients c\s+WHERE c\.id = v_client_id\s+FOR SHARE'
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
@@ -708,8 +710,9 @@ SELECT is(
   'F-87: nada mudou: o processo segue ativo na versão 1, a fase 1 em andamento, sem aprovação e sem evento'
 );
 SELECT is_empty(
-  $$ SELECT a.action FROM public.audit_events a WHERE a.process_id = '00000000-0000-4000-8000-0000000001d1' $$,
-  'F-87: a recusa não grava auditoria'
+  $$ SELECT a.action FROM public.audit_events a
+      WHERE a.request_id = 'req-approve-0005' OR a.process_id = '00000000-0000-4000-8000-0000000001d1' $$,
+  'F-87: a recusa não grava auditoria (nem com o id da requisição, nem com o do processo)'
 );
 
 -- F-104: o instante da aprovação depois de uma espera de trava: a fase seguinte já começou "no futuro" -----------------------------
