@@ -20,7 +20,7 @@
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
-| 10.2 | Decisões de produto: título ativo único por cliente (F-80), processos de cliente arquivado congelados (F-87), contrato `1.0.0-draft.4` | 10.1 | — | 🟡 |
+| 10.2 | Decisões de produto: título ativo único por cliente (F-80), processos de cliente arquivado congelados (F-87), contrato `1.0.0-draft.4` | 10.1 | — | ✅ |
 | 11 | Hardening e go-live | 7, 9, 10, 10.1, 10.2 | — | ⬜ |
 
 ```
@@ -414,9 +414,12 @@ tempo):
   retenção de auditoria conforme Q-07); log drain e alertas (spec §3.10); job de OWASP ZAP
   baseline no CI contra o preview; teste de carga k6 (`tests/load/`); runbooks em
   `docs/how-to/` (criar CEO, resetar MFA de CEO, rotacionar a secret key, anonimizar dados de
-  cliente, resposta a incidente); revisão do threat model; configuração de produção (Supabase Pro
-  em `sa-east-1`, HIBP ligado, chaves JWT assimétricas, `supabase config push`; Vercel com
-  domínio, env de produção e Deployment Protection nos previews); skill `security-scan`; ADRs
+  cliente, resposta a incidente); revisão do threat model; configuração de produção (Supabase
+  **Free** em `sa-east-1`, ADR 0018; chaves JWT assimétricas, `supabase config push`; Vercel com o
+  domínio `*.vercel.app` (Q-12), env de produção e Deployment Protection nos previews);
+  compensações do plano Free (ADR 0018): recusa de senha vazada pelo backend (API de k-anonimato do
+  Pwned Passwords, só nas senhas escolhidas pelo usuário, com threat model do modo de falha e o
+  F-128) e dump diário agendado e criptografado do banco; skill `security-scan`; ADRs
   `accepted`.
 - **Gates de go-live herdados das ondas 3–5** (threat model §8). Nenhum ambiente hospedado recebe
   contas reais antes de cumpri-los:
@@ -424,7 +427,8 @@ tempo):
   - Auth hospedado:
     - `disable_signup` ligado;
     - provider de e-mail ativo;
-    - `[auth.sessions]` com timebox de 12 h e inatividade de 4 h (plano Pro);
+    - ~~`[auth.sessions]` com timebox de 12 h e inatividade de 4 h~~: fora do gate desde o ADR 0018
+      (o Free não aplica; o banco aplica os dois limites, ADR 0009);
     - `sign_in_sign_ups` acima do teto global de login (300 por 5 min);
     - `token_refresh` dimensionado;
     - assinatura assimétrica, com o segredo HS256 legado revogado.
@@ -432,7 +436,7 @@ tempo):
   - **F-50 (c), decidido em 2026-11-16:**
     - a publishable key é tratada como segredo: só no servidor, nunca em log, e rotacionada a
       qualquer exposição;
-    - proteção de senha vazada (HIBP) ligada;
+    - recusa de senha vazada pelo backend, no lugar do HIBP do Auth, que é do plano Pro (ADR 0018);
     - alerta sobre falhas de login e de MFA nos logs do Auth.
   - **F-20, decidido em 2026-11-16:** o cadastro do TOTP fica amarrado à sessão que limpou
     `CHANGE_PASSWORD`.

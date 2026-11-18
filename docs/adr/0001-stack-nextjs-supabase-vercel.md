@@ -1,6 +1,7 @@
 # ADR 0001 — Stack: Next.js + TypeScript na Vercel, Supabase (Postgres + Auth)
 
-- **Status:** accepted
+- **Status:** accepted. O item "Plano Supabase Pro em produção" foi substituído pelo
+  [ADR 0018](0018-planos-gratuitos-supabase-free-e-repositorio-publico.md) (2026-11-17).
 - **Data:** 2026-11-15
 - **Spec:** [`docs/specs/client-delivery-tracker.md`](../specs/client-delivery-tracker.md)
 

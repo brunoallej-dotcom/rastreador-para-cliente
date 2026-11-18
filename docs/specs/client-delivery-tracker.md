@@ -95,7 +95,7 @@ internacionalização. Os itens com chance de entrar depois estão em §8.
 | RNF-05 | **LGPD:** dados no Brasil (`sa-east-1` e `gru1`), minimização, base legal e retenção definidas (§3.12). |
 | RNF-06 | **Qualidade:** TypeScript strict (`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`), cobertura ≥ 80% em `domain/` e `application/`, toda policy e função do banco coberta por pgTAP. |
 | RNF-07 | **Compatibilidade:** API versionada em `/api/v1`. Mudança incompatível vira `/api/v2` com nota de compatibilidade; mudança aditiva é bump minor do contrato. |
-| RNF-08 | **Disponibilidade:** herda os SLAs de Vercel e Supabase. Produção no plano Pro do Supabase, porque projetos Free pausam por inatividade e não têm proteção contra senhas vazadas. |
+| RNF-08 | **Disponibilidade:** herda os SLAs de Vercel e Supabase. Produção no plano **Free** do Supabase (ADR 0018). O projeto pausa depois de 7 dias sem atividade: é um risco aceito, e ele volta pelo painel com os dados preservados. A recusa de senha vazada é feita pelo backend (Onda 11). |
 
 ### 2.3 Requisitos de segurança
 
@@ -107,7 +107,7 @@ internacionalização. Os itens com chance de entrar depois estão em §8.
 | SEC-04 | **RLS em todas as tabelas de `public`.** Policies existem somente para `SELECT`. `anon` não tem nenhum privilégio. `authenticated` não tem `INSERT/UPDATE/DELETE` em nenhuma tabela: escritas só por funções `SECURITY DEFINER` com `SET search_path = ''`, nomes totalmente qualificados e checagem de papel e tenant dentro da função. |
 | SEC-05 | **Acesso cross-tenant retorna 404** (nunca o dado e nunca 403, que revelaria a existência do recurso). Testes cross-tenant são obrigatórios em pgTAP e na API. |
 | SEC-06 | **SQL injection:** nenhuma SQL montada por concatenação no app; acesso só pelo client Supabase (PostgREST parametrizado) e por RPC com parâmetros tipados; nenhuma SQL dinâmica em funções (se inevitável, `format()` com `%I`/`%L` e `EXECUTE ... USING`); input do usuário nunca interpolado em filtros PostgREST (`.or()`, `.filter()`, `.textSearch()`). Todos os objetos Zod usam `.strict()` (rejeitam campos desconhecidos, o que evita mass assignment). Ver §3.8. |
-| SEC-07 | **Sessão:** cookie `__Host-rt-session` com `HttpOnly`, `Secure`, `SameSite=Lax` e `Path=/`. O access token expira em 15 min; refresh token com rotação e detecção de reuso. A sessão dura no máximo 12 h e é encerrada após 4 h de inatividade (`[auth.sessions] timebox` e `inactivity_timeout`); o cookie tem o mesmo teto de 12 h (ADR 0009). O servidor valida o JWT com `getClaims()`/`getUser()` e nunca confia em `getSession()`. A sessão é checada no banco a cada requisição (`auth.sessions`), o que torna logout e desativação efetivos imediatamente. |
+| SEC-07 | **Sessão:** cookie `__Host-rt-session` com `HttpOnly`, `Secure`, `SameSite=Lax` e `Path=/`. O access token expira em 15 min; refresh token com rotação e detecção de reuso. A sessão dura no máximo 12 h e é encerrada após 4 h de inatividade: no banco (`private.session_is_alive()`) e, onde o plano permite, também no Auth (`[auth.sessions] timebox` e `inactivity_timeout`; o Free hospedado não aplica, ADR 0018); o cookie tem o mesmo teto de 12 h (ADR 0009). O servidor valida o JWT com `getClaims()`/`getUser()` e nunca confia em `getSession()`. A sessão é checada no banco a cada requisição (`auth.sessions`), o que torna logout e desativação efetivos imediatamente. |
 | SEC-08 | **CSRF:** métodos não seguros exigem `Origin` igual a uma origem permitida (`APP_ORIGIN`; em preview, as URLs da própria deployment). O corpo precisa ser `application/json`. SameSite=Lax completa a defesa. |
 | SEC-09 | **Rate limiting** por IP, por conta e por usuário (§3.9), com resposta 429 e `Retry-After`. O limitador fica **na frente** do Supabase Auth. |
 | SEC-10 | **Senhas:** de 12 a 72 bytes UTF-8 (o bcrypt trunca acima de 72 bytes); a nova precisa ser diferente da atual; senha temporária com 20 caracteres gerados por CSPRNG, exibida uma única vez, com troca obrigatória e **validade de 72 h** contadas da criação ou do reset (vencida, a conta perde o principal e o login é recusado com o erro genérico; um reset por um CEO recomeça o prazo, ADR 0013); troca exige a senha atual e revoga as demais sessões; proteção contra senhas vazadas (HIBP) do Supabase ativada em produção. |
@@ -1183,9 +1183,10 @@ usuários nos dois casos.
 antes de `security_update_password_require_current_password` estar ligado no projeto (Management
 API; não é chave do `config.toml`, o Supabase local não a liga). Sem ela, quem tem o token de acesso
 de uma sessão recente e a publishable key troca a senha direto em `PUT /auth/v1/user`, sem a senha
-atual que o app exige em `POST /auth/password` (ADR 0010). Entram no mesmo gate, Onda 11: HIBP,
-chaves JWT assimétricas, `timebox` e `inactivity_timeout` e o `sign_in_sign_ups` do Auth acima do
-orçamento global de logins.
+atual que o app exige em `POST /auth/password` (ADR 0010). Entram no mesmo gate, Onda 11: a recusa
+de senha vazada pelo backend (o HIBP do Auth é do plano Pro; ADR 0018), chaves JWT assimétricas e o
+`sign_in_sign_ups` do Auth acima do orçamento global de logins. O `timebox` e o `inactivity_timeout`
+do Auth saíram do gate: a produção fica no Free, e o banco aplica os dois limites (ADR 0009).
 
 ### 3.12 LGPD
 

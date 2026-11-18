@@ -1,6 +1,8 @@
 # ADR 0012 — Repositório privado até o go-live e SAST com Semgrep CE no lugar do CodeQL
 
-- **Status:** accepted
+- **Status:** accepted. A parte do repositório privado foi substituída pelo
+  [ADR 0018](0018-planos-gratuitos-supabase-free-e-repositorio-publico.md) (2026-11-17): o
+  repositório voltou a ser público. O Semgrep CE e o resto da decisão continuam valendo.
 - **Data:** 2026-11-16
 
 ## Contexto
