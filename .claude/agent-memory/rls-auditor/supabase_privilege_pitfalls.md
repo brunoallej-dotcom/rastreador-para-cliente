@@ -74,3 +74,10 @@ Recurring traps confirmed on the local Supabase (PG 17, CLI 2.122) during the Wa
 **Why:** these pass pgTAP and `db lint` silently; they only show up in catalog queries.
 **How to apply:** in every audit, run the service_role ACL query and check new CHECK regexes and
 claim casts. See [[local-db-probing]] and [[wave2-audit-findings]].
+
+- Row-lock reasoning (Wave 10.2): a tuple with a lock-only xmax (FOR SHARE/NKU held, not yet updated)
+  is "live" for `_bt_check_unique` (HeapTupleSatisfiesDirty) -> immediate 23505, no wait. Only an
+  in-progress UPDATE/INSERT index entry makes a unique check wait. So "X locked the row, then waits for
+  the parent" cannot deadlock with an INSERT on the same key unless X already WROTE the key. A new
+  FOR SHARE requester joins compatible lockers ahead of a queued NKU waiter (writer starvation possible,
+  still serializable: the joiner commits before the waiter).

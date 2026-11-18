@@ -1,3 +1,3 @@
-- [Supabase privilege pitfalls](supabase_privilege_pitfalls.md) — default ACLs, claim casts, btrim/ICU/NFKC gaps, auth.* CASCADE, attested helper, pgTAP vacuity + count-scoping heuristics
+- [Supabase privilege pitfalls](supabase_privilege_pitfalls.md) — default ACLs, claim casts, unicode gaps, auth.* CASCADE, attested helper, pgTAP scoping, row-lock vs unique-check waits
 - [Local DB probing](local_db_probing.md) — docker exec psql into the local container, rollback probes, role limits
-- [Open audit findings](wave2_audit_findings.md) — open items per wave (2, 6, 6.1, 7, 8, 10, 10.1): BAIXOs, load-bearing orders, forward items
+- [Open audit findings](wave2_audit_findings.md) — open items per wave (2, 6, 6.1, 7, 8, 10, 10.1, 10.2): BAIXOs, load-bearing orders, forward items
