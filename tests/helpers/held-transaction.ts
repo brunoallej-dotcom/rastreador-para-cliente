@@ -27,7 +27,8 @@
 // machine wait for it. So the session limits itself inside the database (`lock_timeout`,
 // `statement_timeout`, `idle_in_transaction_session_timeout`, all below the test timeout), and it is ended
 // from both sides on open failure, on any failed step and in `abort()`: end of input to psql, a bounded
-// wait for it to exit, a kill, and always a `pg_terminate_backend` of its pid from another connection.
+// wait for it to exit, a kill, and always a `pg_terminate_backend` of its pid from another connection, except
+// after a clean commit (psql exited with 0): the backend is gone and its pid may already be another one's.
 // Test code only: nothing in `src/` may import it.
 import { spawn } from 'node:child_process';
 import { vi } from 'vitest';
@@ -277,6 +278,12 @@ export async function openHeldTransaction(): Promise<HeldTransaction> {
   child.stdin.on('error', () => undefined);
 
   let pid: number | undefined;
+  /**
+   * Set once the session committed and psql exited with status 0: the backend is gone by its own doing. From
+   * then on its pid belongs to nobody we know (the OS and Postgres reuse pids), so `shutdown` must not
+   * `pg_terminate_backend` it: that could end another backend.
+   */
+  let exitedCleanly = false;
 
   /** Waits until `check` says so, the session ends, or `timeoutMs` passes; `null` means it timed out. */
   function waitFor(check: () => boolean, timeoutMs: number): Promise<'done' | 'ended' | 'timeout'> {
@@ -302,6 +309,7 @@ export async function openHeldTransaction(): Promise<HeldTransaction> {
    * connection, which is what releases the locks even when the client never got the message.
    */
   async function shutdown(): Promise<void> {
+    if (exitedCleanly) return;
     child.stdin.end();
     if ((await waitFor(() => ended, EXIT_WAIT_MS)) === 'timeout') child.kill('SIGKILL');
     if (pid !== undefined) await terminateBackend(pid);
@@ -359,6 +367,7 @@ export async function openHeldTransaction(): Promise<HeldTransaction> {
         await shutdown();
         throw new Error('held transaction: the session did not end cleanly');
       }
+      exitedCleanly = true;
     },
     abort: shutdown,
   };

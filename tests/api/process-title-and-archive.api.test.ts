@@ -24,6 +24,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { expectToMatchContract } from '../helpers/contract';
 import { approveViaApi, listEventsViaApi, type ProcessEventListBody } from '../helpers/approvals';
 import { updateClientViaApi } from '../helpers/clients';
+import { countLockWaiters } from '../helpers/db';
 import { createClient } from '../helpers/fixtures';
 import {
   ceoIdentityOf,
@@ -62,6 +63,8 @@ const COMBINING_JOINER = String.fromCodePoint(0x034f);
 const COMBINING_ACUTE = String.fromCodePoint(0x0301);
 const E_ACUTE = String.fromCodePoint(0x00e9);
 const CAPITAL_E_ACUTE = String.fromCodePoint(0x00c9);
+/** How long an approval that must NOT wait may take before the test calls it parked (it answers in milliseconds). */
+const PARALLEL_APPROVAL_BOUND_MS = 8000;
 const TAKEN_DETAIL = 'A process with this title is already active for this client.';
 const ARCHIVED_DETAIL = 'The client is archived. Unarchive it to create or change its processes.';
 
@@ -690,13 +693,17 @@ describe('F-87: a write and an archive of the same client serialize on the clien
     holder = await loginAsCeoWithMfa();
   });
 
-  it('F-87, E-101: an approval and a rename parked behind an archive in flight (held, not committed) are 422 CLIENT_ARCHIVED once it commits, and write nothing', async () => {
+  it('F-87, E-101: an approval, a rename and a cancellation parked behind an archive in flight (held, not committed) are 422 CLIENT_ARCHIVED once it commits, and write nothing', async () => {
     const { tenant, process } = await tenantWithProcess(ceo.cookies);
     const other = await createProcessOrFail(ceo.cookies, tenant.id, {
       title: uniqueProcessTitle('Outro'),
     });
+    const third = await createProcessOrFail(ceo.cookies, tenant.id, {
+      title: uniqueProcessTitle('Terceiro'),
+    });
     const beforeOne = await stateOf(process.id);
     const beforeTwo = await stateOf(other.id);
+    const beforeThree = await stateOf(third.id);
     const identity = ceoIdentityOf(holder);
     const held = await openHeldTransaction();
     let responses: Response[];
@@ -709,18 +716,22 @@ describe('F-87: a write and an archive of the same client serialize on the clien
       const renaming = updateProcessViaApi(ceo.cookies, other.id, {
         title: uniqueProcessTitle('Renomear'),
       });
+      const cancelling = updateProcessViaApi(ceo.cookies, third.id, { status: 'cancelled' });
       await waitForLockWaiters(held, 'approve_current_stage', 1);
-      await waitForLockWaiters(held, 'update_process', 1);
+      // the rename and the cancellation are both inside update_process, parked on the same client row
+      await waitForLockWaiters(held, 'update_process', 2);
       await held.commit();
-      responses = await Promise.all([approving, renaming]);
+      responses = await Promise.all([approving, renaming, cancelling]);
     } finally {
       await held.abort();
     }
 
     await expectArchived('approveCurrentStage', responses[0] as Response);
     await expectArchived('updateProcess', responses[1] as Response);
+    await expectArchived('updateProcess', responses[2] as Response);
     expect(await stateOf(process.id)).toEqual(beforeOne);
     expect(await stateOf(other.id)).toEqual(beforeTwo);
+    expect(await stateOf(third.id)).toEqual(beforeThree);
   });
 
   it('F-87, E-101: an archive parked behind an approval in flight (held, not committed) waits for it, and then archives: the approval stands and the next one is refused', async () => {
@@ -770,10 +781,27 @@ describe('F-87: a write and an archive of the same client serialize on the clien
     try {
       // an approval in flight on one process: it holds the client FOR SHARE and that process
       await held.approveStage(identity, process.id, stageAt(process, 1).id);
-      // the approval of ANOTHER process of the same client is not blocked by it: it answers while the first is open
-      response = await approveViaApi(ceo.cookies, other.id, {
+      // the approval of ANOTHER process of the same client is not blocked by it: it answers while the first is
+      // open. A regression (an exclusive client lock) would park it, so the wait is bounded and says so, instead
+      // of leaving the test to the 30 s timeout.
+      const approving = approveViaApi(ceo.cookies, other.id, {
         expectedStageId: stageAt(other, 1).id,
       });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        approving,
+        new Promise<'parked'>((resolve) => {
+          timer = setTimeout(() => resolve('parked'), PARALLEL_APPROVAL_BOUND_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (outcome === 'parked') {
+        const parked = await countLockWaiters('approve_current_stage', held.pid);
+        throw new Error(
+          `the approval of another process of the same client is parked behind the held one (${parked} waiting): the client lock is not shared`,
+        );
+      }
+      response = outcome;
       await held.commit();
     } finally {
       await held.abort();
