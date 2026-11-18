@@ -15,8 +15,10 @@ const PROCESSES_PATH = '/api/v1/admin/processes';
  * contract: role ceo only, `allowPending: []`, user 60 / min in the `writes` counter. Answers 201 with
  * the new process and a `Location` header that points at it.
  *
- * A 503 does not say whether the process was saved, and a repeated request makes a SECOND process:
- * nothing in the request is a natural key (spec §6, E-21).
+ * A 503 does not say whether the process was saved, but a repeated request never makes a SECOND
+ * process: the title is unique among the active processes of the client, so the repetition of a saved
+ * request is 409 `CONFLICT` and the CEO lists the client's processes (spec §3.7.2, §6, E-21, E-98,
+ * F-80). An archived client is 422 `CLIENT_ARCHIVED` (E-16).
  *
  * `route` is `withRoute` in production; tests pass a pipeline wired to fakes.
  */

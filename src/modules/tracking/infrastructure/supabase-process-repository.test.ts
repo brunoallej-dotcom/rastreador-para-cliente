@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { describe, expect, it, vi } from 'vitest';
 import type { Database } from '@/shared/db/database.types';
 import {
+  ConflictError,
   ForbiddenError,
   NotFoundError,
   ServiceUnavailableError,
@@ -341,6 +342,12 @@ describe('create', () => {
       ClientArchivedError,
       'CLIENT_ARCHIVED',
     ],
+    [
+      'F-80, E-96: a title that an active process of the client already has',
+      failure('P0001', 'PROCESS_TITLE_TAKEN'),
+      ConflictError,
+      'CONFLICT',
+    ],
     ['an unknown client', failure('P0001', 'NOT_FOUND'), NotFoundError, 'NOT_FOUND'],
     ['invalid input', failure('P0001', 'INVALID_INPUT'), ValidationError, 'VALIDATION_ERROR'],
     ['a denial', failure('42501', 'FORBIDDEN'), ForbiddenError, 'FORBIDDEN'],
@@ -354,6 +361,32 @@ describe('create', () => {
     expect(result.error).toBeInstanceOf(type);
     expect(result.error.code).toBe(code);
     expect(queries).toHaveLength(1);
+  });
+
+  it('F-80: the 409 names no process and no title, and its cause is only the SQLSTATE', async () => {
+    const taken = repositoryOver([
+      failure('P0001', 'PROCESS_TITLE_TAKEN'),
+      failure('P0001', 'PROCESS_TITLE_TAKEN'),
+    ]);
+
+    const created = await taken.repository.create({
+      clientId: CLIENT,
+      title: 'Site secreto',
+      stages: null,
+    });
+    const renamed = await taken.repository.update(P1, { title: 'Site secreto' });
+
+    for (const result of [created, renamed]) {
+      expect(!result.ok && result.error).toBeInstanceOf(ConflictError);
+      if (result.ok) return;
+      expect(result.error.detail).toBe(
+        'A process with this title is already active for this client.',
+      );
+      expect(result.error.cause).toEqual({ code: 'P0001' });
+      expect(
+        JSON.stringify([result.error.detail, result.error.cause, result.error.message]),
+      ).not.toMatch(/secreto/i);
+    }
   });
 
   it('a client that is not there names the client in the 404, not a process', async () => {
@@ -516,6 +549,18 @@ describe('update', () => {
       ProcessNotActiveError,
       'PROCESS_NOT_ACTIVE',
     ],
+    [
+      'F-87, E-99: a process of an archived client',
+      failure('P0001', 'CLIENT_ARCHIVED'),
+      ClientArchivedError,
+      'CLIENT_ARCHIVED',
+    ],
+    [
+      'F-80, E-97: a title that another active process of the client already has',
+      failure('P0001', 'PROCESS_TITLE_TAKEN'),
+      ConflictError,
+      'CONFLICT',
+    ],
     ['an unknown process', failure('P0001', 'NOT_FOUND'), NotFoundError, 'NOT_FOUND'],
     ['invalid input', failure('P0001', 'INVALID_INPUT'), ValidationError, 'VALIDATION_ERROR'],
     ['a denial', failure('42501', 'FORBIDDEN'), ForbiddenError, 'FORBIDDEN'],
@@ -529,6 +574,19 @@ describe('update', () => {
     expect(result.error).toBeInstanceOf(type);
     expect(result.error.code).toBe(code);
     expect(queries).toHaveLength(1);
+  });
+
+  it('F-80: a raw 23505 (a unique index that is not the title one) is an unexpected error (500), never a 409', async () => {
+    const { repository } = repositoryOver([failure('23505', 'duplicate key value', 409)]);
+
+    const failed = await repository.update(P1, { title: 'Novo' }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(failed).toBeInstanceOf(Error);
+    expect(failed).not.toBeInstanceOf(ConflictError);
+    expect(failed).not.toBeInstanceOf(ServiceUnavailableError);
   });
 
   it('a process that is not there names the process in the 404', async () => {
@@ -614,6 +672,12 @@ describe('approve', () => {
       failure('P0001', 'PROCESS_NOT_ACTIVE'),
       ProcessNotActiveError,
       'PROCESS_NOT_ACTIVE',
+    ],
+    [
+      'F-87, E-99: a process of an archived client',
+      failure('P0001', 'CLIENT_ARCHIVED'),
+      ClientArchivedError,
+      'CLIENT_ARCHIVED',
     ],
     ['an unknown process', failure('P0001', 'NOT_FOUND'), NotFoundError, 'NOT_FOUND'],
     ['invalid input', failure('P0001', 'INVALID_INPUT'), ValidationError, 'VALIDATION_ERROR'],

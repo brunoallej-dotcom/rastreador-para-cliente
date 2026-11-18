@@ -33,13 +33,18 @@ export class ProcessNotActiveError extends DomainError {
   }
 }
 
-/** The client is archived, so it takes no new process (E-16). 422 `CLIENT_ARCHIVED`. */
+/**
+ * The client is archived, so it takes no new process (E-16) and its processes are frozen: no
+ * approval, no rename, no cancellation (F-87, Q-13, E-99). Reading them is still fine (E-83), and
+ * unarchiving the client thaws them. 422 `CLIENT_ARCHIVED`. The detail is the same for the four
+ * operations, because it says what the CEO has to do (unarchive), not which operation was refused.
+ */
 export class ClientArchivedError extends DomainError {
   readonly code = 'CLIENT_ARCHIVED';
 
   constructor(options?: DomainErrorOptions) {
     super('the client is archived', {
-      detail: 'An archived client takes no new process.',
+      detail: 'The client is archived. Unarchive it to create or change its processes.',
       ...options,
     });
   }

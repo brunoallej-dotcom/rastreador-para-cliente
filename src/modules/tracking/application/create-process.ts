@@ -25,8 +25,10 @@ export type CreateProcessInput = {
  * pipeline already checked the role and `aal2`; the role is checked again here as the rule of the use
  * case, and the database function checks it a third time (spec §3.5). I1 is checked here too (1 to 30
  * stages, E-20), before the round trip. A client that does not exist is `NotFoundError` (404) and an
- * archived one is `ClientArchivedError` (422, E-16), both decided by the database in the same
- * transaction that creates the process.
+ * archived one is `ClientArchivedError` (422, E-16), and a title that an active process of the client
+ * already has is `ConflictError` (409, F-80, E-96): all decided by the database in the same
+ * transaction that creates the process, so repeating a request whose answer was lost never makes a
+ * second process.
  */
 export async function createProcess(
   deps: CreateProcessDeps,
