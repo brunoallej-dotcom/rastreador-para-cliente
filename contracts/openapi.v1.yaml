@@ -40,10 +40,14 @@ info:
     (inclusive nas de erro); os demais são do transporte e não se repetem em cada uma.
 
     ## Entrada
-    Campo de corpo que o contrato não tem, e parâmetro de query que o contrato não tem (um
-    `clientId` na lista do cliente, um `status` onde não há filtro), são 400 `VALIDATION_ERROR`
-    com o caminho em `errors[].path` (`body.<campo>`, `query.<campo>`). Um id malformado no path
-    também é 400. O servidor nunca ignora entrada que não conhece.
+    Numa operação que declara um corpo, um campo que o contrato não tem é 400 `VALIDATION_ERROR`; numa
+    que declara parâmetros de query (`limit`, `cursor`, `status`, `includeArchived`), um parâmetro que
+    o contrato não tem (um `clientId` na lista do cliente, um `status` onde não há filtro) também é.
+    O caminho vem em `errors[].path` (`body.<campo>`, `query.<campo>`). Um id malformado no path é 400.
+    Uma operação que **não declara** corpo ou query não os lê: o que vier ali é ignorado (um corpo em
+    `logout` ou em `resetClientUserPassword`, uma query em `getHealth`, `getClient`, `getProcess` ou
+    `getMyProcess`). O que o servidor nunca faz é aceitar, num objeto que o contrato declara, um campo
+    que ele não conhece.
 
     ## Texto visível
     Todo texto digitado por uma pessoa (nome de cliente, título de processo, nome e descrição de
@@ -100,8 +104,9 @@ info:
         concluído ou cancelado pode ser usado de novo, e o de outro cliente não conta. Dois `POST`
         com o mesmo título, que criavam dois processos, agora dão 201 e 409. Um `POST` repetido
         depois de um 503, cuja primeira chamada já tinha sido gravada, dá 409 e não duplica o
-        processo: a descrição antiga, de que repetir criava um segundo processo, deixa de valer.
-        `Idempotency-Key` foi rejeitado.
+        processo enquanto ele estiver ativo (se já foi concluído ou cancelado, o título voltou a
+        ficar livre e a repetição cria outro): a descrição antiga, de que repetir criava um segundo
+        processo, deixa de valer. `Idempotency-Key` foi rejeitado.
       - **Cliente arquivado congela os processos (F-87).** `approveCurrentStage` e `updateProcess`
         (renomear e cancelar) passam a responder 422 `CLIENT_ARCHIVED` para o processo de um
         cliente arquivado, qualquer que seja o status do processo, antes de `PROCESS_NOT_ACTIVE`.
@@ -112,9 +117,11 @@ info:
         `updateProcess`, `approveCurrentStage`, `provisionClientUser` e `resetClientUserPassword`;
         os contadores de limite compartilhados; a regra do texto visível (E-30) nos campos de
         texto; `progressPercent` (arredondamento) e o significado de `currentStage`; ordem das
-        listas, desempate, cursor e parâmetros desconhecidos → 400; a ordem das fases e os campos
+        listas, desempate, cursor e parâmetros desconhecidos → 400 (nas operações que declaram
+        query ou corpo; as que não declaram ignoram o que vier); a ordem das fases e os campos
         nulos por status; `Cache-Control` declarado como header de toda resposta;
-        `previousTitle` e `newTitle` (nunca preenchidos); o formato de `ProcessEventDetails`;
+        `previousTitle` e `newTitle` (nunca preenchidos, agora marcados `deprecated`: removê-los do
+        schema é mudança incompatível e exige `/api/v2`); o formato de `ProcessEventDetails`;
         `actor: null`; `currentStageId: null`; o `expectedStageId` alheio → 409; a ordem da linha do
         tempo por `id`; a resposta do "Ok" relida depois do COMMIT; a regra de que o cliente da
         API nunca reenvia um "Ok" sozinho; e os casos E-81, E-82 e E-83 do painel do cliente.
@@ -1114,10 +1121,12 @@ paths:
         processos de mesmo nome, de propósito, exigem outro título.
 
         **Repetir** (um duplo clique, ou depois de um 503, que não diz se a primeira chamada foi
-        gravada, nem quando só a releitura que devolve o corpo falhou): nunca duplica o processo. Se
-        a primeira chamada tinha sido gravada, a repetição responde 409 `CONFLICT` e o CEO lista os
-        processos do cliente (`listClientProcesses`) para achar o que já existe; se não tinha, a
-        repetição é a criação, 201. `Idempotency-Key` não existe.
+        gravada, nem quando só a releitura que devolve o corpo falhou): não duplica o processo
+        enquanto o primeiro estiver ativo. Se a primeira chamada tinha sido gravada, a repetição
+        responde 409 `CONFLICT` e o CEO lista os processos do cliente (`listClientProcesses`) para
+        achar o que já existe; se não tinha, a repetição é a criação, 201. Se o primeiro processo já
+        foi concluído ou cancelado nesse intervalo, o título voltou a ficar livre e a repetição cria
+        outro. `Idempotency-Key` não existe.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -1306,9 +1315,9 @@ paths:
         futura, já foi concluída ou é de **outro** processo. Nunca é 404 (um `expectedStageId`
         alheio é 409) e nunca pula uma fase. Operação atômica, com auditoria na mesma transação.
 
-        Erros 422, na ordem em que valem: 404 se o processo não existe; `CLIENT_ARCHIVED` se o
+        Precedência dos erros: 404 se o processo não existe; 422 `CLIENT_ARCHIVED` se o
         cliente do processo está arquivado (F-87: o cliente precisa ser desarquivado antes);
-        `PROCESS_NOT_ACTIVE` se o processo está concluído ou cancelado (que vence o 409: um
+        422 `PROCESS_NOT_ACTIVE` se o processo está concluído ou cancelado (que vence o 409: um
         `expectedStageId` velho num processo que já não está ativo é 422, e não 409); e só então o
         409 `STALE_STAGE`.
 
@@ -1573,11 +1582,13 @@ components:
   headers:
     X-Request-Id:
       description: Correlation id da requisição (também gravado nos logs e na auditoria).
+      required: true
       schema:
         type: string
         pattern: '^[A-Za-z0-9-]{8,64}$'
     Cache-Control:
       description: 'Sempre `no-store`: nenhuma resposta da API (nem a de erro) pode ser guardada por cache, compartilhado ou do navegador.'
+      required: true
       schema:
         type: string
         enum: [no-store]
@@ -1750,8 +1761,8 @@ components:
         A operação falha fechada, ou seja, nada é liberado por causa da falha. Escritas são atômicas
         (nada fica pela metade), mas um 503 não diz se a escrita chegou a ser gravada. Repetir uma
         escrita idempotente (`PATCH` de renome, desativar, arquivar) é seguro, e repetir `createClient`
-        ou `createProcess` nunca duplica: se a primeira chamada tinha sido gravada, a repetição
-        responde 409 `CONFLICT`. Nas demais escritas (`updateProcess` ao cancelar, `approveCurrentStage`,
+        ou `createProcess` não duplica enquanto o primeiro cliente ou processo estiver ativo: se a
+        primeira chamada tinha sido gravada, a repetição responde 409 `CONFLICT`. Nas demais escritas (`updateProcess` ao cancelar, `approveCurrentStage`,
         `provisionClientUser`, `resetClientUserPassword`), a descrição da própria operação diz o que
         a repetição devolve. A exceção, `changePassword`, está na descrição da operação.
       headers:
