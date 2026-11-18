@@ -859,7 +859,7 @@ funções.
   na hora e o teste falha. A sessão segurada se limita sozinha (`lock_timeout`, `statement_timeout` e
   `idle_in_transaction_session_timeout`, todos abaixo do timeout do teste) e é encerrada dos dois lados no `finally`
   (F-108).
-- **Por que o cliente vem antes do processo, e com `FOR SHARE` (F-87).** O congelamento do cliente arquivado só vale
+- **Por que o cliente vem antes do processo, e com `FOR SHARE` (F-87, ADR 0017).** O congelamento do cliente arquivado só vale
   se a aprovação vê o `archived_at` **depois** de ter esperado o que precisava esperar:
   - *O `JOIN` na consulta que trava o processo não basta.* `FROM processes p JOIN clients c … FOR NO KEY UPDATE OF
     p` não trava o cliente e, no `READ COMMITTED`, depois de esperar a trava do processo reavalia só a linha travada:
