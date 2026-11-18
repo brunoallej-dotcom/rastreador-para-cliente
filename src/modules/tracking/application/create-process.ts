@@ -27,8 +27,8 @@ export type CreateProcessInput = {
  * stages, E-20), before the round trip. A client that does not exist is `NotFoundError` (404) and an
  * archived one is `ClientArchivedError` (422, E-16), and a title that an active process of the client
  * already has is `ConflictError` (409, F-80, E-96): all decided by the database in the same
- * transaction that creates the process, so repeating a request whose answer was lost never makes a
- * second process.
+ * transaction that creates the process, so repeating a request whose answer was lost makes no second
+ * process while the first one is active (once it is completed or cancelled its title is free again).
  */
 export async function createProcess(
   deps: CreateProcessDeps,

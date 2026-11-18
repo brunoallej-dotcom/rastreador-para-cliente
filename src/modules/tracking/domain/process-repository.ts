@@ -21,7 +21,7 @@ export type NewProcess = {
  * failure: nothing was written, repeating is safe). A 503 from a write does not say whether it was
  * saved: repeating a rename is idempotent, repeating a cancel that was saved is
  * `ProcessNotActiveError`, repeating `create` that was saved is a `ConflictError` (the title is already
- * active in the client: it never makes a second process, F-80), and repeating an approval that was
+ * active in the client: it makes no second process while the first is active, F-80), and repeating an approval that was
  * saved is `StaleStageError` (or `ProcessNotActiveError` after the last stage): it never approves twice
  * (spec §3.7.3, E-02, E-21). A refusal by the database comes back as an `err` of the matching domain
  * error (spec §3.7): `ForbiddenError` (42501: the pipeline should have stopped this caller),

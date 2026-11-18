@@ -795,15 +795,21 @@ funções.
   na trava do cliente e a segunda leva o 409; dois renomes para o mesmo título em processos do mesmo cliente
   disputam o índice, e o que chega depois espera o COMMIT do outro e leva o 409. Dois renomes que se cruzam (o
   processo P1 para o título do P2 e o P2 para o do P1) esperam um pelo índice do outro: o Postgres derruba uma das
-  transações (`40P01`), que o app responde 503, e a outra termina em 409 (E-102). **A migration falha** se algum
+  transações (`40P01`), que o app responde 503, e a outra termina em 409 (E-102). **Residual aceito (F-123):** a
+  corrida está dentro de um único `UPDATE`, entre a atualização da linha e a checagem do índice único, onde nenhuma
+  transação segurada de um teste consegue parar; por isso ela é documentada e não provada por um teste determinístico.
+  Quem precisa **trocar** dois títulos faz a troca por um título provisório (P1 para o provisório, P2 para o título
+  do P1, P1 para o título do P2): cada renome é um passo que não disputa o título do outro. **A migration falha** se algum
   banco já tem dois processos ativos de um mesmo cliente com a mesma chave: renomeie ou cancele um deles antes de
   aplicá-la. Não há ambiente hospedado ainda, e nem o seed local nem as fixtures dos testes repetem título num
   cliente. Rejeitado: `Idempotency-Key` (uma tabela de chaves, um cabeçalho novo e um segundo caminho para o mesmo
   problema, quando o título único já resolve o retry).
 - **Retry de `createProcess` (F-80).** Um 503 não diz se o COMMIT aconteceu, mas **o `POST` não duplica mais o
-  processo**: se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), o
-  retry responde **409 `CONFLICT`** (o título dela está ativo no cliente), com um processo só e um só
-  `process.created`; se não foi gravada, o retry é a criação, 201. O mesmo vale para o duplo clique. O CEO que
+  processo enquanto o primeiro estiver ativo**: se a primeira chamada foi gravada (inclusive quando só a releitura
+  que devolve o corpo falhou), o retry responde **409 `CONFLICT`** (o título dela está ativo no cliente), com um
+  processo só e um só `process.created`; se não foi gravada, o retry é a criação, 201. O mesmo vale para o duplo
+  clique. Se o primeiro processo foi concluído ou cancelado entre as duas chamadas, o título voltou a ficar livre e o
+  retry cria outro (um CEO que cancelou o que acabou de criar quer isso). O CEO que
   recebe o 409 de um retry lista os processos do cliente para achar o que já existe (o 409 não traz o id dele, de
   propósito). Um **título igual de propósito**, para um segundo contrato, exige outro título: um dos dois processos
   precisa terminar ou ser cancelado antes, ou o título precisa mudar (uma sufixação como "Site novo (2)" vale). O
@@ -843,7 +849,7 @@ funções.
   serializam, e a consulta confere o `client_id` lido), lê o `status` **depois da trava** e só então trava a fase em
   andamento, também com `FOR NO KEY UPDATE`. Nenhuma escrita vem antes das travas. Nunca `FOR UPDATE` no processo
   (cruzaria com o outro modo), nunca a fase antes do processo (deadlock com o cancelamento) e nunca o processo antes
-  do cliente (abaixo). A precedência dos erros é: papel (42501), entrada (`INVALID_INPUT`), processo (`NOT_FOUND`),
+  do cliente (a convenção única, abaixo). A precedência dos erros é: papel (42501), entrada (`INVALID_INPUT`), processo (`NOT_FOUND`),
   **cliente arquivado (`CLIENT_ARCHIVED`)**, `status` (`PROCESS_NOT_ACTIVE`, que vence um `STALE_STAGE`: E-03) e a
   fase esperada (`STALE_STAGE`). O arquivado vem antes do status porque a decisão de arquivar vale para todos os
   processos do cliente, e o CEO precisa saber que desarquivar é o primeiro passo, mesmo que o processo, além disso,
@@ -874,13 +880,20 @@ funções.
     linha travada): vê `archived_at` e responde `CLIENT_ARCHIVED`. Um arquivamento que chega **depois** de a
     aprovação ter pegado a trava espera o COMMIT dela: a aprovação vale, e o arquivamento vem depois. Não existe
     escrita num processo que passe sobre um arquivamento já gravado.
-  - *O processo antes do cliente abriria um deadlock.* `create_process` segura o cliente (`FOR NO KEY UPDATE`) e o
-    `INSERT` espera, no índice único do título (F-80), um renome ainda não gravado; se esse renome já segurasse o
-    processo e pedisse o cliente, as duas esperariam uma pela outra. Com cliente, processo e fase sempre nessa ordem,
-    não há ciclo: quem segura o cliente nunca espera por processo nem por fase (`update_client` não toca em
-    processo, e o `INSERT` de `create_process` cria um processo que ninguém mais enxerga), e quem segura o processo
-    já passou pelo cliente. Nenhuma função pede `FOR SHARE` e depois `FOR NO KEY UPDATE` na mesma linha de cliente
-    (uma troca de trava que as duas esperariam).
+  - *Uma convenção só, sem ciclo de espera.* Cliente, processo e fase, sempre nessa ordem (de pai para filho), em
+    toda função de escrita. Quem segura o cliente em modo **exclusivo** (`update_client`, `create_process`, o gatilho
+    do perfil) nunca espera por processo nem por fase, e quem segura o processo já passou pelo cliente; nenhuma função
+    pede `FOR SHARE` e depois `FOR NO KEY UPDATE` na mesma linha de cliente (uma troca de trava que as duas
+    esperariam). O único ciclo possível não é de linhas de cliente, é o dos renomes cruzados (F-123, §3.7.2). Travar
+    o processo antes do cliente **não** abriria deadlock com o índice de título (uma linha só travada, ainda não
+    atualizada, não faz a checagem de unicidade esperar: o `create_process` receberia `23505` na hora); a razão da
+    ordem é a janela do `JOIN` acima e a regra única.
+  - *O que a ordem não garante.* `approved_at` e `archived_at` são cada um o `now()` do começo da sua transação.
+    Um arquivamento que começou antes e pegou a trava depois da aprovação deixa os dois instantes invertidos por
+    milissegundos, sem consequência: a ordem dos fatos é a do `id` da auditoria, não a dos instantes (F-125). E um
+    `FOR SHARE` que só encontra outras travas compartilhadas passa na frente de um `FOR NO KEY UPDATE` na fila:
+    aprovações e renomes sobrepostos, sem parar, do mesmo cliente poderiam atrasar um arquivamento ou um
+    `create_process` até o `statement_timeout` (503). Com 4 CEOs humanos a probabilidade é desprezível (F-126).
   - *Custo.* A aprovação e a edição de um processo esperam um `update_client` (ou um `create_process`, ou o gatilho de
     perfil de um login novo) do mesmo cliente em andamento, que dura milissegundos. A trava marca a linha do cliente
     (um `xmax` com a trava compartilhada, sem versão nova), sem relevância na escala do §2.2.
@@ -1467,7 +1480,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-18 | Limite de 10 logins por cliente atingido | 422 `USER_LIMIT_REACHED` |
 | E-19 | `userId` no path não pertence ao `clientId` (ou é um CEO) | 404 `NOT_FOUND` |
 | E-20 | Lista de fases vazia, com mais de 30 itens ou com nome só de espaços | 400 `VALIDATION_ERROR` |
-| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes` também nunca duplica, pelo título único entre os ativos do cliente (F-80): se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 409 `CONFLICT` (E-98), um processo só e um só `process.created`, e o CEO lista os processos do cliente para achar o que já existe (§3.7.2); no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
+| E-21 | Supabase lento ou fora do ar | Timeout de 5 s → 503 `SERVICE_UNAVAILABLE`. As escritas são atômicas (nada fica pela metade), mas um 503 não diz se o COMMIT aconteceu: o retry de uma escrita idempotente (`PATCH`, desativar, arquivar) é seguro; o do `POST` de cliente nunca duplica: se a primeira chamada foi gravada, a repetição dá 409 `CONFLICT` (E-40, F-51) e o CEO confere a lista; o de `POST /admin/clients/{clientId}/processes` também não duplica enquanto o primeiro processo estiver ativo, pelo título único entre os ativos do cliente (F-80; se ele foi concluído ou cancelado entre as duas chamadas, o título voltou a ficar livre e o retry cria outro): se a primeira chamada foi gravada (inclusive quando só a releitura que devolve o corpo falhou), a repetição responde 409 `CONFLICT` (E-98), um processo só e um só `process.created`, e o CEO lista os processos do cliente para achar o que já existe (§3.7.2); no `PATCH /admin/processes/{processId}`, o retry de um **renome** é idempotente (200, E-61), mas o de um **cancelamento** cuja primeira chamada foi gravada responde 422 `PROCESS_NOT_ACTIVE` (o processo já está cancelado, E-60): o 422 não desfaz nada, e o CEO confere o detalhe antes de concluir que falhou |
 | E-22 | Rate limiter indisponível | 503 (fail closed), documentado em toda operação autenticada do contrato |
 | E-23 | Falha ao gravar `account.provisioned` depois de `createUser` | Compensação: grava `account.provision_reverted`, apaga o usuário criado, responde 503 e loga em `error` (se o `provision_reverted` não grava, ou se o registro chegou a valer, não apaga: E-93) |
 | E-24 | Falha no `ban` do Auth depois de desativar no banco | O acesso já está bloqueado pelo banco; loga em `error` e responde 200 (a desativação vale) |
@@ -1517,7 +1530,7 @@ Código respeita o contrato; mudar o contrato exige bump de versão e nota de co
 | E-99 | Aprovar a fase, renomear ou cancelar um processo de cliente **arquivado** (qualquer status do processo) | 422 `CLIENT_ARCHIVED`; nada muda, nada é auditado, as fases ficam como estavam (F-87, Q-13). Precedência: processo inexistente (404), `CLIENT_ARCHIVED`, `PROCESS_NOT_ACTIVE`, título em uso (409) ou `STALE_STAGE` (409): um processo concluído ou cancelado de cliente arquivado responde `CLIENT_ARCHIVED`, e um `expectedStageId` velho num processo de cliente arquivado também |
 | E-100 | Cliente arquivado e depois desarquivado | Arquivado: a lista e o detalhe seguem 200 (E-83) e criar processo segue 422 (E-16). Desarquivado (`archived: false`): aprovar, renomear e cancelar voltam a valer, no processo como estava |
 | E-101 | Aprovação (ou renome, ou cancelamento) e arquivamento do mesmo cliente ao mesmo tempo | Serializam pela trava `FOR SHARE` do cliente (§3.7.3): a escrita que pega a trava primeiro conclui antes de a outra decidir. Aprovação atrás de um arquivamento em andamento: 422 `CLIENT_ARCHIVED`, mesmo que ela tenha chegado antes do COMMIT dele. Arquivamento atrás de uma aprovação: a aprovação vale (200) e o cliente fica arquivado. Nunca uma escrita de processo depois de o `archived_at` ser gravado, nunca deadlock |
-| E-102 | Dois `PATCH` que se cruzam ao mesmo tempo no mesmo cliente, o processo P1 para o título do P2 e o P2 para o do P1 | O Postgres detecta o deadlock dos dois índices e derruba uma das transações: 503 `SERVICE_UNAVAILABLE` com `Retry-After`, sem nada gravado nem auditado. A outra termina em 409 `CONFLICT` (o título do outro processo não saiu). Repetir a que caiu dá 409 ou 200, conforme o estado de então (como E-47) |
+| E-102 | Dois `PATCH` que se cruzam ao mesmo tempo no mesmo cliente, o processo P1 para o título do P2 e o P2 para o do P1 | O Postgres detecta o deadlock dos dois índices e derruba uma das transações: 503 `SERVICE_UNAVAILABLE` com `Retry-After`, sem nada gravado nem auditado. A outra termina em 409 `CONFLICT` (o título do outro processo não saiu). Repetir a que caiu dá 409 ou 200, conforme o estado de então (como E-47). Residual aceito (F-123), sem teste determinístico: a corrida está dentro de um único `UPDATE`. Para trocar dois títulos, use um título provisório |
 
 ---
 
