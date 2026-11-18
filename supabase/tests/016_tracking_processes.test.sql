@@ -176,17 +176,18 @@ SELECT is(
 
 -- Os travamentos, no catálogo (a concorrência em si não se prova num teste de uma sessão só): o cliente é
 -- travado com FOR NO KEY UPDATE em create_process (criar e arquivar se serializam, E-16) e o processo, em
--- update_process (as escritas do mesmo processo se serializam, a aprovação da Onda 9 inclusive). Nenhuma das
--- duas usa FOR UPDATE, que bloquearia quem só referencia a linha por chave estrangeira.
+-- update_process (as escritas do mesmo processo se serializam, a aprovação da Onda 9 inclusive; o cliente vem
+-- antes, com FOR SHARE, Onda 10.2). Nenhuma das duas usa FOR UPDATE, que bloquearia quem só referencia a linha
+-- por chave estrangeira. A ordem cliente, processo, fase está em 017 e 022.
 SELECT ok(
   (SELECT p.prosrc ~ 'FROM public\.clients c\s+WHERE c\.id = p_client_id\s+FOR NO KEY UPDATE'
      FROM pg_proc p WHERE p.oid = 'public.create_process(uuid, text, jsonb)'::regprocedure),
   'E-16: create_process trava a linha de public.clients com FOR NO KEY UPDATE'
 );
 SELECT ok(
-  (SELECT p.prosrc ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+FOR NO KEY UPDATE'
+  (SELECT p.prosrc ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+AND p\.client_id = v_client_id\s+FOR NO KEY UPDATE'
      FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure),
-  'AC-19: update_process trava a linha de public.processes com FOR NO KEY UPDATE'
+  'AC-19: update_process trava a linha de public.processes com FOR NO KEY UPDATE (depois do cliente, F-87)'
 );
 SELECT ok(
   (SELECT position('FOR NO KEY UPDATE' IN p.prosrc) < position('INSERT INTO public.processes' IN p.prosrc)
@@ -714,6 +715,12 @@ SELECT v.label, p.id
 -- 'um' nasceu há dois dias, para provar quando `updated_at` mexe (dentro de uma transação o now() é um só).
 UPDATE public.processes SET created_at = now() - interval '2 days', updated_at = now() - interval '2 days'
   WHERE id = (SELECT p.id FROM proc p WHERE p.label = 'um');
+-- F-80: o título é único entre os processos ativos do cliente. Os testes de texto acima criaram, no cliente A, um
+-- processo para cada título de good_texts, e os de update_process abaixo renomeiam para esses mesmos títulos:
+-- libere os títulos (como postgres, sem auditoria) antes. A unicidade em si está no arquivo 022.
+UPDATE public.processes SET title = 'Livre ' || id::text
+ WHERE client_id = '00000000-0000-4000-8000-00000000000a'
+   AND title IN (SELECT g.expected FROM good_texts g);
 
 -- SEC-16: a auditoria de create_process, na mesma transação, sem título nem nome ------------------------------------
 SELECT results_eq(
@@ -783,6 +790,12 @@ SELECT results_eq(
   $$ VALUES ('Caf' || chr(233)) $$,
   'E-30: update_process guarda o título em NFC'
 );
+-- F-80: o processo 'um' ficou com o título "Café" (acima), que o laço abaixo usa de novo, para o processo dos
+-- títulos, no mesmo cliente: libere-o (como postgres, sem auditoria) e volte a ser o CEO.
+SELECT tests.clear_authentication();
+UPDATE public.processes SET title = 'Processo Um em NFC' WHERE id = (SELECT p.id FROM proc p WHERE p.label = 'um');
+SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
+SELECT tests.set_request_id('req-procs-0002');
 SELECT is(
   (SELECT u.title FROM public.update_process(
      (SELECT p.id FROM proc p WHERE p.label = 'titulos'), g.value) u),

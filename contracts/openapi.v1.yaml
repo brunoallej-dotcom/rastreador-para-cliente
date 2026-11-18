@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Rastreador para Cliente API
-  version: 1.0.0-draft.3
+  version: 1.0.0-draft.4
   summary: Backend do rastreador de entregas (painel do cliente e painel dos CEOs).
   description: |
     Contrato normativo da API v1. Spec de origem: `docs/specs/client-delivery-tracker.md`.
@@ -36,7 +36,56 @@ info:
     `X-Request-Id`, `Cache-Control: no-store`, `Strict-Transport-Security`,
     `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
     `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
-    `Permissions-Policy`.
+    `Permissions-Policy`. `X-Request-Id` e `Cache-Control` estão declarados em cada resposta
+    (inclusive nas de erro); os demais são do transporte e não se repetem em cada uma.
+
+    ## Entrada
+    Numa operação que declara um corpo, um campo que o contrato não tem é 400 `VALIDATION_ERROR`; numa
+    que declara parâmetros de query (`limit`, `cursor`, `status`, `includeArchived`), um parâmetro que
+    o contrato não tem (um `clientId` na lista do cliente, um `status` onde não há filtro) também é.
+    O caminho vem em `errors[].path` (`body.<campo>`, `query.<campo>`). Um id malformado no path é 400.
+    Uma operação que **não declara** corpo ou query não os lê: o que vier ali é ignorado (um corpo em
+    `logout` ou em `resetClientUserPassword`, uma query em `getHealth`, `getClient`, `getProcess` ou
+    `getMyProcess`). O que o servidor nunca faz é aceitar, num objeto que o contrato declara, um campo
+    que ele não conhece.
+
+    ## Texto visível
+    Todo texto digitado por uma pessoa (nome de cliente, título de processo, nome e descrição de
+    fase, nome de exibição do login) segue a mesma regra, antes de qualquer outra coisa. O servidor
+    normaliza para NFC e apara as pontas (espaços, NBSP, U+3000, BOM e os demais do `trim` do
+    JavaScript); `minLength` e `maxLength` contam caracteres (pontos de código) **depois** disso.
+    Recusa (400 `VALIDATION_ERROR`) o que tem caractere de controle ou de formatação (quebra de
+    linha, tabulação, espaço de largura zero, marcas bidi, separadores U+2028 e U+2029), "fillers"
+    invisíveis (U+115F, U+1160, U+17B4, U+17B5, U+2800, U+3164, U+FFA0), um surrogate UTF-16 solto,
+    e o texto sem nenhuma letra ou número ("***", só emoji). A descrição de fase em branco, depois de
+    aparada, vale "sem descrição" (`null` na resposta). A resposta devolve o texto como foi
+    guardado, já normalizado.
+
+    ## Listas e cursor
+    Toda lista pagina por cursor opaco (`nextCursor`, `null` na última página). A ordem é total e
+    estável: `createdAt` decrescente e, para o mesmo instante, `id` crescente (clientes, processos
+    de um cliente, `/me/processes`); a linha do tempo de um processo é por `id` do evento
+    crescente (veja `listProcessEvents`). Nas listas por `createdAt`, um item criado depois de a
+    primeira página ser lida entra antes do cursor e não aparece nas páginas seguintes, e nenhum
+    item que já existia se repete ou se perde. O cursor só vale para o endpoint que o emitiu:
+    cursor adulterado, truncado, de outro endpoint ou com posição que o banco não lê é 400. Ele
+    não leva o cliente nem o processo do path, e um cursor bem formado que veio de outro recurso
+    ou de outro usuário não amplia o acesso: só move a posição dentro do que quem o envia já lê.
+    `limit` é inteiro de 1 a 100 (padrão 50), e fora disso é 400.
+
+    ## Limites de taxa e contadores compartilhados
+    O `x-rate-limit` de uma operação diz o limite; o **contador** é compartilhado entre as
+    operações do mesmo grupo, por usuário, então gastar numa gasta nas outras:
+    - **leituras**, 300 por minuto: `getSession`, `listMyProcesses`, `getMyProcess`, `listClients`,
+      `getClient`, `listClientUsers`, `listClientProcesses`, `getProcess`, `listProcessEvents` e
+      `getDefaultStageTemplate`. O cliente que consulta o painel e a sessão gasta o mesmo contador;
+    - **escritas**, 60 por minuto: `logout`, `createClient`, `updateClient`, `updateClientUser`,
+      `createProcess`, `updateProcess` e `approveCurrentStage`;
+    - **senha de login de cliente**, 20 por hora, **um contador só** para `provisionClientUser` e
+      `resetClientUserPassword` (as duas entregam uma senha): 12 provisionamentos e 8 resets, por
+      exemplo, esgotam o contador.
+    Excedido: 429 com `Retry-After`. As demais operações têm contador próprio. Os orçamentos
+    `programmatic` (login global, TOTP diário, sessão por IP) são descritos nas entradas deles.
 
     ## Erros
     `application/problem+json` (RFC 9457) com `code` estável e `requestId`. Nunca contém stack,
@@ -46,6 +95,36 @@ info:
     requisição é negada, nunca liberada.
 
     ## Compatibilidade
+    - `1.0.0-draft.4` (minor, **sem mudança de schema**). Aditivo, duas regras novas que mudam
+      respostas que antes eram 2xx:
+      - **Título único de processo ativo (F-80).** `createProcess` e `updateProcess` passam a
+        documentar 409 `CONFLICT`, quando o título já é de outro processo **ativo** do mesmo
+        cliente. A comparação ignora caixa, sequências de espaços e as diferenças de compatibilidade
+        do Unicode (a mesma regra do nome de cliente, `createClient`). O título de um processo
+        concluído ou cancelado pode ser usado de novo, e o de outro cliente não conta. Dois `POST`
+        com o mesmo título, que criavam dois processos, agora dão 201 e 409. Um `POST` repetido
+        depois de um 503, cuja primeira chamada já tinha sido gravada, dá 409 e não duplica o
+        processo enquanto ele estiver ativo (se já foi concluído ou cancelado, o título voltou a
+        ficar livre e a repetição cria outro): a descrição antiga, de que repetir criava um segundo
+        processo, deixa de valer. `Idempotency-Key` foi rejeitado.
+      - **Cliente arquivado congela os processos (F-87).** `approveCurrentStage` e `updateProcess`
+        (renomear e cancelar) passam a responder 422 `CLIENT_ARCHIVED` para o processo de um
+        cliente arquivado, qualquer que seja o status do processo, antes de `PROCESS_NOT_ACTIVE`.
+        As leituras (`listClientProcesses`, `getProcess`, `listProcessEvents`, `listMyProcesses`,
+        `getMyProcess`) continuam 200, e desarquivar (`updateClient` com `archived: false`)
+        descongela. `createProcess` para cliente arquivado já era 422 `CLIENT_ARCHIVED`.
+      - **Só documentação, sem mudança de comportamento:** semântica de retry de `createProcess`,
+        `updateProcess`, `approveCurrentStage`, `provisionClientUser` e `resetClientUserPassword`;
+        os contadores de limite compartilhados; a regra do texto visível (E-30) nos campos de
+        texto; `progressPercent` (arredondamento) e o significado de `currentStage`; ordem das
+        listas, desempate, cursor e parâmetros desconhecidos → 400 (nas operações que declaram
+        query ou corpo; as que não declaram ignoram o que vier); a ordem das fases e os campos
+        nulos por status; `Cache-Control` declarado como header de toda resposta;
+        `previousTitle` e `newTitle` (nunca preenchidos, agora marcados `deprecated`: removê-los do
+        schema é mudança incompatível e exige `/api/v2`); o formato de `ProcessEventDetails`;
+        `actor: null`; `currentStageId: null`; o `expectedStageId` alheio → 409; a ordem da linha do
+        tempo por `id`; a resposta do "Ok" relida depois do COMMIT; a regra de que o cliente da
+        API nunca reenvia um "Ok" sozinho; e os casos E-81, E-82 e E-83 do painel do cliente.
     - `1.0.0-draft.3` (minor, **sem mudança de schema**). Aditivo: `createClient` e `updateClient`
       passam a documentar 409 `CONFLICT`, quando o nome já é de outro cliente **não arquivado**. A
       comparação trata como o mesmo nome: um acento decomposto e o composto ("Cafe" + U+0301 vale
@@ -109,6 +188,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -159,6 +240,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
             Set-Cookie:
               $ref: '#/components/headers/Set-Cookie-Session'
           content:
@@ -230,6 +313,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -332,6 +417,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -395,6 +482,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
             Set-Cookie:
               $ref: '#/components/headers/Set-Cookie-Session'
           content:
@@ -424,7 +513,21 @@ paths:
     get:
       operationId: listMyProcesses
       summary: Listar os meus processos
-      description: Processos do cliente da sessão. Não aceita id de cliente.
+      description: |
+        Processos do cliente da sessão, de **qualquer** status, do mais recente para o mais antigo
+        (`createdAt` decrescente, `id` crescente no empate). Não aceita id de cliente nem filtro:
+        `clientId`, `status` ou qualquer outro parâmetro que o contrato não tem → 400.
+
+        - Login com a senha temporária por trocar (`CHANGE_PASSWORD`) → 403
+          `PASSWORD_CHANGE_REQUIRED`, até a troca em `changePassword`.
+        - Cliente **arquivado** continua lendo os processos que já tem (200): arquivar impede
+          processos e logins novos e congela os processos (ninguém os muda), mas não a leitura.
+        - Um processo do cliente que quebra as regras do modelo (sem fase, estado sem a data, mais
+          fases concluídas do que fases) nunca é mostrado: a lista que o contém, e a página anterior,
+          que apontaria para ele, respondem 500 `INTERNAL_ERROR`, sem mostrar nada dele. Outros
+          clientes não são afetados.
+        - O cursor é o de `/me/processes` e só serve a ele; o de outro cliente anda só dentro das
+          linhas de quem o envia.
       tags: [Client Panel]
       x-auth-policy:
         access: authenticated
@@ -443,6 +546,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -464,7 +569,18 @@ paths:
     get:
       operationId: getMyProcess
       summary: Detalhar um processo meu
-      description: Processo de outro cliente ou inexistente → 404 com a mesma resposta.
+      description: |
+        Processo de outro cliente ou inexistente → 404 com a mesma resposta.
+
+        - Login com a senha temporária por trocar → 403 `PASSWORD_CHANGE_REQUIRED`, até a troca em
+          `changePassword`.
+        - Cliente **arquivado** continua lendo o detalhe dos processos que já tem (200).
+        - Processo que quebra as regras do modelo (sem fase, estado sem a data, fases fora de ordem)
+          → 500 `INTERNAL_ERROR`, sem mostrar nada dele.
+        - `currentStage` é a fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele
+          parou, e no concluído é `null`. `progressPercent` é `round(100 × completedStages ÷
+          totalStages)`, inteiro de 0 a 100, com a metade arredondada para cima (1 de 3 é 33, 2 de 3
+          é 67, 1 de 8 é 13); só chega a 100 quando todas as fases estão concluídas.
       tags: [Client Panel]
       x-auth-policy:
         access: authenticated
@@ -482,6 +598,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -505,7 +623,9 @@ paths:
     get:
       operationId: listClients
       summary: Listar clientes
-      description: Base das abas do painel dos CEOs. Ordenado por criação (mais recente primeiro).
+      description: |
+        Base das abas do painel dos CEOs. Ordenado por criação (`createdAt` decrescente, `id`
+        crescente no empate). Sem `includeArchived`, só os não arquivados.
       tags: [Admin Clients]
       x-auth-policy:
         access: authenticated
@@ -531,6 +651,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -579,6 +701,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
             Location:
               $ref: '#/components/headers/Location'
           content:
@@ -625,6 +749,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -647,8 +773,11 @@ paths:
       operationId: updateClient
       summary: Renomear, arquivar ou desarquivar cliente
       description: |
-        Arquivar impede novos processos e novos logins; não desativa os logins existentes. Arquivar
-        libera o nome. O nome é único entre os clientes não arquivados (como em `createClient`):
+        Arquivar impede novos processos e novos logins e **congela os processos que o cliente já tem**:
+        aprovar a fase, renomear e cancelar um processo dele respondem 422 `CLIENT_ARCHIVED` (F-87),
+        enquanto a leitura (`listClientProcesses`, `getProcess`, `listProcessEvents` e o painel do
+        cliente) continua 200. Desarquivar (`archived: false`) descongela: tudo volta a valer, com os
+        processos como estavam. Arquivar não desativa os logins existentes. Arquivar libera o nome. O nome é único entre os clientes não arquivados (como em `createClient`):
         renomear para o nome de outro cliente não arquivado, ou desarquivar um cliente cujo nome foi
         tomado por um ativo, responde 409 `CONFLICT`, sem dizer qual é o outro cliente, e não muda
         nada. Renomear e arquivar na mesma chamada vale pelo estado final: o cliente que acaba
@@ -676,6 +805,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -722,6 +853,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -746,6 +879,16 @@ paths:
       description: |
         Cria o login com senha temporária gerada pelo servidor (20 caracteres, CSPRNG),
         devolvida **somente nesta resposta**. O usuário nasce com a pendência `CHANGE_PASSWORD`.
+        Cliente arquivado → 422 `CLIENT_ARCHIVED`; cliente que já tem 10 logins → 422
+        `USER_LIMIT_REACHED`; e-mail já cadastrado → 409 `EMAIL_ALREADY_REGISTERED`.
+
+        **Repetir depois de um 503** (a conta pode ter sido criada no Auth sem a resposta chegar):
+        antes de responder 503, o servidor confere o que aconteceu e, se a conta é comprovadamente
+        desta tentativa, a apaga; então repetir dá 201. Se não consegue apagá-la (ou não tem certeza
+        de que é dela), o login **fica** na lista do cliente, com uma senha que ninguém recebeu:
+        repetir dá 409 `EMAIL_ALREADY_REGISTERED`, e o CEO confere `listClientUsers` e usa
+        `resetClientUserPassword`, que entrega uma senha nova. O servidor nunca cria dois logins com
+        o mesmo e-mail. Gasta o contador de 20 por hora que `resetClientUserPassword` também gasta.
       tags: [Admin Client Users]
       x-auth-policy:
         access: authenticated
@@ -769,6 +912,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -825,6 +970,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -854,7 +1001,14 @@ paths:
       summary: Resetar a senha de um login de cliente
       description: |
         Gera uma nova senha temporária (devolvida somente nesta resposta), marca a pendência
-        `CHANGE_PASSWORD` e revoga todas as sessões do usuário.
+        `CHANGE_PASSWORD` e revoga todas as sessões do usuário. A senha anterior deixa de valer, e
+        cada reset invalida a senha do reset anterior: só a última vale.
+
+        **Repetir depois de um 503:** o servidor troca a senha no Auth e só então grava a pendência
+        no banco. Se o segundo passo falha, a senha antiga e as sessões já não valem, mas a
+        pendência não foi gravada e a senha nova **não** é mostrada: o CEO repete o reset, que
+        conclui e devolve outra senha. Repetir um reset que já tinha dado certo também é seguro (200,
+        outra senha). Gasta o contador de 20 por hora que `provisionClientUser` também gasta.
       tags: [Admin Client Users]
       x-auth-policy:
         access: authenticated
@@ -873,6 +1027,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -896,6 +1052,14 @@ paths:
     get:
       operationId: listClientProcesses
       summary: Listar os processos de um cliente
+      description: |
+        Do mais recente para o mais antigo (`createdAt` decrescente, `id` crescente no empate), com o
+        filtro opcional `status`. Cliente sem processo → página vazia; cliente inexistente → 404.
+        Funciona para cliente arquivado (200): arquivar congela os processos, não a leitura.
+        Processo que quebra as regras do modelo (sem fase, estado sem a data) faz a lista que o
+        contém responder 500 `INTERNAL_ERROR`, sem mostrar nada dele. `currentStage` é a fase
+        `in_progress`: no processo ativo é a atual, no cancelado é onde ele parou, e no concluído é
+        `null`.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -921,6 +1085,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -945,6 +1111,22 @@ paths:
       description: |
         Sem `stages`, usa o template padrão (`GET /admin/stage-templates/default`). A fase 1 já
         nasce `in_progress`. Cliente arquivado → 422 `CLIENT_ARCHIVED`.
+
+        O título é único entre os processos **ativos** do cliente: um título que já é de outro
+        processo ativo dele responde 409 `CONFLICT`, sem dizer qual é o outro processo, e nada é
+        criado. A comparação trata como o mesmo título as diferenças só de caixa, de sequências de
+        espaços e de marcas de variação invisíveis, o acento decomposto e o composto, e as formas de
+        compatibilidade do Unicode (a mesma regra do nome em `createClient`). O título de um
+        processo concluído ou cancelado pode ser usado de novo, e o de outro cliente não conta. Dois
+        processos de mesmo nome, de propósito, exigem outro título.
+
+        **Repetir** (um duplo clique, ou depois de um 503, que não diz se a primeira chamada foi
+        gravada, nem quando só a releitura que devolve o corpo falhou): não duplica o processo
+        enquanto o primeiro estiver ativo. Se a primeira chamada tinha sido gravada, a repetição
+        responde 409 `CONFLICT` e o CEO lista os processos do cliente (`listClientProcesses`) para
+        achar o que já existe; se não tinha, a repetição é a criação, 201. Se o primeiro processo já
+        foi concluído ou cancelado nesse intervalo, o título voltou a ficar livre e a repetição cria
+        outro. `Idempotency-Key` não existe.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -968,6 +1150,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
             Location:
               $ref: '#/components/headers/Location'
           content:
@@ -982,6 +1166,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -999,6 +1185,15 @@ paths:
     get:
       operationId: getProcess
       summary: Detalhar processo (visão de CEO)
+      description: |
+        Funciona para o processo de cliente arquivado (200). As fases vêm em ordem de `position` (1
+        a n, sem buracos). Por status: a fase `pending` não tem `startedAt`, só a `completed` tem
+        `completedAt` e `approval` (quem aprovou e quando); o processo `active` não tem `completedAt`
+        nem `cancelledAt`, o `completed` tem `completedAt` e o `cancelled` tem `cancelledAt`.
+        `currentStage` é a fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele
+        parou (as fases ficam como estavam), e no concluído é `null`. Processo que quebra as regras do
+        modelo (sem fase, estado sem a data, duas aprovações numa fase) → 500 `INTERNAL_ERROR`, sem
+        mostrar nada dele.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -1016,6 +1211,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -1037,7 +1234,24 @@ paths:
     patch:
       operationId: updateProcess
       summary: Renomear ou cancelar processo
-      description: Só processos `active` aceitam mudança; nos demais → 422 `PROCESS_NOT_ACTIVE`.
+      description: |
+        Renomeia (`title`) e/ou cancela (`status: cancelled`, a única transição manual; não há
+        caminho de volta). Só processos `active` aceitam mudança; nos demais → 422
+        `PROCESS_NOT_ACTIVE`, até para renomear para o mesmo título. O processo de um cliente
+        **arquivado** não muda: → 422 `CLIENT_ARCHIVED` (o cliente precisa ser desarquivado antes,
+        F-87), que vence `PROCESS_NOT_ACTIVE`. Precedência: 404, `CLIENT_ARCHIVED`,
+        `PROCESS_NOT_ACTIVE` e, só no renome, 409 `CONFLICT`.
+
+        Renomear para o título de outro processo **ativo** do mesmo cliente → 409 `CONFLICT`, sem
+        dizer qual é o outro processo (a regra de `createProcess`); o processo fica como estava.
+        Renomear para o próprio título, ou só trocar as maiúsculas e os espaços dele, é permitido.
+        Renomear e cancelar na mesma chamada vale pelo estado final: o processo que acaba cancelado
+        não disputa o título. Cancelar não muda as fases: a que estava em andamento continua.
+
+        **Repetir depois de um 503** (que não diz se a primeira chamada foi gravada): o renome é
+        idempotente (200, sem nova versão e sem novo evento). O cancelamento que já tinha sido
+        gravado responde 422 `PROCESS_NOT_ACTIVE`, porque o processo já está cancelado: o 422 não
+        desfaz nada, e o CEO confere `getProcess` antes de concluir que falhou.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -1061,6 +1275,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -1073,6 +1289,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -1092,9 +1310,30 @@ paths:
       summary: Dar "Ok" na fase atual
       description: |
         Conclui a fase atual e inicia a próxima (ou conclui o processo, se for a última). Basta
-        **um** CEO. `expectedStageId` precisa ser a fase atual; se não for (outro CEO já
-        aprovou ou houve um retry), responde 409 `STALE_STAGE` com `currentStageId`.
-        Operação atômica, com auditoria na mesma transação.
+        **um** CEO. `expectedStageId` precisa ser a fase atual; se não for, responde 409
+        `STALE_STAGE` com `currentStageId`: outro CEO já aprovou, houve um retry, a fase ainda é
+        futura, já foi concluída ou é de **outro** processo. Nunca é 404 (um `expectedStageId`
+        alheio é 409) e nunca pula uma fase. Operação atômica, com auditoria na mesma transação.
+
+        Precedência dos erros: 404 se o processo não existe; 422 `CLIENT_ARCHIVED` se o
+        cliente do processo está arquivado (F-87: o cliente precisa ser desarquivado antes);
+        422 `PROCESS_NOT_ACTIVE` se o processo está concluído ou cancelado (que vence o 409: um
+        `expectedStageId` velho num processo que já não está ativo é 422, e não 409); e só então o
+        409 `STALE_STAGE`.
+
+        **Repetir depois de um 503** (a resposta se perdeu, ou só a releitura que devolve o corpo
+        falhou) nunca aprova duas vezes, porque a fase esperada é a chave: se a primeira chamada foi
+        gravada, o retry com o mesmo `expectedStageId` responde 409 `STALE_STAGE` com a fase seguinte
+        em `currentStageId`, ou 422 `PROCESS_NOT_ACTIVE` se era a última fase (ou se o processo foi
+        cancelado depois); se não foi gravada, o retry é a própria aprovação, 200. O CEO que recebe o
+        409 ou o 422 de um retry lê `getProcess` para ver o que a primeira chamada fez
+        (`stages[].approval` diz quem concluiu cada fase).
+
+        **O cliente da API nunca reenvia um "Ok" sozinho** (F-107): nem com o `currentStageId` de um
+        409, nem depois de um 503, nem num retry automático da biblioteca de requisições. Reenviar
+        com o `currentStageId` que acabou de receber aprova a fase **seguinte**, que o CEO nunca viu.
+        Depois de um 409 ou de um 503, a tela mostra a fase atual (e quem aprovou a anterior), e o
+        novo "Ok" é sempre um clique novo, sobre o que a tela mostra naquele momento.
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -1118,10 +1357,15 @@ paths:
                   expectedStageId: 7f1c2b4e-9a3d-4c5e-8f6a-1b2c3d4e5f60
       responses:
         '200':
-          description: Fase aprovada; devolve o processo atualizado.
+          description: |
+            Fase aprovada; devolve o processo **relido logo depois do COMMIT**: o corpo pode já incluir
+            uma mudança concorrente gravada nesse intervalo (um cancelamento que esperava a trava, por
+            exemplo), e nunca mostra um estado anterior a esta aprovação.
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -1135,14 +1379,41 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: A fase esperada não é mais a atual.
+          description: |
+            A fase esperada não é mais a atual. `currentStageId` é a fase atual **no momento em que a
+            resposta é montada** (o processo é relido depois do erro); é `null` só se o processo
+            deixou de estar ativo entre o erro e a releitura (um cancelamento ou a última aprovação
+            concorrentes).
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/StaleStageProblem'
+              examples:
+                otherCeoApproved:
+                  summary: Outro CEO já aprovou a fase; a atual é a seguinte.
+                  value:
+                    type: about:blank
+                    title: Stage is no longer current
+                    status: 409
+                    code: STALE_STAGE
+                    detail: The stage is no longer the current one of the process.
+                    requestId: 8f3b2c1d-0a4e-4b7a-9c55-2e1f6d7a8b90
+                    currentStageId: 3d9c2f10-6b1e-4f7a-8a42-5c0e9b1d7e21
+                processNoLongerActive:
+                  summary: O processo foi cancelado entre o erro e a releitura.
+                  value:
+                    type: about:blank
+                    title: Stage is no longer current
+                    status: 409
+                    code: STALE_STAGE
+                    detail: The stage is no longer the current one of the process.
+                    requestId: 1b7e4a90-3c2d-4e8f-a1b6-9d0c5f2e7a34
+                    currentStageId: null
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
@@ -1160,7 +1431,15 @@ paths:
     get:
       operationId: listProcessEvents
       summary: Linha do tempo do processo
-      description: Eventos de auditoria do processo em ordem cronológica crescente.
+      description: |
+        Eventos de auditoria do processo em ordem **causal** crescente: pelo `id` do evento
+        (sequencial), e não por `occurredAt`. Toda escrita do mesmo processo pega a trava dele antes
+        de gravar a auditoria, então um evento posterior sempre tem `id` maior; já o `occurredAt` é o
+        instante de início da transação, e uma escrita que esperou a trava pode mostrar um instante
+        alguns milissegundos anterior ao do evento que a antecedeu. A ordem do `id` prevalece. O
+        cursor é a posição do último `id` da página: os eventos novos entram no fim, e uma página
+        posterior os traz. Só as ações de `ProcessEventAction` aparecem; uma ação nova só chega aqui
+        depois de entrar nessa lista. Funciona para o processo de cliente arquivado (200).
       tags: [Admin Processes]
       x-auth-policy:
         access: authenticated
@@ -1180,6 +1459,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -1219,6 +1500,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
           content:
             application/json:
               schema:
@@ -1292,16 +1575,23 @@ components:
       name: cursor
       in: query
       required: false
-      description: Cursor opaco devolvido em `nextCursor`. Valor adulterado → 400.
+      description: 'Cursor opaco devolvido em `nextCursor`; só serve ao endpoint que o emitiu. Valor adulterado, truncado, de outro endpoint ou com posição que o banco não lê → 400. Veja "Listas e cursor" na descrição do contrato.'
       schema:
         $ref: '#/components/schemas/Cursor'
 
   headers:
     X-Request-Id:
       description: Correlation id da requisição (também gravado nos logs e na auditoria).
+      required: true
       schema:
         type: string
         pattern: '^[A-Za-z0-9-]{8,64}$'
+    Cache-Control:
+      description: 'Sempre `no-store`: nenhuma resposta da API (nem a de erro) pode ser guardada por cache, compartilhado ou do navegador.'
+      required: true
+      schema:
+        type: string
+        enum: [no-store]
     Retry-After:
       description: Segundos até a próxima tentativa ser aceita.
       schema:
@@ -1330,6 +1620,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
         Set-Cookie:
           $ref: '#/components/headers/Set-Cookie-Session-Refresh'
     NoContentClearCookie:
@@ -1337,6 +1629,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
         Set-Cookie:
           $ref: '#/components/headers/Set-Cookie-Session'
     BadRequest:
@@ -1344,6 +1638,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1353,6 +1649,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1364,6 +1662,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1373,6 +1673,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1380,10 +1682,14 @@ components:
     Conflict:
       description: |
         `EMAIL_ALREADY_REGISTERED`, `MFA_ALREADY_ENROLLED` ou `CONFLICT`. Em `createClient` e
-        `updateClient`, `CONFLICT` é o nome de cliente que já é de outro cliente não arquivado.
+        `updateClient`, `CONFLICT` é o nome de cliente que já é de outro cliente não arquivado. Em
+        `createProcess` e `updateProcess`, `CONFLICT` é o título que já é de outro processo ativo do
+        mesmo cliente.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1393,6 +1699,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1402,6 +1710,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1410,9 +1720,13 @@ components:
       description: |
         Regra de negócio violada: `PROCESS_NOT_ACTIVE`, `CLIENT_ARCHIVED`, `WEAK_PASSWORD`,
         `PASSWORD_UNCHANGED`, `INVALID_CURRENT_PASSWORD`, `INVALID_MFA_CODE`, `USER_LIMIT_REACHED`.
+        `CLIENT_ARCHIVED` vale para provisionar login e criar processo de um cliente arquivado e, desde
+        a `1.0.0-draft.4`, para aprovar a fase, renomear e cancelar um processo dele.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1422,6 +1736,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
         Retry-After:
           $ref: '#/components/headers/Retry-After'
       content:
@@ -1433,6 +1749,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
       content:
         application/problem+json:
           schema:
@@ -1442,13 +1760,16 @@ components:
         Dependência indisponível ou lenta (`SERVICE_UNAVAILABLE`): limitador de taxa, banco ou Auth.
         A operação falha fechada, ou seja, nada é liberado por causa da falha. Escritas são atômicas
         (nada fica pela metade), mas um 503 não diz se a escrita chegou a ser gravada. Repetir uma
-        escrita idempotente (`PATCH`, desativar, arquivar) é seguro, e repetir `createClient` nunca
-        duplica o cliente: se a primeira chamada tinha sido gravada, a repetição responde 409
-        `CONFLICT`. Nas demais escritas, a descrição da própria operação diz o que a repetição
-        devolve. A exceção, `changePassword`, está na descrição da operação.
+        escrita idempotente (`PATCH` de renome, desativar, arquivar) é seguro, e repetir `createClient`
+        ou `createProcess` não duplica enquanto o primeiro cliente ou processo estiver ativo: se a
+        primeira chamada tinha sido gravada, a repetição responde 409 `CONFLICT`. Nas demais escritas (`updateProcess` ao cancelar, `approveCurrentStage`,
+        `provisionClientUser`, `resetClientUserPassword`), a descrição da própria operação diz o que
+        a repetição devolve. A exceção, `changePassword`, está na descrição da operação.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
         Retry-After:
           $ref: '#/components/headers/Retry-After'
       content:
@@ -1492,6 +1813,7 @@ components:
       type: string
       minLength: 1
       maxLength: 120
+      description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`.'
     TemporaryPasswordValue:
       type: string
       minLength: 20
@@ -1577,7 +1899,7 @@ components:
           required: [currentStageId]
           properties:
             currentStageId:
-              description: Fase atual no momento do conflito (null se o processo não está mais ativo).
+              description: 'Fase atual no momento em que a resposta é montada, relida depois do erro. `null` só se o processo deixou de estar ativo nesse intervalo (um cancelamento ou a última aprovação concorrentes).'
               oneOf:
                 - $ref: '#/components/schemas/Uuid'
                 - type: 'null'
@@ -1705,7 +2027,7 @@ components:
     MyStage:
       type: object
       additionalProperties: false
-      description: Fase na visão do cliente (sem dados internos de aprovação).
+      description: 'Fase na visão do cliente (sem dados internos de aprovação). `startedAt` é `null` enquanto a fase está `pending`; `completedAt` é `null` até ela ser `completed`.'
       required: [position, name, description, status, startedAt, completedAt]
       properties:
         position:
@@ -1753,6 +2075,7 @@ components:
         status:
           $ref: '#/components/schemas/ProcessStatus'
         currentStage:
+          description: 'A fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele parou, e no concluído é `null`.'
           oneOf:
             - $ref: '#/components/schemas/MyCurrentStage'
             - type: 'null'
@@ -1768,6 +2091,7 @@ components:
           type: integer
           minimum: 0
           maximum: 100
+          description: '`round(100 × completedStages ÷ totalStages)`, com a metade arredondada para cima (1 de 3 é 33, 2 de 3 é 67, 1 de 8 é 13). Só chega a 100 quando todas as fases estão concluídas.'
         createdAt:
           $ref: '#/components/schemas/Timestamp'
         updatedAt:
@@ -1789,6 +2113,7 @@ components:
         status:
           $ref: '#/components/schemas/ProcessStatus'
         currentStage:
+          description: 'A fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele parou, e no concluído é `null`.'
           oneOf:
             - $ref: '#/components/schemas/MyCurrentStage'
             - type: 'null'
@@ -1804,16 +2129,19 @@ components:
           type: integer
           minimum: 0
           maximum: 100
+          description: '`round(100 × completedStages ÷ totalStages)`, com a metade arredondada para cima (1 de 3 é 33, 2 de 3 é 67, 1 de 8 é 13). Só chega a 100 quando todas as fases estão concluídas.'
         createdAt:
           $ref: '#/components/schemas/Timestamp'
         updatedAt:
           $ref: '#/components/schemas/Timestamp'
         completedAt:
+          description: 'Só o processo `completed` tem; nos demais é `null`.'
           oneOf:
             - $ref: '#/components/schemas/Timestamp'
             - type: 'null'
         stages:
           type: array
+          description: 'Em ordem de `position`, de 1 a n, sem buracos.'
           minItems: 1
           maxItems: 30
           items:
@@ -1906,6 +2234,7 @@ components:
           type: string
           minLength: 1
           maxLength: 160
+          description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`.'
     UpdateClientRequest:
       type: object
       additionalProperties: false
@@ -1915,8 +2244,10 @@ components:
           type: string
           minLength: 1
           maxLength: 160
+          description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`.'
         archived:
           type: boolean
+          description: '`true` arquiva (impede processos e logins novos e congela os processos que o cliente já tem: `CLIENT_ARCHIVED` ao aprovar, renomear e cancelar), `false` desarquiva (descongela). Repetir o mesmo valor não muda nada.'
 
     ClientUser:
       type: object
@@ -1993,9 +2324,11 @@ components:
           type: string
           minLength: 1
           maxLength: 120
+          description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`.'
         description:
           type: string
           maxLength: 2000
+          description: 'Mesma regra de texto visível do `name`, com uma diferença: vazia ou só de espaços, depois de aparada, vale "sem descrição" (`description: null` na resposta), e não é erro.'
     CreateProcessRequest:
       type: object
       additionalProperties: false
@@ -2005,6 +2338,7 @@ components:
           type: string
           minLength: 1
           maxLength: 160
+          description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`. Único entre os processos ativos do cliente (409 `CONFLICT`).'
         stages:
           type: array
           description: Fases em ordem. Omitido → template padrão.
@@ -2021,6 +2355,7 @@ components:
           type: string
           minLength: 1
           maxLength: 160
+          description: 'Texto visível (veja "Texto visível" na descrição do contrato): NFC, pontas aparadas, sem caractere de controle ou de formatação, sem "filler" invisível e com ao menos uma letra ou um número; o comprimento conta caracteres depois disso. Violação → 400 `VALIDATION_ERROR`. Único entre os processos ativos do cliente (409 `CONFLICT`).'
         status:
           type: string
           description: Única transição manual permitida.
@@ -2031,7 +2366,9 @@ components:
       required: [expectedStageId]
       properties:
         expectedStageId:
-          $ref: '#/components/schemas/Uuid'
+          description: 'A fase que o CEO viu como atual (controle de concorrência otimista, como um `If-Match`). Se não é a atual do processo (já concluída, ainda futura, de outro processo ou inexistente) → 409 `STALE_STAGE`, nunca 404.'
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
     ActorRef:
       type: object
       additionalProperties: false
@@ -2053,6 +2390,7 @@ components:
     AdminStage:
       type: object
       additionalProperties: false
+      description: 'Por status: `pending` não tem `startedAt`; só a `completed` tem `completedAt` e `approval` (quem aprovou e quando).'
       required: [id, position, name, description, status, startedAt, completedAt, approval]
       properties:
         id:
@@ -2110,6 +2448,7 @@ components:
         status:
           $ref: '#/components/schemas/ProcessStatus'
         currentStage:
+          description: 'A fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele parou (as fases ficam como estavam), e no concluído é `null`.'
           oneOf:
             - $ref: '#/components/schemas/AdminCurrentStage'
             - type: 'null'
@@ -2153,6 +2492,7 @@ components:
         status:
           $ref: '#/components/schemas/ProcessStatus'
         currentStage:
+          description: 'A fase `in_progress`: no processo ativo é a atual, no cancelado é onde ele parou (as fases ficam como estavam), e no concluído é `null`.'
           oneOf:
             - $ref: '#/components/schemas/AdminCurrentStage'
             - type: 'null'
@@ -2181,6 +2521,7 @@ components:
             - type: 'null'
         stages:
           type: array
+          description: 'Em ordem de `position`, de 1 a n, sem buracos.'
           minItems: 1
           maxItems: 30
           items:
@@ -2215,13 +2556,13 @@ components:
         id:
           type: string
           pattern: '^[0-9]{1,19}$'
-          description: Id sequencial do evento (bigint serializado como string).
+          description: 'Id sequencial do evento (bigint serializado como string, decimal canônico). É a ordem em que as escritas aconteceram, e é por ele que a lista é ordenada e paginada.'
         occurredAt:
           $ref: '#/components/schemas/Timestamp'
         action:
           $ref: '#/components/schemas/ProcessEventAction'
         actor:
-          description: CEO que executou a ação (null se for ação de sistema).
+          description: 'CEO que executou a ação. `null` se for ação de sistema **ou** se o perfil dele não é legível (por exemplo, não existe mais): a linha do tempo mostra o que há, sem erro.'
           oneOf:
             - $ref: '#/components/schemas/ActorRef'
             - type: 'null'
@@ -2230,6 +2571,13 @@ components:
     ProcessEventDetails:
       type: object
       additionalProperties: false
+      description: |
+        Só o que a trilha de auditoria guarda, sem títulos nem nomes de pessoas. `stage.approved`
+        traz `stageId` e, da fase, `stagePosition` e `stageName` (se a fase não é achada, só
+        `stageId`). Os outros eventos (`process.created`, `process.updated`, `process.cancelled`,
+        `process.completed`) têm `details: {}`. `previousTitle` e `newTitle` **nunca** vêm
+        preenchidos: a trilha não guarda títulos (um `process.updated` não diz de qual título para
+        qual), e o título de hoje estaria errado depois de um renome seguinte.
       properties:
         stageId:
           $ref: '#/components/schemas/Uuid'
@@ -2243,9 +2591,13 @@ components:
         previousTitle:
           type: string
           maxLength: 160
+          deprecated: true
+          description: 'Nunca preenchido (veja a descrição de `ProcessEventDetails`).'
         newTitle:
           type: string
           maxLength: 160
+          deprecated: true
+          description: 'Nunca preenchido (veja a descrição de `ProcessEventDetails`).'
     ProcessEventList:
       type: object
       additionalProperties: false

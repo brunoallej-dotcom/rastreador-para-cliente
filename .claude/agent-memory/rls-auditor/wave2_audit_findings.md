@@ -109,3 +109,14 @@ new-migration SKILL still says REVOKE INSERT/UPDATE/DELETE/TRUNCATE from service
 Wave 10.1 criterion: `db:test` runs after `test:api` WITHOUT reset, so pgTAP counts must be scoped.
 
 Related: [[supabase-privilege-pitfalls]].
+
+Wave 10.2 static audit (2026-11-17, branch feat/wave-10.2-product-decisions, migration 20261118020125,
+pgTAP 022 + 016/017 edits). APROVADO COM RESSALVAS (BAIXO only). F-80 partial unique index
+`processes_client_active_title_key` mirrors clients key + client_id; F-87 freeze in update_process and
+approve_current_stage via client `FOR SHARE` -> process NKU -> stage NKU (ADR 0017). Verified deadlock-free
+vs create_process/update_client/approvals (only the documented crossing-rename 40P01) and not stale
+(archive NKU must wait for every SHARE holder). BAIXO left: ADR 0017 item 2 / migration comment claim a
+process->client deadlock with create_process that cannot happen (rename writes its index entry only after
+both locks; lock-only xmax makes `_bt_check_unique` fail fast, not wait); no `IF NOT FOUND` after the client
+FOR SHARE (NULL archived_at = not archived; unreachable: FK RESTRICT, no client delete path); denial
+asserts narrowed (017:712 `process_id = PX`, 022:754 client/process filters) instead of request_id scoping.

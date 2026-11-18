@@ -44,8 +44,10 @@ Credenciais efêmeras, com dois limites no servidor e um no navegador:
   `SESSION_COOKIE_MAX_AGE_SECONDS`, a migration `session_time_limits_in_db` e este ADR.
 - Quando o limite vence, a próxima requisição recebe 401 e o usuário faz login de novo. Não há
   "lembrar de mim".
-- No Supabase hospedado, `timebox` e `inactivity_timeout` exigem o plano Pro, que a produção já
-  exige. Os valores vão para o projeto remoto com `supabase config push` na Onda 11, nunca antes.
+- No Supabase hospedado, `timebox` e `inactivity_timeout` exigem o plano Pro. Desde o
+  [ADR 0018](0018-planos-gratuitos-supabase-free-e-repositorio-publico.md) (2026-11-17), a produção
+  fica no plano Free: lá os dois limites valem pelo banco (`private.session_is_alive()`) e pelo teto
+  do cookie, e o Auth hospedado não os aplica. No `config.toml` local os valores continuam.
 
 Resíduo aceito: fazer login com um cookie de sessão válido sobrescreve o cookie, mas não revoga a
 sessão anterior. Ela deixa de valer pelo `timebox` (no máximo 12 h) ou pela inatividade (4 h).

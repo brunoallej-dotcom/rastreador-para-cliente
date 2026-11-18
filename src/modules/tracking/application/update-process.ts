@@ -18,8 +18,10 @@ export type UpdateProcessInput = {
 
 /**
  * `PATCH /admin/processes/{processId}` (RF-11, AC-19): renames and/or cancels an ACTIVE process. A
- * completed or cancelled one answers `ProcessNotActiveError` (422, I3, I4); a missing one,
- * `NotFoundError` (404); a patch that changes nothing, `ValidationError` (400).
+ * completed or cancelled one answers `ProcessNotActiveError` (422, I3, I4); one of an archived client,
+ * `ClientArchivedError` (422, F-87: frozen, and this wins over the status); a missing one,
+ * `NotFoundError` (404); a title an active process of the client already has, `ConflictError` (409,
+ * F-80); a patch that changes nothing, `ValidationError` (400).
  */
 export async function updateProcess(
   deps: UpdateProcessDeps,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ForbiddenError, NotFoundError, ServiceUnavailableError } from '@/shared/kernel';
-import { ProcessNotActiveError, StaleStageError } from '../domain/errors';
+import { ClientArchivedError, ProcessNotActiveError, StaleStageError } from '../domain/errors';
 import { invariantViolations } from '../domain/process';
 import { approveCurrentStage } from './approve-current-stage';
 import { ceoPrincipal, clientPrincipal } from './client-fixtures';
@@ -8,6 +8,7 @@ import { createFakeProcessRepository, FAKE_APPROVER } from './fake-process-repos
 import { CLIENT_A, processFixture, stageIdOf } from './process-fixtures';
 
 const PROCESS = processFixture();
+const ARCHIVED = { id: '00000000-0000-4000-8000-00000000000b', name: 'Cliente B', archived: true };
 
 const repository = (process = PROCESS) =>
   createFakeProcessRepository({ clients: [CLIENT_A], processes: [process] });
@@ -129,6 +130,58 @@ describe('approveCurrentStage', () => {
       if (!result.ok) expect(result.error).toBeInstanceOf(ProcessNotActiveError);
     }
     expect(processes.stored()).toEqual([completed, cancelled]);
+  });
+
+  it.each([
+    ['an active process', { statuses: ['in_progress', 'pending'] as const }],
+    [
+      'a process that is already completed',
+      {
+        status: 'completed' as const,
+        statuses: ['completed'] as const,
+        completedAt: new Date('2026-01-02T00:00:00.000Z'),
+      },
+    ],
+    [
+      'a cancelled process',
+      {
+        status: 'cancelled' as const,
+        statuses: ['in_progress'] as const,
+        cancelledAt: new Date('2026-01-02T00:00:00.000Z'),
+      },
+    ],
+  ])(
+    'E-99, F-87: %s of an archived client is ClientArchivedError, whatever the stage asked for',
+    async (_label, state) => {
+      const frozen = processFixture({ clientId: ARCHIVED.id, client: ARCHIVED, ...state });
+      const processes = createFakeProcessRepository({ clients: [ARCHIVED], processes: [frozen] });
+
+      for (const expectedStageId of [
+        stageIdOf(1),
+        stageIdOf(2),
+        '00000000-0000-4000-8000-0000000002ff',
+      ]) {
+        const result = await approveCurrentStage({ processes }, ceoPrincipal, {
+          processId: frozen.id,
+          expectedStageId,
+        });
+
+        expect(!result.ok && result.error).toBeInstanceOf(ClientArchivedError);
+      }
+      expect(processes.stored()).toEqual([frozen]);
+    },
+  );
+
+  it('F-87: reading is not frozen, and an unknown process of an archived client is still NotFoundError', async () => {
+    const frozen = processFixture({ clientId: ARCHIVED.id, client: ARCHIVED });
+    const processes = createFakeProcessRepository({ clients: [ARCHIVED], processes: [frozen] });
+
+    expect(await processes.find(frozen.id)).toEqual(frozen);
+    const result = await approveCurrentStage({ processes }, ceoPrincipal, {
+      processId: '00000000-0000-4000-8000-00000000dead',
+      expectedStageId: stageIdOf(1),
+    });
+    expect(!result.ok && result.error).toBeInstanceOf(NotFoundError);
   });
 
   it('an unknown process is NotFoundError (404)', async () => {

@@ -204,7 +204,12 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
   const healthResponse = (headers: Record<string, string> = {}) =>
     new Response(JSON.stringify({ status: 'ok' }), {
       status: 200,
-      headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId, ...headers },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Request-Id': requestId,
+        'Cache-Control': 'no-store',
+        ...headers,
+      },
     });
 
   const problemResponse = (status: number, headers: Record<string, string> = {}) =>
@@ -213,6 +218,7 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
       headers: {
         'Content-Type': 'application/problem+json',
         'X-Request-Id': requestId,
+        'Cache-Control': 'no-store',
         ...headers,
       },
     });
@@ -261,7 +267,7 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
   it('fails when the Content-Type header is missing', () => {
     const response = new Response(JSON.stringify({ status: 'ok' }), {
       status: 200,
-      headers: { 'X-Request-Id': requestId },
+      headers: { 'X-Request-Id': requestId, 'Cache-Control': 'no-store' },
     });
     response.headers.delete('content-type');
     expect(failureWith('getHealth', 200, { status: 'ok' }, response)).toMatch(/Content-Type/);
@@ -285,6 +291,31 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
         );
       },
     );
+  });
+
+  describe('Cache-Control (declared on every response since 1.0.0-draft.4)', () => {
+    it('fails when it is missing', () => {
+      const response = healthResponse();
+      response.headers.delete('cache-control');
+      expect(failureWith('getHealth', 200, { status: 'ok' }, response)).toMatch(
+        /declares the header Cache-Control/,
+      );
+    });
+
+    it('fails when it is anything but no-store', () => {
+      const response = healthResponse({ 'Cache-Control': 'max-age=60' });
+      expect(failureWith('getHealth', 200, { status: 'ok' }, response)).toMatch(
+        /header Cache-Control does not match/,
+      );
+    });
+
+    it('is declared on the error responses too', () => {
+      const response = problemResponse(429, { 'Retry-After': '30' });
+      response.headers.delete('cache-control');
+      expect(failureWith('getHealth', 429, problem(), response)).toMatch(
+        /declares the header Cache-Control/,
+      );
+    });
   });
 
   describe('Retry-After on 429 and 503', () => {
@@ -354,11 +385,15 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
         status: 204,
         headers: {
           'X-Request-Id': requestId,
+          'Cache-Control': 'no-store',
           'Set-Cookie': '__Host-rt-session=; Max-Age=0; Path=/',
         },
       });
       expect(failureWith('logout', 204, undefined, withCookie)).toBe('');
-      const without = new Response(null, { status: 204, headers: { 'X-Request-Id': requestId } });
+      const without = new Response(null, {
+        status: 204,
+        headers: { 'X-Request-Id': requestId, 'Cache-Control': 'no-store' },
+      });
       expect(failureWith('logout', 204, undefined, without)).toMatch(
         /declares the header Set-Cookie/,
       );
@@ -366,7 +401,10 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
 
     it('the Set-Cookie of the changePassword 204 is optional: it passes with and without it', () => {
       const answer = (headers: Record<string, string>) =>
-        new Response(null, { status: 204, headers: { 'X-Request-Id': requestId, ...headers } });
+        new Response(null, {
+          status: 204,
+          headers: { 'X-Request-Id': requestId, 'Cache-Control': 'no-store', ...headers },
+        });
       expect(failureWith('changePassword', 204, undefined, answer({}))).toBe('');
       expect(
         failureWith(
@@ -393,7 +431,12 @@ describe('expectToMatchContract with the Response (status, Content-Type and decl
           }),
           {
             status: 201,
-            headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId, ...headers },
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Request-Id': requestId,
+              'Cache-Control': 'no-store',
+              ...headers,
+            },
           },
         );
       const body = {

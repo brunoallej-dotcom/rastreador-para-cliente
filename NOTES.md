@@ -4,13 +4,14 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 
 ## Status atual
 
-- **Fase:** implementação em andamento (2026-11-17). Ondas 0 a 10.1 concluídas, mais os contratos
-  `1.0.0-draft.2` e `draft.3` e a troca do CodeQL pelo Semgrep.
+- **Fase:** implementação em andamento (2026-11-18). Ondas 0 a 10.2 concluídas, mais os contratos
+  `1.0.0-draft.2`, `draft.3` e `draft.4` e a troca do CodeQL pelo Semgrep.
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 11 (hardening e go-live). Ela depende da configuração de produção do
-  usuário e herda os itens da Onda 10.1 anotados no plano.
+- **Próxima onda:** 11 (hardening e go-live). Ela depende da configuração de produção do usuário
+  (projetos Supabase no plano Free, ADR 0018) e herda os itens das Ondas 10.1 e 10.2 anotados no
+  plano.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -29,7 +30,8 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
-| 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
+| 10.2 | Decisões de produto: título ativo único por cliente (F-80), processos de cliente arquivado congelados (F-87), contrato `1.0.0-draft.4` | 10.1 | — | ✅ |
+| 11 | Hardening e go-live | 7, 9, 10, 10.1, 10.2 | — | ⬜ |
 
 Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
@@ -37,18 +39,12 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 | Pendência | Bloqueia |
 |-----------|----------|
-| Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
 | Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
-| Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
-| Decidir F-80 (POST de processo repetido: título ativo único com 409, ou `Idempotency-Key`), F-87 (processos de cliente arquivado: congelar com 422 `CLIENT_ARCHIVED`?) e aprovar o bump `draft.4` do contrato, só de documentação (candidatos nos logs das Ondas 7, 8, 9 e 10) | nada hoje; F-87 muda a spec e o `approve_current_stage`/`update_process` |
-| Deixar o repositório privado (decidido em 2026-11-16) **depois** do merge do PR do Semgrep, que substitui o CodeQL (code scanning não existe em repositório privado de conta pessoal no GitHub Free) | exposição do threat model com achados abertos |
+| ~~Deixar o repositório privado~~: **revertido em 2026-11-17, o repositório fica público.** No privado, o GitHub recusou rodar o CI (cobrança do Actions). Risco aceito: o threat model e os achados em aberto ficam visíveis | — |
 | ~~Branch protection na `main`~~: **decidido em 2026-11-16, sem GitHub Pro por ora.** Risco aceito: o GitHub não barra merge com CI vermelho; o fluxo de ondas só faz merge com todos os checks verdes | — |
 | Corrigir no código-fonte do `@aisac/cli` o falso positivo do `secrets-guard` (identificador terminado em `.key` em comando Bash; ver CLAUDE.md) | conforto dos agentes |
-| Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
+| Criar os projetos Supabase **dev/staging** e **prod** em `sa-east-1`, ambos no plano **Free** (ADR 0018), e mandar os dois *project refs* (não são segredo; a senha do banco fica com o usuário) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
-| Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
-| Q-07 (retenção) e Q-12 (domínio) | Onda 11 |
-| Revisar as decisões que a sessão principal tomou sozinha na Onda 10.1, com autonomia dada pelo usuário (lista no log de 2026-11-17) | nada; cada uma é reversível numa onda futura |
 
 ## Observações
 
@@ -684,3 +680,73 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   - `db:test` logo depois, sem reset → 1713/1713;
   - `test:api -t "F-8[13]|F-9[23]|F-110"` → 14, três vezes seguidas;
   - `build`, `format:check`, `test:hooks` (179), `pnpm sast` (0 achados) e `contract:lint` ok.
+
+### 2026-11-17 — Decisões do usuário e abertura da Onda 10.2
+
+- **Merge da Onda 10.1:** com o repositório privado, o GitHub recusou rodar o CI (cobrança do
+  Actions). O usuário tornou o repositório público, o CI rodou verde nos PRs #23 e #24, e os dois
+  foram mergeados (`d668d0d` e `d04f972`).
+- **Decisões do usuário:**
+  - o repositório fica **público**, o que reverte a decisão de 2026-11-16;
+  - **F-80:** título ativo único por cliente, com 409 `CONFLICT`. `Idempotency-Key` foi rejeitado;
+  - **F-87 (Q-13):** cliente arquivado congela os processos (422 `CLIENT_ARCHIVED` em aprovar,
+    renomear e cancelar). A leitura continua, e desarquivar descongela;
+  - **contrato `draft.4`** aprovado, com as duas mudanças acima;
+  - **Q-01:** os nomes das fases padrão ficam como estão na migration;
+  - **Q-07:** auditoria guardada por 5 anos; contas anonimizadas 1 ano depois do arquivamento do
+    cliente. A implementação (`pg_cron`) é da Onda 11;
+  - **Q-12:** por ora, o domínio padrão que a Vercel atribui (`*.vercel.app`) vai no `APP_ORIGIN`;
+  - as decisões que a sessão principal tomou sozinha na Onda 10.1 foram revisadas e aceitas.
+- **Pendências resolvidas pelo usuário:** `ceo:create` rodado contra o Supabase local (goal command
+  da Onda 4) e nomes das variáveis locais alinhados com o `.env.example`.
+- **Onda 10.2 aberta** no plano: subagente, com revisão na sessão principal.
+
+### 2026-11-18 — Onda 10.2: decisões de produto, e Supabase Free
+
+- **Como foi executada:** subagente Sonnet (xhigh) em worktree, sozinho, e as quatro revisões na
+  sessão principal. Uma rodada de correções com 16 itens.
+- **Entregue:**
+  - migration `20261118020125_process_title_unique_and_client_archive_freeze`, pgTAP 022 (novo),
+    016 e 017 ajustados, e o ADR 0017;
+  - **F-80:** índice único parcial `processes_client_active_title_key`, com a mesma chave dos nomes
+    de cliente mais `client_id`, só entre ativos. Criar ou renomear para um título ativo do mesmo
+    cliente responde 409 `CONFLICT` (`PROCESS_TITLE_TAKEN` só quando vem desse índice; outro 23505
+    continua 500);
+  - **F-87:** com o cliente arquivado, aprovar, renomear e cancelar respondem 422
+    `CLIENT_ARCHIVED`. A leitura continua (E-83), e desarquivar descongela;
+  - **ordem de trava, um desvio do brief aceito pelas quatro revisões:** o cliente com `FOR SHARE`,
+    depois o processo, depois a fase. O `JOIN` sem trava do cliente deixaria uma janela de corrida
+    com o arquivamento (F-120). A precedência dos erros é 404, `CLIENT_ARCHIVED`,
+    `PROCESS_NOT_ACTIVE` e, por fim, título em uso ou `STALE_STAGE`;
+  - **contrato `1.0.0-draft.4`:** 409 e 422 novos, mais as lacunas só de documentação das Ondas 7
+    a 10. `Cache-Control` agora está declarado em todas as respostas. `previousTitle` e `newTitle`
+    ficaram `deprecated`. Nenhum schema mudou de forma;
+  - **spec §8:** Q-01, Q-07, Q-12, Q-13 e Q-14 decididas.
+- **Revisões:** threat-modeler, code-reviewer, contract-guardian e rls-auditor estático. Nenhum
+  CRÍTICO ou ALTO. Corrigido na rodada única:
+  - fail-closed depois da trava do cliente (F-127);
+  - um inventário pgTAP das funções que escrevem nas tabelas de rastreamento (T-56, F-124);
+  - as negativas do pgTAP sem filtro nas colunas que um bug poderia gravar diferente;
+  - o cancelamento no teste de corrida do arquivamento;
+  - o teste de "aprovações não se esperam" falha rápido;
+  - a seção "Entrada" do contrato alinhada ao ADR 0008;
+  - a justificativa da ordem de trava corrigida;
+  - F-125 e F-126 registrados, e os renomes cruzados (F-123, E-102) documentados.
+- **Decisão do usuário (2026-11-17): Supabase Free em dev e prod.** Registrada no ADR 0018, que
+  também registra o repositório público e substitui itens dos ADRs 0001 e 0012. Compensações na
+  Onda 11:
+  - sessão: o banco já aplica 12 h e 4 h;
+  - recusa de senha vazada pelo backend, com o resíduo F-128;
+  - dump diário criptografado;
+  - pausa por inatividade aceita.
+
+  Atualizados junto: spec RNF-08, SEC-07 e §3.11, o ADR 0009 e o plano da Onda 11.
+- **Verificado pela sessão principal**, sob o lock, a partir de `pnpm db:reset`:
+  - `pnpm verify` → 1879 pgTAP; `test:coverage` → 2886 unit;
+  - `db:lint` ok; `db:types` sem diff; `test:int` → 22/22;
+  - `test:api` → 578/578 duas vezes;
+  - `db:test` logo depois, sem reset → 1879/1879;
+  - `test:api -t "F-80|F-87"` → 24, três vezes seguidas;
+  - `build`, `format:check`, `test:hooks`, `sast:test` (4/4), `pnpm sast` (0 achados) e
+    `contract:lint` ok;
+  - gitleaks sem vazamento nos commits da branch.

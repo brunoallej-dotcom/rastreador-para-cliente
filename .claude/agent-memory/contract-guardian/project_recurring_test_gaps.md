@@ -27,3 +27,9 @@ Wave 9 (admin-approvals.api.test.ts, 2026-11-16): same pattern again. The first 
 `Cache-Control: no-store` (withRoute sets it, proven in `with-route.test.ts`; expectToMatchContract does
 not check it); the `null` arm of a `oneOf [X, null]` problem extension (e.g. `currentStageId`) is only
 checked in repository unit tests, never against the contract. 500 is never contract-validated in admin suites.
+
+Update, contract `1.0.0-draft.4` (Wave 10.2, 2026-11-17): `Cache-Control` (enum `no-store`) is now declared
+on all 204 (operation, status) pairs and the 13 component responses. The helper treats a declared header
+as required unless `required: false`, so every `expectToMatchContract(..., response)` now enforces it: the
+Cache-Control gap above is CLOSED. The header components still lack `required: true` (OpenAPI default is
+optional), so the contract text is laxer than the helper (BAIXO doc point, not a test gap).

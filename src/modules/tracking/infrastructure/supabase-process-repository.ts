@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { Database } from '@/shared/db/database.types';
 import { upstreamFailure } from '@/shared/db/upstream-errors';
 import {
+  ConflictError,
   err,
   ForbiddenError,
   NotFoundError,
@@ -46,6 +47,12 @@ const NOT_FOUND_MESSAGE = 'NOT_FOUND';
 const INVALID_INPUT_MESSAGE = 'INVALID_INPUT';
 const CLIENT_ARCHIVED_MESSAGE = 'CLIENT_ARCHIVED';
 const PROCESS_NOT_ACTIVE_MESSAGE = 'PROCESS_NOT_ACTIVE';
+/**
+ * What `create_process` and `update_process` raise (`P0001`) when the title is already an active
+ * process of the same client: the database turns the violation of its unique index into this business
+ * error (spec §3.7.2, F-80), so a raw `23505` is never expected here and stays unmapped (500).
+ */
+const TITLE_TAKEN_MESSAGE = 'PROCESS_TITLE_TAKEN';
 const STALE_STAGE_MESSAGE = 'STALE_STAGE';
 /**
  * Postgres rolled the whole transaction back and nothing of it persisted (no row, no audit event), so
@@ -229,8 +236,11 @@ export type ProcessRepositoryOptions = {
  * `create_process`, `update_process` and `approve_current_stage` functions, which check the CEO role,
  * `aal2` and the TOTP factor by themselves and write the audit event in the same transaction.
  *
- * Whatever comes back is validated with Zod. Database errors are mapped by the table of spec §3.7;
- * an unmapped one is an unexpected error (500) and a slow or dead database is a 503 (E-21). The
+ * Whatever comes back is validated with Zod. Database errors are mapped by the table of spec §3.7
+ * (a title already active in the client, `PROCESS_TITLE_TAKEN`, is a `ConflictError`: 409, F-80;
+ * an archived client, `CLIENT_ARCHIVED`, is a 422 for the creation, the approval, the rename and the
+ * cancellation, F-87); an unmapped one is an unexpected error (500) and a slow or dead database is a
+ * 503 (E-21). The
  * functions return the process row only, so after a write the process is read again, with its
  * stages, approvals and client; the write is already committed by then, and a process that cannot be
  * read now (the row is gone, or the session ended between the two calls) is answered as not found.
@@ -269,7 +279,19 @@ export function createSupabaseProcessRepository(
       return new NotFoundError(`${operation} found no such resource`, { detail: notFoundDetail });
     }
     if (error.code === RAISE_EXCEPTION && error.message === CLIENT_ARCHIVED_MESSAGE) {
+      // The client is archived: no new process (E-16) and its processes are frozen (F-87, E-99).
       return new ClientArchivedError({ cause: { code: error.code } });
+    }
+    if (error.code === RAISE_EXCEPTION && error.message === TITLE_TAKEN_MESSAGE) {
+      // 409 CONFLICT. The detail names no process (not its id, not its title): the database error did
+      // not carry them and the answer must not either. `cause` keeps only the SQLSTATE.
+      return new ConflictError(
+        `${operation}: the title is already an active process of the client`,
+        {
+          detail: 'A process with this title is already active for this client.',
+          cause: { code: error.code },
+        },
+      );
     }
     if (error.code === RAISE_EXCEPTION && error.message === PROCESS_NOT_ACTIVE_MESSAGE) {
       return new ProcessNotActiveError({ cause: { code: error.code } });

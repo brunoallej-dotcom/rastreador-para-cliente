@@ -1445,7 +1445,7 @@ describe('Supabase failing', () => {
     expect(await processCountOf(tenant.id)).toBe(0);
   });
 
-  it('E-21: createProcess whose answer was lost (503) and is repeated makes a SECOND process: a create has no natural key, so the CEO checks the list first', async () => {
+  it('E-21, F-80: createProcess whose answer was lost (503) and is repeated is 409 CONFLICT: the process exists once, and the CEO finds it in the list', async () => {
     const tenant = await createClient();
     const title = uniqueProcessTitle('Reenvio');
     const realFetch = globalThis.fetch;
@@ -1467,13 +1467,13 @@ describe('Supabase failing', () => {
     expect(await processCountOf(tenant.id)).toBe(1);
 
     const repeated = await createProcessViaApi(outageCeo.cookies, tenant.id, { title });
-    await expectContract<ProcessDetailBody>('createProcess', repeated);
+    const repeatedBody = await expectContract<Problem>('createProcess', repeated);
 
-    expect(repeated.status).toBe(201);
-    expect(await processTitlesOf(tenant.id)).toEqual([title, title]);
+    expect(repeated.status).toBe(409);
+    expect(repeatedBody.code).toBe('CONFLICT');
+    expect(await processTitlesOf(tenant.id)).toEqual([title]);
     const listed = await listAllProcesses(outageCeo.cookies, tenant.id);
-    expect(listed.map((item) => item.title)).toEqual([title, title]);
-    expect(new Set(listed.map((item) => item.id)).size).toBe(2);
+    expect(listed.map((item) => item.title)).toEqual([title]);
   });
 
   it('E-21: createProcess that was saved but whose read-back cannot reach the database is 503, and the process exists', async () => {

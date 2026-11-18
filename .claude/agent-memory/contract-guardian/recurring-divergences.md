@@ -70,3 +70,15 @@ Audit-action leaks: new `audit_events` actions (Wave 10.1: `account.*_intent`, `
 stay out of the process timeline only while `supabase-process-event-queries.ts` keeps both the
 `.in('action', PROCESS_EVENT_ACTIONS)` filter and `z.enum(PROCESS_EVENT_ACTIONS)`. Check both whenever a
 wave adds an audit action.
+
+Seen in draft.4 (Wave 10.2, 2026-11-17): the new `info.description` "Entrada" section says unknown body
+fields and query params are always 400 and "O servidor nunca ignora entrada que não conhece". False for
+routes without a query/body schema (ADR 0008, accepted: getHealth ignores query, logout and
+resetClientUserPassword ignore the body, getProcess/getMyProcess/getClient ignore query). Rated MÉDIO.
+Whenever contract prose generalizes about input handling, check it against ADR 0008 and `validateInput`
+(a part without a schema is skipped). Draft.4 also documents the shared `reads`/`writes`/`client-user-admin`
+counters in prose (verified exact against the `*_RULE` constants), so the shared-counter doc gap is closed.
+Judged documentation-only in draft.4: `deprecated: true` (annotation in JSON Schema 2020-12, Ajv knows it,
+no validation effect), `$ref` wrapped in `allOf` to carry a description, declaring an already-emitted
+response header. Route rules must keep having NO `group` key in `x-rate-limit` (only programmatic entries
+carry `group`), so prose was the right way to document counters.

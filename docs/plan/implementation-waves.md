@@ -20,7 +20,8 @@
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
-| 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
+| 10.2 | Decisões de produto: título ativo único por cliente (F-80), processos de cliente arquivado congelados (F-87), contrato `1.0.0-draft.4` | 10.1 | — | ✅ |
+| 11 | Hardening e go-live | 7, 9, 10, 10.1, 10.2 | — | ⬜ |
 
 ```
 0 ─┬─ 1 ─┐
@@ -48,7 +49,7 @@ tempo):
 
 ### Sequência de execução
 
-13 ondas em 9 passos. Caminho crítico: 0 → 2 → 3 → 5 → 6 → 6.1 → 8 → 9 → 11.
+15 ondas em 11 passos. Caminho crítico: 0 → 2 → 3 → 5 → 6 → 6.1 → 8 → 9 → 10.1 → 10.2 → 11.
 
 | Passo | Ondas | Quem executa |
 |-------|-------|--------------|
@@ -61,7 +62,8 @@ tempo):
 | 7 | 7 ∥ 8 | um subagente para cada; a sessão principal coordena a fila de gates de banco |
 | 8 | 9 ∥ 10 | 9 na sessão principal; 10 em subagente |
 | 9 | 10.1 | subagente, com revisão na sessão principal |
-| 10 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
+| 10 | 10.2 | subagente, com revisão na sessão principal |
+| 11 | 11 | sessão principal; as frentes independentes podem ir para subagentes (ver Notas de execução) |
 
 ### Pré-requisitos do paralelismo com subagentes
 
@@ -378,6 +380,33 @@ tempo):
   `DATA_EXCEPTION_CLASS`, `invalidPosition`, `parseRows`, a paginação keyset em duas consultas)
   para um módulo compartilhado de `infrastructure/`.
 
+## Onda 10.2 — Decisões de produto (F-80, F-87, contrato `draft.4`)
+
+- **Origem**: decisões do usuário em 2026-11-17 sobre os itens que as revisões das Ondas 7 a 10
+  deixaram com ele. Não depende da configuração de produção.
+- **Escopo**:
+  - **F-80, título ativo único por cliente.** Um índice único parcial em `processes` (cliente +
+    título normalizado, só `status = 'active'`), no mesmo padrão de `clients_active_name_key`.
+    Criar ou renomear para um título que já está ativo no mesmo cliente responde **409
+    `CONFLICT`**. O POST repetido (duplo clique, retry) deixa de duplicar o processo. Rejeitado:
+    `Idempotency-Key`;
+  - **F-87, cliente arquivado congela os processos** (Q-13). Aprovar fase, renomear e cancelar
+    processo de cliente arquivado respondem **422 `CLIENT_ARCHIVED`**, com a mudança que a spec
+    §3.7.3 descreve: ler o `archived_at` na consulta que trava o processo, sem travar
+    `public.clients`. A leitura continua valendo (E-83), e desarquivar (`archived: false`)
+    descongela;
+  - **contrato `1.0.0-draft.4`**: as duas mudanças acima (aditivas) mais as lacunas só de
+    documentação anotadas nos logs das Ondas 7, 8, 9 e 10;
+  - **spec §8**: Q-01, Q-07, Q-12 e Q-13 marcadas como decididas.
+- **Depende de / paralela com**: 10.1 / —.
+- **Critérios de aceite**: testes de API e pgTAP com os IDs F-80 e F-87 (409 ao criar e ao
+  renomear para título ativo repetido, inclusive com diferença só de maiúsculas e espaços; título
+  de processo concluído ou cancelado pode ser reusado; 422 ao aprovar, renomear e cancelar
+  processo de cliente arquivado; leitura do arquivado continua 200; desarquivar volta a permitir);
+  `pnpm contract:lint` verde com `info.version: 1.0.0-draft.4`; contract-guardian sem divergência.
+- **Goal command**: `pnpm test:api -t "F-80|F-87"`, verde três vezes seguidas, depois de
+  `pnpm db:reset`.
+
 ## Onda 11 — Hardening e go-live
 
 - **Objetivo**: produção segura, observável e operável.
@@ -385,9 +414,12 @@ tempo):
   retenção de auditoria conforme Q-07); log drain e alertas (spec §3.10); job de OWASP ZAP
   baseline no CI contra o preview; teste de carga k6 (`tests/load/`); runbooks em
   `docs/how-to/` (criar CEO, resetar MFA de CEO, rotacionar a secret key, anonimizar dados de
-  cliente, resposta a incidente); revisão do threat model; configuração de produção (Supabase Pro
-  em `sa-east-1`, HIBP ligado, chaves JWT assimétricas, `supabase config push`; Vercel com
-  domínio, env de produção e Deployment Protection nos previews); skill `security-scan`; ADRs
+  cliente, resposta a incidente); revisão do threat model; configuração de produção (Supabase
+  **Free** em `sa-east-1`, ADR 0018; chaves JWT assimétricas, `supabase config push`; Vercel com o
+  domínio `*.vercel.app` (Q-12), env de produção e Deployment Protection nos previews);
+  compensações do plano Free (ADR 0018): recusa de senha vazada pelo backend (API de k-anonimato do
+  Pwned Passwords, só nas senhas escolhidas pelo usuário, com threat model do modo de falha e o
+  F-128) e dump diário agendado e criptografado do banco; skill `security-scan`; ADRs
   `accepted`.
 - **Gates de go-live herdados das ondas 3–5** (threat model §8). Nenhum ambiente hospedado recebe
   contas reais antes de cumpri-los:
@@ -395,7 +427,8 @@ tempo):
   - Auth hospedado:
     - `disable_signup` ligado;
     - provider de e-mail ativo;
-    - `[auth.sessions]` com timebox de 12 h e inatividade de 4 h (plano Pro);
+    - ~~`[auth.sessions]` com timebox de 12 h e inatividade de 4 h~~: fora do gate desde o ADR 0018
+      (o Free não aplica; o banco aplica os dois limites, ADR 0009);
     - `sign_in_sign_ups` acima do teto global de login (300 por 5 min);
     - `token_refresh` dimensionado;
     - assinatura assimétrica, com o segredo HS256 legado revogado.
@@ -403,7 +436,7 @@ tempo):
   - **F-50 (c), decidido em 2026-11-16:**
     - a publishable key é tratada como segredo: só no servidor, nunca em log, e rotacionada a
       qualquer exposição;
-    - proteção de senha vazada (HIBP) ligada;
+    - recusa de senha vazada pelo backend, no lugar do HIBP do Auth, que é do plano Pro (ADR 0018);
     - alerta sobre falhas de login e de MFA nos logs do Auth.
   - **F-20, decidido em 2026-11-16:** o cadastro do TOTP fica amarrado à sessão que limpou
     `CHANGE_PASSWORD`.
@@ -455,7 +488,7 @@ tempo):
       `default_stage_template`.
 - Candidatos de implementação:
   - `pg_cron` que apaga as sessões que `session_is_alive()` já nega.
-- **Depende de / paralela com**: 7, 9, 10, 10.1 / —.
+- **Depende de / paralela com**: 7, 9, 10, 10.1, 10.2 / —.
 - **Critérios de aceite**: AC-30 completo; k6 dentro do RNF-02; ZAP sem alertas High;
   `GET https://<domínio>/api/v1/health` → 200; `security-scan` sem achados críticos ou altos;
   runbooks revisados.

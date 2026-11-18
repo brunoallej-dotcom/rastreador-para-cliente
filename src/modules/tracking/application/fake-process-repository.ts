@@ -1,7 +1,10 @@
 // In-memory fake of `ProcessRepository`, for the unit tests of the process use cases. It runs the
 // real transitions of the aggregate (`startProcess`, `approveCurrentStage`, `applyProcessPatch`), keeps
-// the real order (newest first, id breaking ties) and the real keyset paging. Imported by tests only.
+// the real order (newest first, id breaking ties) and the real keyset paging, and mirrors the two rules
+// the database decides: a title is unique among the ACTIVE processes of a client (F-80) and an archived
+// client's processes are frozen (F-87), in the database's order of precedence. Imported by tests only.
 import {
+  ConflictError,
   err,
   NotFoundError,
   ok,
@@ -55,6 +58,19 @@ export const FAKE_APPROVER: Approver = {
   aal: 'aal2',
 };
 
+/**
+ * The key two titles are compared by (spec §3.7.1, §3.7.2): NFKC, lower case, without the invisible
+ * variation marks and with every run of spaces reduced to one. The database index does the same.
+ */
+const INVISIBLE_VARIATION_MARKS = /[\u034F\u180B-\u180F\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
+const SPACE_RUNS = /[ \u1680]+/g;
+export const titleKey = (title: string): string =>
+  title
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(INVISIBLE_VARIATION_MARKS, '')
+    .replace(SPACE_RUNS, ' ');
+
 const FAKE_ID_PREFIX = '00000000-0000-4000-8000-';
 const ID_DIGITS = 12;
 const fakeId = (n: number) => `${FAKE_ID_PREFIX}${String(n).padStart(ID_DIGITS, '0')}`;
@@ -94,6 +110,19 @@ export function createFakeProcessRepository(
     if (outage) throw new ServiceUnavailableError('the database is down');
   };
 
+  /** Is another ACTIVE process of the client already called `title` (by key)? */
+  const titleTaken = (clientId: string, title: string, exceptId?: string): boolean =>
+    [...rows.values()].some(
+      (other) =>
+        other.clientId === clientId &&
+        other.id !== exceptId &&
+        other.status === 'active' &&
+        titleKey(other.title) === titleKey(title),
+    );
+
+  /** F-87: the processes of an archived client are frozen. */
+  const frozen = (process: Process): boolean => clients.get(process.clientId)?.archived === true;
+
   return {
     calls,
     stored: () => [...rows.values()],
@@ -109,6 +138,9 @@ export function createFakeProcessRepository(
         return Promise.resolve(err(new NotFoundError('no such client')));
       }
       if (client.archived === true) return Promise.resolve(err(new ClientArchivedError()));
+      if (titleTaken(client.id, input.title)) {
+        return Promise.resolve(err(new ConflictError('the title is already active in the client')));
+      }
 
       created += 1;
       const started = startProcess({
@@ -138,7 +170,16 @@ export function createFakeProcessRepository(
       if (current === undefined) {
         return Promise.resolve(err(new NotFoundError('no such process')));
       }
+      // The database's order: not found, archived client, not active (inside the patch), title taken.
+      if (frozen(current)) return Promise.resolve(err(new ClientArchivedError()));
       const next = applyProcessPatch(current, patch, now);
+      if (
+        next.ok &&
+        next.value.status === 'active' &&
+        titleTaken(current.clientId, next.value.title, current.id)
+      ) {
+        return Promise.resolve(err(new ConflictError('the title is already active in the client')));
+      }
       if (next.ok) rows.set(processId, next.value);
       return Promise.resolve(next);
     },
@@ -151,6 +192,7 @@ export function createFakeProcessRepository(
       if (current === undefined) {
         return Promise.resolve(err(new NotFoundError('no such process')));
       }
+      if (frozen(current)) return Promise.resolve(err(new ClientArchivedError()));
       const next = applyApproval(current, { expectedStageId, approver, at: now });
       if (next.ok) rows.set(processId, next.value);
       return Promise.resolve(next);

@@ -25,6 +25,8 @@ export type ApproveCurrentStageInput = {
  *
  * The answers, by precedence (E-01 to E-04, spec §3.7.3):
  * - a missing process is `NotFoundError` (404);
+ * - one of an archived client is `ClientArchivedError` (422, F-87, E-99): archiving freezes the
+ *   processes, whatever their status and the expected stage;
  * - a completed or cancelled one is `ProcessNotActiveError` (422), whatever the expected stage;
  * - an expected stage that is not the current one is `StaleStageError` (409) with the current id.
  *

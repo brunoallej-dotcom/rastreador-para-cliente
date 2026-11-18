@@ -1,4 +1,4 @@
 - [Accepted contract gaps](feedback_accepted_gaps.md) — 503 infra gap, ignored body/query, rate-limit groups (ADR 0008): don't re-report
-- [Recurring test gaps](project_recurring_test_gaps.md) — secondary API tests assert status without expectToMatchContract; e-mail normalization leniency
-- [Recurring divergences](recurring-divergences.md) — 503 per ADR 0008; retry-after-503 docs gap; shared reads/writes counters; z.uuid vs format uuid
+- [Recurring test gaps](project_recurring_test_gaps.md) — secondary tests without expectToMatchContract; 429 pairs; Cache-Control closed in draft.4
+- [Recurring divergences](recurring-divergences.md) — 503 per ADR 0008; retry-after-503; prose overclaims vs ADR 0008 (draft.4 "Entrada"); z.uuid; doc-only rulings
 - [Programmatic rate limits](project_programmatic_rate_limits.md) — draft.2 programmatic:true budgets; audit rules and invariants-test gap
