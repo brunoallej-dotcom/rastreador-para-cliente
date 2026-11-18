@@ -6,14 +6,14 @@
 -- (AC-16: a fase vira completed com a aprovação e o CEO, a próxima in_progress, version +1 uma vez, auditoria na
 -- mesma transação, qualquer CEO aprova), a última fase (AC-18, E-04), processo concluído ou cancelado (E-03, I3,
 -- I4, AC-19), a fase esperada velha, futura, de outro processo ou inexistente (E-01, E-02: STALE_STAGE), a
--- precedência dos erros (papel, entrada, processo, status, fase), erros sem DETAIL nem HINT, as invariantes
+-- precedência dos erros (papel, entrada, processo, cliente arquivado, status, fase), erros sem DETAIL nem HINT, as invariantes
 -- depois de cada passo (I2, I5, I6), escrita direta negada, o isolamento por tenant, o cliente arquivado (F-87:
--- hoje vale o atual, e o teste o registra), o instante da aprovação depois de uma espera de trava com o teto de
+-- congela os processos, CLIENT_ARCHIVED), o instante da aprovação depois de uma espera de trava com o teto de
 -- 1 minuto (F-104), a função que confere o que escreve (F-105, T-49: posições com buraco, fase anterior aberta,
 -- nenhuma fase atual, sempre sem escrever nada), o índice da linha do tempo (F-106) e as invariantes e contagens
 -- escopadas aos processos desta fixture (o arquivo não depende do que `pnpm test:api` deixou no banco).
 BEGIN;
-SELECT plan(123);
+SELECT plan(124);
 
 -- arrange (como postgres) --------------------------------------------------------------------------
 -- A e B são clientes ativos; X é arquivado. a1 é login de A e b1, de B. c1 e c7 são CEOs com fator verificado;
@@ -56,7 +56,7 @@ UPDATE public.profiles SET must_change_password = false
 --   P3 (1a1): cliente A, 3 fases (2a1 em andamento, 2a2 e 2a3 pendentes): o caminho feliz inteiro.
 --   P1 (1a2): cliente A, 1 fase (2b1): a primeira aprovação conclui o processo (E-04).
 --   PB (1b1): cliente B, 2 fases (2c1, 2c2): cancelado antes de aprovar (AC-19).
---   PX (1d1): cliente X (arquivado), 2 fases (2d1, 2d2): aprovar e depois cancelar (F-87, I4).
+--   PX (1d1): cliente X (arquivado), 2 fases (2d1, 2d2): aprovar e cancelar são recusados, CLIENT_ARCHIVED (F-87).
 --   PD (1e1): concluído, com a aprovação da única fase (2e1).   PC (1e2): cancelado no meio (2e2 feita, 2e3 parada).
 --   PF (1f1): 2 fases; a fase 2f1 começou DAQUI A UM SEGUNDO (o `started_at` que uma aprovação que esperou a trava
 --             grava na fase seguinte, com um `now()` mais antigo que ele: dentro da tolerância de 1 minuto, F-104).
@@ -226,19 +226,24 @@ SELECT ok(
   'F-106: o índice é parcial (process_id IS NOT NULL), como os outros da trilha'
 );
 
--- F-82, T-41: a ORDEM DE TRAVA, no catálogo (a concorrência em si está nos testes de API, que seguram a trava
--- numa segunda sessão: um teste de uma sessão só não prova a espera). O processo é a primeira linha travada, com
--- FOR NO KEY UPDATE, a mesma consulta e o mesmo modo de update_process; o status é lido depois da trava; a fase
--- em andamento só é travada depois disso, também com FOR NO KEY UPDATE; nenhuma escrita vem antes das duas
--- travas; e nada trava public.clients (create_process trava o cliente e depois insere o processo: uma aprovação
--- que travasse o cliente depois do processo cruzaria com ela).
+-- F-82, T-41, F-87: a ORDEM DE TRAVA, no catálogo (a concorrência em si está nos testes de API, que seguram a trava
+-- numa segunda sessão: um teste de uma sessão só não prova a espera). De pai para filho: o cliente primeiro, com
+-- FOR SHARE (lê o `archived_at` já com a trava, Onda 10.2); depois o processo, com FOR NO KEY UPDATE, a mesma
+-- consulta e o mesmo modo de update_process; o status é lido depois da trava; a fase em andamento só é travada
+-- depois disso, também com FOR NO KEY UPDATE; nenhuma escrita vem antes das três travas. O processo antes do
+-- cliente seria deadlock contra create_process (que segura o cliente e espera o índice de título, F-80).
 SELECT ok(
-  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+FOR NO KEY UPDATE'
+  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.clients c\s+WHERE c\.id = v_client_id\s+FOR SHARE'
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
-  'F-82: approve_current_stage trava a linha de public.processes com FOR NO KEY UPDATE'
+  'F-87: approve_current_stage trava a linha do cliente do processo com FOR SHARE'
 );
 SELECT ok(
-  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+FOR NO KEY UPDATE'
+  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+AND p\.client_id = v_client_id\s+FOR NO KEY UPDATE'
+     FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
+  'F-82: approve_current_stage trava a linha de public.processes com FOR NO KEY UPDATE (depois do cliente)'
+);
+SELECT ok(
+  (SELECT pg_temp.code(p.oid) ~ 'FROM public\.processes p\s+WHERE p\.id = p_process_id\s+AND p\.client_id = v_client_id\s+FOR NO KEY UPDATE'
      FROM pg_proc p WHERE p.oid = 'public.update_process(uuid, text, boolean)'::regprocedure),
   'F-82: update_process trava a mesma linha, com o mesmo modo (as duas se serializam)'
 );
@@ -261,7 +266,7 @@ SELECT ok(
 SELECT ok(
   (SELECT regexp_count(pg_temp.code(p.oid), 'FOR NO KEY UPDATE', 1, 'i') = 2
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
-  'F-82: duas travas, a do processo e a da fase, nessa ordem, e mais nenhuma'
+  'F-82: duas travas FOR NO KEY UPDATE, a do processo e a da fase, nessa ordem, e mais nenhuma'
 );
 SELECT ok(
   (SELECT position('FOR NO KEY UPDATE' IN pg_temp.code(p.oid)) < position('v_row.status <> ''active''' IN pg_temp.code(p.oid))
@@ -275,18 +280,23 @@ SELECT ok(
   (SELECT position('FROM public.process_stages s' IN pg_temp.code(p.oid)) < position('UPDATE public.process_stages s' IN pg_temp.code(p.oid))
           AND position('UPDATE public.process_stages s' IN pg_temp.code(p.oid)) > 0
           AND position('FOR NO KEY UPDATE' IN pg_temp.code(p.oid)) < position('INSERT INTO public.stage_approvals' IN pg_temp.code(p.oid))
+          AND position('FOR SHARE' IN pg_temp.code(p.oid)) < position('UPDATE public.process_stages s' IN pg_temp.code(p.oid))
           AND position('INSERT INTO public.stage_approvals' IN pg_temp.code(p.oid)) < position('UPDATE public.processes p' IN pg_temp.code(p.oid))
           AND position('UPDATE public.processes p' IN pg_temp.code(p.oid)) > 0
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
   'F-82: as duas travas vêm antes de qualquer escrita (fase, aprovação, processo)'
 );
 SELECT ok(
-  (SELECT pg_temp.code(p.oid) !~* 'FOR\s+UPDATE\M' AND pg_temp.code(p.oid) !~* 'FOR\s+(KEY\s+)?SHARE\M' AND pg_temp.code(p.oid) !~* 'public\.clients'
+  (SELECT pg_temp.code(p.oid) !~* 'FOR\s+UPDATE\M' AND pg_temp.code(p.oid) !~* 'FOR\s+KEY\s+SHARE\M'
+          AND regexp_count(pg_temp.code(p.oid), 'FOR SHARE', 1, 'i') = 1
+          AND regexp_count(pg_temp.code(p.oid), 'public\.clients', 1, 'i') = 1
+          AND position('FOR SHARE' IN pg_temp.code(p.oid)) < position('FOR NO KEY UPDATE' IN pg_temp.code(p.oid))
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
-  'F-82: approve_current_stage não usa FOR UPDATE nem FOR SHARE e não toca public.clients'
+  'F-87: approve_current_stage: nenhum FOR UPDATE, uma só trava FOR SHARE (a do cliente, a única que toca public.clients), antes das FOR NO KEY UPDATE'
 );
 SELECT ok(
   (SELECT pg_temp.code(p.oid) ~ 'IF private\.is_ceo\(\) IS NOT TRUE THEN'
+          AND position('is_ceo()' IN pg_temp.code(p.oid)) < position('FOR SHARE' IN pg_temp.code(p.oid))
           AND position('is_ceo()' IN pg_temp.code(p.oid)) < position('FOR NO KEY UPDATE' IN pg_temp.code(p.oid))
      FROM pg_proc p WHERE p.oid = 'public.approve_current_stage(uuid, uuid)'::regprocedure),
   'F-55: approve_current_stage abre com IF private.is_ceo() IS NOT TRUE, antes de qualquer trava'
@@ -677,28 +687,29 @@ SELECT results_eq(
   'I4: o cancelamento que ganhou da aprovação deixa as fases como estavam, sem aprovação nenhuma'
 );
 
--- F-87 (decisão do usuário pendente): hoje o cliente arquivado NÃO congela os processos que já tem ----------------------------
+-- F-87 (Q-13, decidido em 2026-11-17): o cliente arquivado congela os processos que já tem. Aprovar e cancelar
+-- (o renome está no 022) respondem CLIENT_ARCHIVED e não gravam nada. A leitura continua (E-83: 018 e 022).
 SELECT tests.set_request_id('req-approve-0005');
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
-SELECT lives_ok(
+SELECT throws_ok(
   $$ SELECT * FROM public.approve_current_stage('00000000-0000-4000-8000-0000000001d1', '00000000-0000-4000-8000-0000000002d1') $$,
-  'F-87: a aprovação num processo de cliente arquivado vale hoje (Q-13: arquivar só impede processos e logins novos)'
+  'P0001', 'CLIENT_ARCHIVED',
+  'F-87: a aprovação num processo de cliente arquivado é recusada com CLIENT_ARCHIVED (Q-13)'
 );
-SELECT lives_ok(
+SELECT throws_ok(
   $$ SELECT * FROM public.update_process('00000000-0000-4000-8000-0000000001d1', NULL, true) $$,
-  'F-87: e o cancelamento depois da aprovação também'
+  'P0001', 'CLIENT_ARCHIVED',
+  'F-87: e o cancelamento também'
 );
 SELECT tests.clear_authentication();
-SELECT results_eq(
-  $$ SELECT p.status::text, p.version, (SELECT string_agg(s.status::text, ',' ORDER BY s.position) FROM public.process_stages s WHERE s.process_id = p.id)
-       FROM public.processes p WHERE p.id = '00000000-0000-4000-8000-0000000001d1' $$,
-  $$ VALUES ('cancelled', 3, 'completed,in_progress') $$,
-  'I4: aprovar e depois cancelar deixa a fase seguinte em andamento (congelada), versão 3'
+SELECT is(
+  pg_temp.state_of('00000000-0000-4000-8000-0000000001d1'),
+  'active/v1/1:in_progress,2:pending/approvals=0/audit=0',
+  'F-87: nada mudou: o processo segue ativo na versão 1, a fase 1 em andamento, sem aprovação e sem evento'
 );
-SELECT results_eq(
-  $$ SELECT a.action FROM public.audit_events a WHERE a.process_id = '00000000-0000-4000-8000-0000000001d1' ORDER BY a.id $$,
-  $$ VALUES ('stage.approved'), ('process.cancelled') $$,
-  'I4: a auditoria mostra a aprovação ANTES do cancelamento, na ordem em que as duas travas foram tomadas'
+SELECT is_empty(
+  $$ SELECT a.action FROM public.audit_events a WHERE a.process_id = '00000000-0000-4000-8000-0000000001d1' $$,
+  'F-87: a recusa não grava auditoria'
 );
 
 -- F-104: o instante da aprovação depois de uma espera de trava: a fase seguinte já começou "no futuro" -----------------------------
@@ -889,7 +900,7 @@ SELECT results_eq(
 );
 SELECT is_empty(
   $$ SELECT s.id FROM public.process_stages s WHERE s.process_id = '00000000-0000-4000-8000-0000000001d1' $$,
-  'AC-09: o cliente A não vê as fases de um processo de outro cliente que o CEO aprovou'
+  'AC-09: o cliente A não vê as fases de um processo de outro cliente'
 );
 SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000b1');
@@ -908,8 +919,8 @@ SELECT tests.clear_authentication();
 SELECT tests.authenticate_as('00000000-0000-4000-8000-0000000000c1', 'aal2');
 SELECT results_eq(
   $$ SELECT count(*)::int FROM public.stage_approvals WHERE process_id IN (SELECT id FROM fixture_processes) $$,
-  $$ VALUES (8) $$,
-  'o CEO aal2 atestado lê as aprovações (2 de fixture, 3 de P3, 1 de P1, 1 de PX e 1 de PF)'
+  $$ VALUES (7) $$,
+  'o CEO aal2 atestado lê as aprovações (2 de fixture, 3 de P3, 1 de P1 e 1 de PF: PX, de cliente arquivado, não aprova, F-87)'
 );
 SELECT tests.clear_authentication();
 
