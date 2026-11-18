@@ -9,8 +9,9 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 - **Paralelismo:** o plano define quais ondas rodam em subagente (Sonnet 5.5, esforço xhigh,
   worktree) e os pré-requisitos, resolvidos nas ondas 0 e 1. Ver "Sequência de execução" e
   "Pré-requisitos do paralelismo com subagentes" em `docs/plan/implementation-waves.md`.
-- **Próxima onda:** 11 (hardening e go-live). Ela depende da configuração de produção do
-  usuário e herda os itens da Onda 10.1 anotados no plano.
+- **Onda em andamento:** 10.2 (decisões de produto: F-80, F-87 e o contrato `draft.4`, aprovados
+  pelo usuário em 2026-11-17). Depois, a 11 (hardening e go-live), que depende da configuração de
+  produção do usuário e herda os itens da Onda 10.1 anotados no plano.
 - **Fonte da verdade do roadmap:** [`docs/plan/implementation-waves.md`](docs/plan/implementation-waves.md).
   Esta tabela espelha a coluna Status de lá.
 
@@ -29,7 +30,8 @@ Diário do projeto: status atual, pendências e log de sessões. Atualize ao fim
 | 9 | Rastreamento: aprovação de fase ("Ok") + linha do tempo | 8 | 10 | ✅ |
 | 10 | Painel do cliente: leitura dos próprios processos | 8 | 9 | ✅ |
 | 10.1 | Endurecimento do banco: sem DML do `service_role` no rastreamento, usuário totalmente ativo no RLS, auditoria de intenção e reversão no provisionamento (F-81, F-83, F-92b, F-93) | 7, 9, 10 | — | ✅ |
-| 11 | Hardening e go-live | 7, 9, 10, 10.1 | — | ⬜ |
+| 10.2 | Decisões de produto: título ativo único por cliente (F-80), processos de cliente arquivado congelados (F-87), contrato `1.0.0-draft.4` | 10.1 | — | 🟡 |
+| 11 | Hardening e go-live | 7, 9, 10, 10.1, 10.2 | — | ⬜ |
 
 Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
@@ -37,18 +39,12 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
 
 | Pendência | Bloqueia |
 |-----------|----------|
-| Rodar `pnpm -s ceo:create --target 127.0.0.1:54421 --email ceo1@local.test --name "CEO Teste"` num terminal (sem `CI`) contra o Supabase local | goal command da Onda 4 (permissão "ask") |
 | Gates de go-live do Auth hospedado (plano, Onda 11), a começar por F-40 | Onda 11 |
-| Q-01: nomes das fases padrão (spec §8) | seed do template na Onda 2 (há placeholder) |
-| Decidir F-80 (POST de processo repetido: título ativo único com 409, ou `Idempotency-Key`), F-87 (processos de cliente arquivado: congelar com 422 `CLIENT_ARCHIVED`?) e aprovar o bump `draft.4` do contrato, só de documentação (candidatos nos logs das Ondas 7, 8, 9 e 10) | nada hoje; F-87 muda a spec e o `approve_current_stage`/`update_process` |
-| Deixar o repositório privado (decidido em 2026-11-16) **depois** do merge do PR do Semgrep, que substitui o CodeQL (code scanning não existe em repositório privado de conta pessoal no GitHub Free) | exposição do threat model com achados abertos |
+| ~~Deixar o repositório privado~~: **revertido em 2026-11-17, o repositório fica público.** No privado, o GitHub recusou rodar o CI (cobrança do Actions). Risco aceito: o threat model e os achados em aberto ficam visíveis | — |
 | ~~Branch protection na `main`~~: **decidido em 2026-11-16, sem GitHub Pro por ora.** Risco aceito: o GitHub não barra merge com CI vermelho; o fluxo de ondas só faz merge com todos os checks verdes | — |
 | Corrigir no código-fonte do `@aisac/cli` o falso positivo do `secrets-guard` (identificador terminado em `.key` em comando Bash; ver CLAUDE.md) | conforto dos agentes |
 | Criar projetos Supabase **dev/staging** e **prod** em `sa-east-1` (prod no plano Pro) | Onda 11 (a Onda 3 foi validada só no Supabase local) |
 | Para o MCP: `export SUPABASE_PROJECT_REF=<ref do projeto DEV>` antes de abrir o Claude Code e autenticar em `/mcp` | uso do MCP |
-| Alinhar os nomes em `.env.local` com `.env.example` (nenhuma chave Supabase com prefixo público do Next.js) | Onda 3 |
-| Q-07 (retenção) e Q-12 (domínio) | Onda 11 |
-| Revisar as decisões que a sessão principal tomou sozinha na Onda 10.1, com autonomia dada pelo usuário (lista no log de 2026-11-17) | nada; cada uma é reversível numa onda futura |
 
 ## Observações
 
@@ -684,3 +680,23 @@ Legenda: ⬜ não iniciada · 🟡 em andamento · ✅ concluída
   - `db:test` logo depois, sem reset → 1713/1713;
   - `test:api -t "F-8[13]|F-9[23]|F-110"` → 14, três vezes seguidas;
   - `build`, `format:check`, `test:hooks` (179), `pnpm sast` (0 achados) e `contract:lint` ok.
+
+### 2026-11-17 — Decisões do usuário e abertura da Onda 10.2
+
+- **Merge da Onda 10.1:** com o repositório privado, o GitHub recusou rodar o CI (cobrança do
+  Actions). O usuário tornou o repositório público, o CI rodou verde nos PRs #23 e #24, e os dois
+  foram mergeados (`d668d0d` e `d04f972`).
+- **Decisões do usuário:**
+  - o repositório fica **público**, o que reverte a decisão de 2026-11-16;
+  - **F-80:** título ativo único por cliente, com 409 `CONFLICT`. `Idempotency-Key` foi rejeitado;
+  - **F-87 (Q-13):** cliente arquivado congela os processos (422 `CLIENT_ARCHIVED` em aprovar,
+    renomear e cancelar). A leitura continua, e desarquivar descongela;
+  - **contrato `draft.4`** aprovado, com as duas mudanças acima;
+  - **Q-01:** os nomes das fases padrão ficam como estão na migration;
+  - **Q-07:** auditoria guardada por 5 anos; contas anonimizadas 1 ano depois do arquivamento do
+    cliente. A implementação (`pg_cron`) é da Onda 11;
+  - **Q-12:** por ora, o domínio padrão que a Vercel atribui (`*.vercel.app`) vai no `APP_ORIGIN`;
+  - as decisões que a sessão principal tomou sozinha na Onda 10.1 foram revisadas e aceitas.
+- **Pendências resolvidas pelo usuário:** `ceo:create` rodado contra o Supabase local (goal command
+  da Onda 4) e nomes das variáveis locais alinhados com o `.env.example`.
+- **Onda 10.2 aberta** no plano: subagente, com revisão na sessão principal.
