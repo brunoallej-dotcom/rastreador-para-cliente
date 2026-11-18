@@ -18,7 +18,9 @@ ordem de `create_process` (cliente, depois o processo que ele insere). A anális
 
 1. No `READ COMMITTED`, depois de esperar a trava do processo, a reavaliação refaz só a linha travada. O `archived_at`
    do `JOIN` seria o do **começo** da consulta, e uma aprovação parada atrás de outra passaria sobre um arquivamento
-   que gravou durante a espera: a janela é do tamanho da espera, e um teste com a trava na mão a mostra.
+   que gravou durante a espera: a janela é do tamanho da espera. Verificado por mutação: sem a trava do cliente
+   (mesmo relendo o `archived_at` depois da trava do processo), os testes de API da corrida com o arquivamento
+   (E-101) falham, porque a aprovação não espera o arquivamento em andamento.
 2. Com o índice de título (F-80), a ordem "processo, depois cliente" deixa de ser só feia: `create_process` segura o
    cliente e o `INSERT` espera, no índice, um renome ainda não gravado; se esse renome já segurasse o processo e
    pedisse o cliente, as duas esperariam uma pela outra.

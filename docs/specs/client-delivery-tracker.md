@@ -864,8 +864,9 @@ funções.
   - *O `JOIN` na consulta que trava o processo não basta.* `FROM processes p JOIN clients c … FOR NO KEY UPDATE OF
     p` não trava o cliente e, no `READ COMMITTED`, depois de esperar a trava do processo reavalia só a linha travada:
     o `archived_at` que ele usa é o do começo da consulta. Uma aprovação parada atrás de outra (ou atrás de um
-    cancelamento) passaria sobre um arquivamento que gravou durante a espera. A janela seria o tempo da espera, e um
-    teste com a trava na mão a mostra.
+    cancelamento) passaria sobre um arquivamento que gravou durante a espera: a janela seria o tempo da espera.
+    Verificado por mutação: sem a trava do cliente (mesmo relendo o `archived_at` depois da trava do processo), os dois
+    testes de API de E-101 falham, porque a aprovação não espera o arquivamento em andamento.
   - *`FOR SHARE` no cliente fecha a janela.* Ele conflita com o `FOR NO KEY UPDATE` de `update_client` (que arquiva) e
     de `create_process`, e com o `FOR UPDATE` do gatilho do perfil, e **não** conflita com outro `FOR SHARE`: duas
     aprovações (ou renomes) de processos do mesmo cliente não esperam uma pela outra. A aprovação que chega durante
@@ -950,7 +951,7 @@ funções.
   - **Corrida com o arquivamento.** `update_client` com `archived: true` trava a linha do cliente com `FOR NO KEY
     UPDATE` e só toca nessa linha. Como a aprovação e a edição de processo pedem `FOR SHARE` na mesma linha, as duas
     coisas se serializam, e o resultado é o mesmo qualquer que seja a ordem em que chegam: a escrita que pega a trava
-    primeiro termina antes da outra começar a decidir (E-100). Não sobra janela: **nenhum processo muda depois de o
+    primeiro termina antes da outra começar a decidir (E-101). Não sobra janela: **nenhum processo muda depois de o
     `archived_at` do cliente ser gravado**, a não ser que o cliente seja desarquivado.
 - **Linha do tempo (RF-12, AC-28).** `GET /admin/processes/{processId}/events` é um query service próprio
   (`supabase-process-event-queries.ts`), não o repositório do agregado. Lê, como o CEO (RLS), quatro coisas simples,
